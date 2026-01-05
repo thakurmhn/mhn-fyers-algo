@@ -1,6 +1,7 @@
 # Ignore Python virtual environment
 .venv/
-
+.env
+access*
 # Ignore config file with credentials
 #config.py
 
@@ -13,6 +14,7 @@ __pycache__/
 *.log
 *.sqlite3
 *.db
+*.log
 
 # IDE/editor files
 .vscode/

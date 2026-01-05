@@ -2,6 +2,8 @@ import pandas as pd
 import logging
 import pendulum as dt
 from config import time_zone, profit_loss_point
+from setup import spot_price
+
 
 # globals (must exist once in your script)
 ticks_buffer = []

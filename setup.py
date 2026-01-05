@@ -123,3 +123,15 @@ hist_data.columns = ["date","open","high","low","close","volume"]
 ist = pytz.timezone("Asia/Kolkata")
 hist_data["date"] = pd.to_datetime(hist_data["date"], unit="s").dt.tz_localize("UTC").dt.tz_convert(ist)
 hist_data = hist_data[hist_data["date"].dt.date < dt.now(time_zone).date()]
+
+# ===== Paper trading info =====
+from config import account_type, strategy_name
+paper_info = {
+    "account_type": account_type,
+    "strategy_name": strategy_name
+}
+
+# ===== Daily ATR =====
+hist_data["tr"] = (hist_data["high"] - hist_data["low"]).abs()
+daily_atr = hist_data["tr"].mean()
+

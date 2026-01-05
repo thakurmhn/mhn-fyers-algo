@@ -1,12 +1,14 @@
 import logging, pickle
 import pandas as pd
 import pendulum as dt
-from setup import option_chain, fyers, paper_info, hist_data, daily_atr
+# from setup import option_chain, fyers, paper_info, hist_data, daily_atr
+from setup import option_chain, fyers, paper_info, hist_data, daily_atr, spot_price
+from data_feed import df
 from config import (
     strike_diff, time_zone, account_type, quantity, MAX_TRADES_PER_DAY,
     strategy_name, end_time, ticker, CALL_MONEYNESS, PUT_MONEYNESS
 )
-from data_feed import df, spot_price
+# from data_feed import df, spot_price
 from indicators import (
     resolve_atr, calculate_cpr, calculate_traditional_pivots,
     calculate_camarilla_pivots, detect_signal, build_dynamic_levels,
