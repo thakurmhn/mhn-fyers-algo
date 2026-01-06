@@ -1,21 +1,27 @@
-import asyncio, logging, time, sys
+# ===== main.py =====
+import asyncio
+import time
+import logging
 import pandas as pd
-import pendulum as dt
-from datetime import timedelta
-from config import account_type, end_time, time_zone
+
+from config import account_type, time_zone
+from setup import fyers_asysc, df, end_time
 from execution import paper_order, real_order
-from data_feed import fyers_socket, chase_order, df
-from setup import fyers_asysc
+from data_feed import fyers_socket, chase_order
+
+import pendulum as dt
 
 async def main_strategy_code():
     global df
     while True:
         ct = dt.now(time_zone)
 
-        if ct > end_time + timedelta(minutes=2):
+        # Close program 2 min after end time
+        if ct > end_time + dt.duration(minutes=2):
             logging.info('closing program')
-            return
+            return  # end coroutine
 
+        # Every 5 seconds: chase orders and broker PnL
         if ct.second % 5 == 0:
             try:
                 order_response = await fyers_asysc.orderbook()
@@ -28,6 +34,7 @@ async def main_strategy_code():
             except Exception as e:
                 logging.error(f"Unable to fetch pnl or chase order: {e}")
 
+        # Run strategy
         if account_type == 'PAPER':
             paper_order()
         else:
@@ -44,8 +51,6 @@ def run():
         logging.info("Manual interrupt received, shutting down.")
     finally:
         logging.info("Program terminated.")
-        sys.exit(0)
 
 if __name__ == "__main__":
     run()
-

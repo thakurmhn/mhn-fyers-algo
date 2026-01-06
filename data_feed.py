@@ -1,69 +1,50 @@
-import pandas as pd
+# ===== data_feed.py =====
 import logging
-from config import ticker, client_id
+import pandas as pd
+
 from fyers_apiv3.FyersWebsocket import data_ws
-from setup import access_token, symbols, spot_price
-from indicators import build_3min_candle, current_3m_start
-from datetime import datetime as dt
-import pytz
 
-time_zone = pytz.timezone("Asia/Kolkata")
+from setup import client_id, access_token, fyers, ticker, symbols, df
+from setup import spot_price as _spot_price  # local name; we update inplace
+from indicators import build_3min_candle
 
-# ===== Tick snapshot DataFrame (indexed by symbol) =====
-df = pd.DataFrame(
-    columns=[
-        "symbol","ltp","ch","chp","avg_trade_price","open_price","high_price","low_price",
-        "prev_close_price","vol_traded_today","oi","pdoi","oipercent","bid_price","ask_price",
-        "last_traded_time","exch_feed_time","bid_size","ask_size","last_traded_qty",
-        "tot_buy_qty","tot_sell_qty","lower_ckt","upper_ckt","type","expiry"
-    ]
-)
+# Keep a module-level spot reference
+spot_price = _spot_price
 
-# ===== Lightweight tick DataFrame for candle building =====
-df_ticks = pd.DataFrame(columns=["timestamp", "price"])
+def onmessage(ticks):
+    global df, spot_price
 
-def onmessage(message):
-    global df, df_ticks, spot_price, current_3m_start
-
-    if not message.get("symbol"):
+    if not ticks.get('symbol'):
         return
 
-    symbol = message["symbol"]
+    symbol = ticks['symbol']
 
-    # --- Update full tick snapshot ---
     if symbol not in df.index:
         df.loc[symbol] = [None] * len(df.columns)
 
-    for key, value in message.items():
+    for key, value in ticks.items():
         if key in df.columns:
             df.loc[symbol, key] = value
 
-    # --- Update spot price + candle builder ---
-    if symbol == ticker and "ltp" in message:
-        spot_price = message["ltp"]
-
-        # Append tick to df_ticks (modern pandas)
-        df_ticks.loc[len(df_ticks)] = [dt.now(time_zone), spot_price]
-
-        # Build candle with just the price
+    # Build 3m candle ONLY from underlying
+    if symbol == ticker and 'ltp' in ticks:
+        spot_price = ticks['ltp']
         build_3min_candle(spot_price)
-
 
 def onerror(message):
     logging.error(f"Socket error: {message}")
 
-
 def onclose(message):
     logging.info(f"Connection closed: {message}")
 
-
 def onopen():
+    # Subscribe to option symbols (you can also subscribe to underlying ticker if available)
     data_type = "SymbolUpdate"
     fyers_socket.subscribe(symbols=symbols, data_type=data_type)
     fyers_socket.keep_running()
     print('starting socket')
 
-
+# ===== Data socket =====
 fyers_socket = data_ws.FyersDataSocket(
     access_token=f"{client_id}:{access_token}",
     log_path=None,
@@ -76,7 +57,7 @@ fyers_socket = data_ws.FyersDataSocket(
     on_message=onmessage
 )
 
-
+# ===== Order chasing =====
 def chase_order(ord_df):
     if not ord_df.empty:
         ord_df = ord_df[ord_df['status'] == 6]
