@@ -19,6 +19,7 @@ from indicators import (
 )
 from signals import detect_signal
 
+
 # Define ATR
 atr, atr_source = resolve_atr(candles_3m, daily_atr)
 

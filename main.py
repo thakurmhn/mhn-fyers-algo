@@ -11,6 +11,9 @@ from data_feed import fyers_socket, chase_order
 
 import pendulum as dt
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
+
 async def main_strategy_code():
     global df
     while True:
