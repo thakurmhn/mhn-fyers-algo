@@ -20,21 +20,21 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
     if rng == 0:
         return None
 
-    # ---- Levels ----
-    pivot = traditional_levels["Pivot"]
+    # ---- Levels (lowercase keys) ----
+    pivot = traditional_levels["pivot"]
     r1, s1, r2, s2 = (
-        traditional_levels["R1"],
-        traditional_levels["S1"],
-        traditional_levels["R2"],
-        traditional_levels["S2"],
+        traditional_levels["r1"],
+        traditional_levels["s1"],
+        traditional_levels["r2"],
+        traditional_levels["s2"],
     )
     r3, r4, s3, s4 = (
-        camarilla_levels["R3"],
-        camarilla_levels["R4"],
-        camarilla_levels["S3"],
-        camarilla_levels["S4"],
+        camarilla_levels["r3"],
+        camarilla_levels["r4"],
+        camarilla_levels["s3"],
+        camarilla_levels["s4"],
     )
-    tc, bc = cpr_levels["TC"], cpr_levels["BC"]
+    tc, bc = cpr_levels["tc"], cpr_levels["bc"]
 
     # ---- Strength + Momentum ----
     def strong(side):

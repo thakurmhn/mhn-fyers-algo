@@ -3,11 +3,12 @@ import logging
 import pickle
 import pandas as pd
 import pendulum as dt
+from fyers_apiv3 import fyersModel
 
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
     CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point,
-    ATR_STOP_MULT, ATR_TGT_MULT, TRAIL_TRIGGER, TRAIL_STEP
+    ATR_STOP_MULT, ATR_TGT_MULT, TRAIL_TRIGGER, TRAIL_STEP, ENTRY_OFFSET, ORDER_TYPE
 )
 from setup import (
     fyers, fyers_asysc, ticker, option_chain, df, spot_price,
@@ -82,12 +83,11 @@ def get_option_by_moneyness(spot_price_, side, moneyness='OTM', points=0):
     return symbol, strike
 
 # ===== Risk management helpers =====
+
 # def build_dynamic_levels(entry_price, side, atr_value):
 #     """
-#     Builds SL / TG / trailing levels for OPTION BUY trades (CALL & PUT).
-
-#     Returns:
-#         stop_loss, target, trail_start_pnl, trail_step_points
+#     Builds SL / TG / partial TG / trailing levels for OPTION BUY trades (CALL & PUT).
+#     Returns: stop_loss, full_target, partial_target, trail_start_pnl, trail_step_points
 #     """
 
 #     # ------------------------------
@@ -95,11 +95,16 @@ def get_option_by_moneyness(spot_price_, side, moneyness='OTM', points=0):
 #     # ------------------------------
 #     if atr_value is None or atr_value <= 0:
 #         sl = entry_price - profit_loss_point
-#         tg = entry_price + profit_loss_point
+#         full_tg = entry_price + profit_loss_point
+#         partial_tg = entry_price + profit_loss_point / 2
 #         trail_start = profit_loss_point
 #         trail_step  = profit_loss_point / 2
 
-#         return round(sl, 2), round(tg, 2), trail_start, trail_step
+#         if not (sl < entry_price < full_tg):
+#             logging.error(f"[SL/TG ERROR] side={side} entry={entry_price} SL={sl} TG={full_tg}")
+#             return None
+
+#         return round(sl, 2), round(full_tg, 2), round(partial_tg, 2), trail_start, trail_step
 
 #     # ------------------------------
 #     # ATR-based distances
@@ -109,74 +114,40 @@ def get_option_by_moneyness(spot_price_, side, moneyness='OTM', points=0):
 #     trail_start = TRAIL_TRIGGER * atr_value
 #     trail_step  = TRAIL_STEP    * atr_value
 
-#     # ------------------------------
-#     # OPTION BUY LOGIC (CALL & PUT)
-#     # ------------------------------
 #     sl = entry_price - stop_dist
-#     tg = entry_price + target_dist
+#     full_tg = entry_price + target_dist
+#     partial_tg = entry_price + target_dist / 2
 
-#     # ------------------------------
-#     # Defensive sanity check
-#     # ------------------------------
-#     if sl >= entry_price or tg <= entry_price:
-#         logging.error(
-#             f"[SL/TG ERROR] side={side} entry={entry_price} SL={sl} TG={tg}"
-#         )
+#     if not (sl < entry_price < full_tg):
+#         logging.error(f"[SL/TG ERROR] side={side} entry={entry_price} SL={sl} TG={full_tg}")
 #         return None
 
-#     return round(sl, 2), round(tg, 2), trail_start, trail_step
+#     return round(sl, 2), round(full_tg, 2), round(partial_tg, 2), trail_start, trail_step
 
-def build_dynamic_levels(entry_price, side, atr_value):
+
+def build_dynamic_levels(entry_price, side, atr_value=None):
     """
-    Builds SL / TG / partial TG / trailing levels for OPTION BUY trades (CALL & PUT).
-
-    Returns:
-        stop_loss, full_target, partial_target, trail_start_pnl, trail_step_points
+    Build SL / TG / partial TG / trailing levels for OPTION BUY trades.
+    Uses fixed profit_loss_point from config.py.
+    - Partial exit at +profit_loss_point
+    - Full exit at +2*profit_loss_point
+    - Hard stop at -15 points
+    - Trail in profit_loss_point increments
     """
 
-    # ------------------------------
-    # Fallback when ATR is unavailable
-    # ------------------------------
-    if atr_value is None or atr_value <= 0:
-        sl = entry_price - profit_loss_point if side == "CALL" else entry_price + profit_loss_point
-        full_tg = entry_price + profit_loss_point if side == "CALL" else entry_price - profit_loss_point
-        partial_tg = entry_price + profit_loss_point/2 if side == "CALL" else entry_price - profit_loss_point/2
-        trail_start = profit_loss_point
-        trail_step  = profit_loss_point / 2
+    # Fixed stop at -15 points
+    sl = entry_price - 15
 
-        return round(sl, 2), round(full_tg, 2), round(partial_tg, 2), trail_start, trail_step
+    # Partial and full targets
+    partial_tg = entry_price + profit_loss_point
+    full_tg    = entry_price + 2 * profit_loss_point
 
-    # ------------------------------
-    # ATR-based distances
-    # ------------------------------
-    stop_dist   = ATR_STOP_MULT * atr_value
-    target_dist = ATR_TGT_MULT  * atr_value
-    trail_start = TRAIL_TRIGGER * atr_value
-    trail_step  = TRAIL_STEP    * atr_value
-
-    # ------------------------------
-    # OPTION BUY LOGIC (CALL & PUT)
-    # ------------------------------
-    if side == "CALL":
-        sl = entry_price - stop_dist
-        full_tg = entry_price + target_dist
-        partial_tg = entry_price + target_dist / 2
-    else:  # PUT
-        sl = entry_price + stop_dist
-        full_tg = entry_price - target_dist
-        partial_tg = entry_price - target_dist / 2
-
-    # ------------------------------
-    # Defensive sanity check
-    # ------------------------------
-    if sl >= entry_price or full_tg <= entry_price:
-        logging.error(
-            f"[SL/TG ERROR] side={side} entry={entry_price} SL={sl} TG={full_tg}"
-        )
-        return None
+    # Trailing setup
+    trail_start = profit_loss_point
+    trail_step  = profit_loss_point
 
     return round(sl, 2), round(full_tg, 2), round(partial_tg, 2), trail_start, trail_step
-
+ 
 def update_trailing_stop(side, current_price, entry_price, current_stop, trail_start_pnl, trail_step_points):
     """
     Returns updated stop price
@@ -376,85 +347,164 @@ else:
 
 
 # ==== Order Processing Logic used for trade Exit =====
-def process_order(side, symbol, price, info, hist_data):
+
+# def process_order(side, symbol, price, info, hist_data):
+#     """
+#     Unified MTM loop for both paper and live trades with partial profit booking.
+#     side: "CALL" or "PUT"
+#     symbol: option symbol
+#     price: current LTP
+#     info: paper_info or live_info dict
+#     hist_data: DataFrame with historical OHLC data
+#     """
+
+#     leg = "call_buy" if side == "CALL" else "put_buy"
+#     trade = info[leg]
+
+#     if trade["trade_flag"] != 1:
+#         return
+
+#     entry = trade["buy_price"]
+#     qty   = trade["quantity"]
+
+#     # --- Stop-loss check ---
+#     if price <= trade["current_stop_price"]:
+#         pnl = (price - entry) * qty
+#         trade["pnl"] += pnl
+#         info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
+
+#         trade["trade_flag"] = 0
+#         trade["quantity"] = 0
+
+#         logging.info(f"[{side} EXIT][STOPLOSS] {symbol} @ {price:.2f} PnL={pnl:.2f} Total={info['total_pnl']:.2f}")
+#         return
+
+#     # --- Partial Profit Booking ---
+#     if not trade.get("partial_booked", False) and price >= trade["partial_target_price"]:
+#         half_qty = qty // 2
+#         pnl = (price - entry) * half_qty
+#         trade["pnl"] += pnl
+#         info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
+
+#         trade["quantity"] -= half_qty
+#         trade["partial_booked"] = True
+
+#         # Move SL to cost after partial exit
+#         trade["current_stop_price"] = entry
+
+#         logging.info(f"[{side} PARTIAL EXIT] {symbol} @ {price:.2f} Qty={half_qty} PnL={pnl:.2f}")
+
+#     # --- Full Target Check ---
+#     if price >= trade["full_target_price"]:
+#         pnl = (price - entry) * trade["quantity"]
+#         trade["pnl"] += pnl
+#         info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
+
+#         trade["trade_flag"] = 0
+#         trade["quantity"] = 0
+
+#         logging.info(f"[{side} EXIT][TARGET] {symbol} @ {price:.2f} PnL={pnl:.2f} Total={info['total_pnl']:.2f}")
+#         return
+
+#     # --- Trailing logic (after partial booked) ---
+#     if trade["partial_booked"]:
+#         pnl_points = price - entry
+#         trail_start = trade["trail_start_pnl"]   # profit_loss_point
+#         trail_step  = trade["trail_step_points"] # profit_loss_point
+
+#         if pnl_points >= trail_start:
+#             new_stop = entry + (pnl_points // trail_step) * trail_step
+#             if new_stop > trade["current_stop_price"]:
+#                 trade["current_stop_price"] = new_stop
+#                 logging.info(f"[TRAIL STOP UPDATE] {symbol} new SL={new_stop:.2f}")
+
+#     # --- MTM Logging ---
+#     logging.info(f"{'Paper' if 'paper' in info else 'Live'} MTM {side} {symbol} LTP={price:.2f} Entry={entry:.2f}")
+
+def send_exit_order(symbol, qty, reason):
     """
-    Unified MTM loop for both paper and live trades.
-    side: "CALL" or "PUT"
+    Send an exit order to Fyers and log response.
     symbol: option symbol
-    price: current LTP
-    info: paper_info or live_info dict
-    hist_data: DataFrame with historical OHLC data
+    qty: quantity to exit
+    reason: string for logging (STOPLOSS, PARTIAL, TARGET, EOD)
     """
+    exit_data = {
+        "symbol": symbol,
+        "qty": qty,
+        "type": 2,       # MARKET
+        "side": -1,      # SELL
+        "productType": "INTRADAY",
+        "validity": "DAY"
+    }
+    try:
+        response = fyers.place_order(exit_data)
+        if response.get("s") == "ok":
+            order_id = response.get("id")
+            logging.info(f"[EXIT][{reason}][BROKER SUCCESS] {symbol} Qty={qty} OrderID={order_id}")
+            return True, order_id
+        else:
+            logging.error(f"[EXIT][{reason}][BROKER FAILED] {symbol} error={response.get('message')}")
+            return False, None
+    except Exception as e:
+        logging.error(f"[EXIT][{reason}][BROKER EXCEPTION] {symbol} error={e}")
+        return False, None
 
-    # --- Calculate levels once per session ---
-    prev_day = hist_data.iloc[-1]
-    pivots = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-    cpr = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
-    camarilla = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-
-    # --- Determine leg key ---
+def process_order(side, symbol, price, info, hist_data):
     leg = "call_buy" if side == "CALL" else "put_buy"
+    trade = info[leg]
 
-    # --- Update trailing stop ---
-    new_stop = update_trailing_stop(
-        side,
-        price,
-        info[leg]["buy_price"],
-        info[leg]["current_stop_price"],
-        info[leg]["trail_start_pnl"],
-        info[leg]["trail_step_points"]
-    )
+    if trade["trade_flag"] != 1:
+        return
 
-    # --- Set target dynamically ---
-    info[leg]["current_profit_price"] = get_dynamic_target(
-        side,
-        info[leg]["buy_price"],
-        pivots,
-        cpr,
-        camarilla,
-        method=info[leg]["target_method"]  # "auto" by default
-    )
+    entry = trade["buy_price"]
+    qty   = trade["quantity"]
 
-    # --- Check if target has been reached ---
-    if (
-        (side == "CALL" and price >= info[leg]["current_profit_price"]) or
-        (side == "PUT" and price <= info[leg]["current_profit_price"])
-    ):
-        info[leg]["target_reached"] = True
+    # --- Stop-loss check ---
+    if price <= trade["current_stop_price"]:
+        success, order_id = send_exit_order(trade["option_name"], qty, "STOPLOSS")
+        if success:
+            trade["pnl"] += (price - entry) * qty
+            info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
+            trade["trade_flag"] = 0
+            trade["quantity"] = 0
+        return
 
-    # --- Exit logic ---
-    if info[leg].get("target_reached", False):
-        hit_stop = (
-            (side == "CALL" and price <= new_stop) or
-            (side == "PUT" and price >= new_stop)
-        )
-        if hit_stop:
-            logging.info(f"[EXIT TRAIL] {side} {symbol} LTP={price} Stop={new_stop}")
-            info[leg]["trade_flag"] = 0
-    else:
-        hit_target = (
-            (side == "CALL" and price >= info[leg]["current_profit_price"]) or
-            (side == "PUT" and price <= info[leg]["current_profit_price"])
-        )
-        hit_stop = (
-            (side == "CALL" and price <= new_stop) or
-            (side == "PUT" and price >= new_stop)
-        )
-        if hit_target or hit_stop:
-            logging.info(
-                f"[EXIT] {side} {symbol} LTP={price} Stop={new_stop} Target={info[leg]['current_profit_price']}"
-            )
-            info[leg]["trade_flag"] = 0
+    # --- Partial Profit Booking ---
+    if not trade.get("partial_booked", False) and price >= trade["partial_target_price"]:
+        half_qty = qty // 2
+        success, order_id = send_exit_order(trade["option_name"], half_qty, "PARTIAL")
+        if success:
+            trade["pnl"] += (price - entry) * half_qty
+            info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
+            trade["quantity"] -= half_qty
+            trade["partial_booked"] = True
+            trade["current_stop_price"] = entry  # move SL to cost
 
-    # --- PnL logging ---
-    pnl = (price - info[leg]["buy_price"]) * info[leg]["quantity"]
-    info[leg]["pnl"] = pnl
-    info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
+    # --- Full Target Check ---
+    if price >= trade["full_target_price"]:
+        success, order_id = send_exit_order(trade["option_name"], trade["quantity"], "TARGET")
+        if success:
+            trade["pnl"] += (price - entry) * trade["quantity"]
+            info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
+            trade["trade_flag"] = 0
+            trade["quantity"] = 0
+        return
 
-    logging.info(f"{'Paper' if 'paper' in info else 'Live'} PnL ({side}): {pnl:.2f}")
-    logging.info(f"{'Paper' if 'paper' in info else 'Live'} Total PnL: {info['total_pnl']:.2f}")
+    # --- Trailing logic ---
+    if trade["partial_booked"]:
+        pnl_points = price - entry
+        trail_start = trade["trail_start_pnl"]
+        trail_step  = trade["trail_step_points"]
 
-   
+        if pnl_points >= trail_start:
+            new_stop = entry + (pnl_points // trail_step) * trail_step
+            if new_stop > trade["current_stop_price"]:
+                trade["current_stop_price"] = new_stop
+                logging.info(f"[TRAIL STOP UPDATE] {symbol} new SL={new_stop:.2f}")
+
+    # --- MTM Logging ---
+    logging.info(f"{'Paper' if 'paper' in info else 'Live'} MTM {side} {symbol} LTP={price:.2f} Entry={entry:.2f}")
+
 
 # ===== paper_order =====
 def paper_order():
@@ -569,13 +619,16 @@ def paper_order():
     #                 )
 
     # ====================================================
-    # 4. ENTRY LOGIC
+    # 4. ENTRY LOGIC (Corrected with guards)
     # ====================================================
     if signal:
         side, reason = signal
         logging.info(f"[SIGNAL] {side} ({reason}) at spot={spot_price}")
 
-        if paper_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
+        # --- Guard: block new entry if any trade is already active ---
+        if paper_info["call_buy"]["trade_flag"] == 1 or paper_info["put_buy"]["trade_flag"] == 1:
+            logging.info("[ENTRY BLOCKED] Existing trade active, skipping new signal")
+        elif paper_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
             logging.info("[ENTRY] Max trades reached")
         else:
             leg = "call_buy" if side == "CALL" else "put_buy"
@@ -590,7 +643,7 @@ def paper_order():
                 if opt_name and opt_name in df.index:
                     ltp = df.loc[opt_name, "ltp"]
 
-                    # --- Build levels (now includes partial target) ---
+                    # --- Build levels (includes partial target) ---
                     stop, full_target, partial_target, trail_start, trail_step = build_dynamic_levels(
                         ltp, side, atr
                     )
@@ -610,7 +663,15 @@ def paper_order():
                         "pnl": 0
                     })
 
-                    entry_price = max(ltp - 5, 0.05)
+                    # entry_price = max(ltp - 5, 0.05)
+                    from config import ORDER_TYPE, ENTRY_OFFSET
+
+                    if ORDER_TYPE == "MARKET":
+                        entry_price = ltp
+                        order_type = "MARKET"
+                    else:
+                        entry_price = max(ltp - ENTRY_OFFSET, 0.05)
+                        order_type = "LIMIT"
 
                     paper_info[leg]["filled_df"].loc[ct] = [
                         opt_name, entry_price, "BUY", stop, full_target, spot_price, quantity
@@ -622,8 +683,7 @@ def paper_order():
                         f"[{side} ENTRY] {opt_name} @ {entry_price:.2f} "
                         f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}"
                     )
-
-
+    
     # ====================================================
     # 5. TRAILING STOP + EXIT MANAGEMENT (Unified)
     # ====================================================
@@ -657,6 +717,170 @@ def paper_order():
     store(paper_info, account_type)
 
 
+# # ===== real_order =====
+# def real_order():
+#     global quantity, live_info, df, spot_price, last_signal_candle_time
+
+#     ct = dt.now(time_zone)
+
+#     # ====================================================
+#     # 1. Refresh spot price
+#     # ====================================================
+#     try:
+#         if spot_price is None or pd.isna(spot_price):
+#             quote = fyers.quotes(data={"symbols": ticker})
+#             spot_price = quote["d"][0]["v"]["lp"]
+#     except Exception as e:
+#         logging.warning(f"[LIVE] Spot fetch failed: {e}")
+
+#     # ====================================================
+#     # 2. EOD FORCE EXIT
+#     # ====================================================
+#     if ct > end_time:
+#         logging.info("[LIVE] End time reached, closing open positions")
+
+#         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
+#             if live_info[leg]["trade_flag"] == 1:
+#                 name = live_info[leg]["option_name"]
+#                 ltp = df.loc[name, "ltp"] if name in df.index else None
+
+#                 live_info[leg]["filled_df"].loc[ct] = [
+#                     name, ltp, "SELL", 0, 0, spot_price, 0
+#                 ]
+#                 live_info[leg]["trade_flag"] = 2
+#                 live_info[leg]["quantity"] = 0
+
+#                 try:
+#                     fyers.exit_positions(data={"id": name + "-INTRADAY"})
+#                 except Exception as e:
+#                     logging.error(f"[LIVE EXIT][EOD] {name} failed: {e}")
+
+#                 logging.info(f"[{side} EXIT][EOD] {name} @ {ltp}")
+
+#         return
+
+#     # ====================================================
+#     # 3. SIGNAL EVALUATION (NEW 3M CANDLE ONLY)
+#     # ====================================================
+#     signal = None
+
+#     if not candles_3m.empty:
+#         last_candle_time = candles_3m.iloc[-1]["time"]
+
+#         if last_signal_candle_time != last_candle_time:
+#             last_signal_candle_time = last_candle_time
+
+#             atr, atr_source = resolve_atr(candles_3m, daily_atr)
+
+#             logging.info(
+#                 f"[SIGNAL EVAL] candle={last_candle_time} "
+#                 f"candles={len(candles_3m)} atr={atr} source={atr_source}"
+#             )
+
+#             prev_day = hist_data.iloc[-1]
+#             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
+#             trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
+#             cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
+
+#             signal = detect_signal(cpr, trad, cam, atr, candles_3m)
+
+#     # ====================================================
+#     # LIVE ENTRY LOGIC (Corrected with guards)
+#     # ====================================================
+#     if signal:
+#         side, reason = signal
+#         logging.info(f"[SIGNAL] {side} ({reason}) at spot={spot_price}")
+
+#         # --- Guard: block new entry if any trade is already active ---
+#         if live_info["call_buy"]["trade_flag"] == 1 or live_info["put_buy"]["trade_flag"] == 1:
+#             logging.info("[ENTRY BLOCKED] Existing trade active, skipping new signal")
+#             return
+
+#         if live_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
+#             logging.info("[ENTRY] Max trades reached")
+#             return
+
+#         leg = "call_buy" if side == "CALL" else "put_buy"
+
+#         if live_info[leg]["trade_flag"] == 0:
+#             opt_type = "CE" if side == "CALL" else "PE"
+#             opt_name, _ = get_option_by_moneyness(
+#                 spot_price, opt_type,
+#                 moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
+#             )
+
+#             if opt_name and opt_name in df.index:
+#                 ltp = df.loc[opt_name, "ltp"]
+
+#                 stop, full_target, partial_target, trail_start, trail_step = build_dynamic_levels(
+#                     ltp, side, atr
+#                 )
+
+#                 live_info[leg].update({
+#                     "option_name": opt_name,
+#                     "quantity": quantity,
+#                     "buy_price": ltp,
+#                     "current_stop_price": stop,
+#                     "full_target_price": full_target,
+#                     "partial_target_price": partial_target,
+#                     "trail_start_pnl": trail_start,
+#                     "trail_step_points": trail_step,
+#                     "trade_flag": 1,
+#                     "partial_booked": False,
+#                     "pnl": 0
+#                 })
+
+#                 # entry_price = max(ltp - 5, 0.05)
+#                 if ORDER_TYPE == "MARKET":
+#                     entry_price = ltp
+#                     order_type = "MARKET"
+#                 else:
+#                     entry_price = max(ltp - ENTRY_OFFSET, 0.05)
+#                     order_type = "LIMIT"
+
+#                 live_info[leg]["filled_df"].loc[ct] = [
+#                     opt_name, entry_price, "BUY", stop, full_target, spot_price, quantity
+#                 ]
+
+#                 live_info["trade_count"] = live_info.get("trade_count", 0) + 1
+
+#                 logging.info(
+#                     f"[{side} ENTRY] {opt_name} @ {entry_price:.2f} "
+#                     f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}"
+#                 )
+
+#         # ====================================================
+#         # 5. TRAILING STOP + EXIT MANAGEMENT (Unified)
+#         # ====================================================
+#         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
+#             if live_info[leg]["trade_flag"] != 1:
+#                 continue
+
+#             name = live_info[leg]["option_name"]
+#             price = df.loc[name, "ltp"] if name in df.index else None
+#             if price is None or pd.isna(price):
+#                 continue
+
+#             # Delegate to unified process_order()
+#             process_order(side, name, price, live_info, hist_data)
+
+#     # ====================================================
+#     # 6. SAVE TRADES
+#     # ====================================================
+#     frames = [
+#         live_info["call_buy"]["filled_df"],
+#         live_info["put_buy"]["filled_df"]
+#     ]
+#     frames = [f for f in frames if not f.empty]  # exclude empties
+
+#     if frames:  # only concat if at least one non-empty
+#         combined = pd.concat(frames)
+#         combined.to_csv(
+#             f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv"
+#         )
+
+#     store(live_info, account_type)
+
 # ===== real_order =====
 def real_order():
     global quantity, live_info, df, spot_price, last_signal_candle_time
@@ -682,20 +906,13 @@ def real_order():
         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
             if live_info[leg]["trade_flag"] == 1:
                 name = live_info[leg]["option_name"]
-                ltp = df.loc[name, "ltp"] if name in df.index else None
+                qty  = live_info[leg]["quantity"]
 
-                live_info[leg]["filled_df"].loc[ct] = [
-                    name, ltp, "SELL", 0, 0, spot_price, 0
-                ]
-                live_info[leg]["trade_flag"] = 2
-                live_info[leg]["quantity"] = 0
-
-                try:
-                    fyers.exit_positions(data={"id": name + "-INTRADAY"})
-                except Exception as e:
-                    logging.error(f"[LIVE EXIT][EOD] {name} failed: {e}")
-
-                logging.info(f"[{side} EXIT][EOD] {name} @ {ltp}")
+                success, order_id = send_exit_order(name, qty, "EOD")
+                if success:
+                    live_info[leg]["trade_flag"] = 2
+                    live_info[leg]["quantity"] = 0
+                    live_info[leg]["filled_df"].loc[ct] = [name, None, "SELL", 0, 0, spot_price, 0]
 
         return
 
@@ -703,19 +920,13 @@ def real_order():
     # 3. SIGNAL EVALUATION (NEW 3M CANDLE ONLY)
     # ====================================================
     signal = None
-
     if not candles_3m.empty:
         last_candle_time = candles_3m.iloc[-1]["time"]
-
         if last_signal_candle_time != last_candle_time:
             last_signal_candle_time = last_candle_time
 
             atr, atr_source = resolve_atr(candles_3m, daily_atr)
-
-            logging.info(
-                f"[SIGNAL EVAL] candle={last_candle_time} "
-                f"candles={len(candles_3m)} atr={atr} source={atr_source}"
-            )
+            logging.info(f"[SIGNAL EVAL] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}")
 
             prev_day = hist_data.iloc[-1]
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
@@ -725,129 +936,86 @@ def real_order():
             signal = detect_signal(cpr, trad, cam, atr, candles_3m)
 
     # ====================================================
-    # 4. ENTRY LOGIC
-    # ====================================================
-    # if signal:
-    #     side, reason = signal
-    #     logging.info(f"[SIGNAL][LIVE] {side} ({reason}) at spot={spot_price}")
-
-    #     if live_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
-    #         logging.info("[LIVE] Max trades reached")
-    #     else:
-    #         leg = "call_buy" if side == "CALL" else "put_buy"
-
-    #         if live_info[leg]["trade_flag"] == 0:
-    #             opt_type = "CE" if side == "CALL" else "PE"
-    #             opt_name, _ = get_option_by_moneyness(
-    #                 spot_price, opt_type,
-    #                 moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
-    #             )
-
-    #             if opt_name and opt_name in df.index:
-    #                 ltp = df.loc[opt_name, "ltp"]
-
-    #                 stop, target, trail_start, trail_step = build_dynamic_levels(
-    #                     ltp, side, atr
-    #                 )
-
-    #                 # ---- Broker BUY ----
-    #                 try:
-    #                     fyers.place_order({
-    #                         "symbol": opt_name,
-    #                         "qty": quantity,
-    #                         "type": 2,  # MARKET
-    #                         "side": 1,  # BUY
-    #                         "productType": "INTRADAY",
-    #                         "limitPrice": 0,
-    #                         "stopPrice": 0,
-    #                         "validity": "DAY",
-    #                         "disclosedQty": 0,
-    #                         "offlineOrder": "False"
-    #                     })
-    #                 except Exception as e:
-    #                     logging.error(f"[LIVE ENTRY FAILED] {opt_name}: {e}")
-    #                     return
-
-    #                 live_info[leg].update({
-    #                     "option_name": opt_name,
-    #                     "quantity": quantity,
-    #                     "buy_price": ltp,
-    #                     "current_stop_price": stop,
-    #                     "current_profit_price": target,
-    #                     "trail_start_pnl": trail_start,
-    #                     "trail_step_points": trail_step,
-    #                     "trade_flag": 1
-    #                 })
-
-    #                 live_info[leg]["filled_df"].loc[ct] = [
-    #                     opt_name, ltp, "BUY", stop, target, spot_price, quantity
-    #                 ]
-
-    #                 live_info["trade_count"] = live_info.get("trade_count", 0) + 1
-
-    #                 logging.info(
-    #                     f"[{side} ENTRY][LIVE] {opt_name} @ {ltp:.2f} "
-    #                     f"SL={stop:.2f} TG={target:.2f}"
-    #                 )
-
-    # ====================================================
-    # 4. ENTRY LOGIC
+    # 4. LIVE ENTRY LOGIC
     # ====================================================
     if signal:
         side, reason = signal
         logging.info(f"[SIGNAL] {side} ({reason}) at spot={spot_price}")
 
+        # --- Guard: block new entry if any trade is already active ---
+        if live_info["call_buy"]["trade_flag"] == 1 or live_info["put_buy"]["trade_flag"] == 1:
+            logging.info("[ENTRY BLOCKED] Existing trade active, skipping new signal")
+            return
+
         if live_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
             logging.info("[ENTRY] Max trades reached")
-        else:
-            leg = "call_buy" if side == "CALL" else "put_buy"
+            return
 
-            if live_info[leg]["trade_flag"] == 0:
-                opt_type = "CE" if side == "CALL" else "PE"
-                opt_name, _ = get_option_by_moneyness(
-                    spot_price, opt_type,
-                    moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
-                )
+        leg = "call_buy" if side == "CALL" else "put_buy"
 
-                if opt_name and opt_name in df.index:
-                    ltp = df.loc[opt_name, "ltp"]
+        if live_info[leg]["trade_flag"] == 0:
+            opt_type = "CE" if side == "CALL" else "PE"
+            opt_name, _ = get_option_by_moneyness(
+                spot_price, opt_type,
+                moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
+            )
 
-                    # --- Build levels (now includes partial target) ---
-                    stop, full_target, partial_target, trail_start, trail_step = build_dynamic_levels(
-                        ltp, side, atr
-                    )
+            if opt_name and opt_name in df.index:
+                ltp = df.loc[opt_name, "ltp"]
 
-                    # --- Update trade info ---
-                    live_info[leg].update({
-                        "option_name": opt_name,
-                        "quantity": quantity,
-                        "buy_price": ltp,
-                        "current_stop_price": stop,
-                        "full_target_price": full_target,
-                        "partial_target_price": partial_target,
-                        "trail_start_pnl": trail_start,
-                        "trail_step_points": trail_step,
-                        "trade_flag": 1,
-                        "partial_booked": False,
-                        "pnl": 0
-                    })
+                stop, full_target, partial_target, trail_start, trail_step = build_dynamic_levels(ltp, side, atr)
 
-                    entry_price = max(ltp - 5, 0.05)
+                # --- Decide entry price and order type ---
+                if ORDER_TYPE == "MARKET":
+                    entry_price = ltp
+                    order_type_code = 2   # MARKET
+                else:
+                    entry_price = max(ltp - ENTRY_OFFSET, 0.05)
+                    order_type_code = 1   # LIMIT
 
-                    live_info[leg]["filled_df"].loc[ct] = [
-                        opt_name, entry_price, "BUY", stop, full_target, spot_price, quantity
-                    ]
+                # --- Send BUY order to Fyers ---
+                order_data = {
+                    "symbol": opt_name,
+                    "qty": quantity,
+                    "type": order_type_code,
+                    "side": 1,                 # BUY
+                    "productType": "INTRADAY",
+                    "limitPrice": entry_price if order_type_code == 1 else 0,
+                    "validity": "DAY"
+                }
+                try:
+                    response = fyers.place_order(order_data)
+                    if response.get("s") == "ok":
+                        order_id = response.get("id")
+                        logging.info(f"[{side} ENTRY][BROKER SUCCESS] {opt_name} @ {entry_price:.2f} OrderID={order_id}")
 
-                    live_info["trade_count"] = live_info.get("trade_count", 0) + 1
-
-                    logging.info(
-                        f"[{side} ENTRY] {opt_name} @ {entry_price:.2f} "
-                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}"
-                    )
-
+                        # --- Update ledger only if broker confirms ---
+                        live_info[leg].update({
+                            "option_name": opt_name,
+                            "quantity": quantity,
+                            "buy_price": entry_price,
+                            "order_type": "MARKET" if order_type_code == 2 else "LIMIT",
+                            "current_stop_price": stop,
+                            "full_target_price": full_target,
+                            "partial_target_price": partial_target,
+                            "trail_start_pnl": trail_start,
+                            "trail_step_points": trail_step,
+                            "trade_flag": 1,
+                            "partial_booked": False,
+                            "pnl": 0,
+                            "order_id": order_id
+                        })
+                        live_info[leg]["filled_df"].loc[ct] = [opt_name, entry_price, "BUY", stop, full_target, spot_price, quantity]
+                        live_info["trade_count"] = live_info.get("trade_count", 0) + 1
+                    else:
+                        logging.error(f"[{side} ENTRY][BROKER FAILED] {opt_name} error={response.get('message')}")
+                        return
+                except Exception as e:
+                    logging.error(f"[{side} ENTRY][BROKER EXCEPTION] {opt_name} error={e}")
+                    return
 
     # ====================================================
-    # 5. TRAILING STOP + EXIT MANAGEMENT (Unified)
+    # 5. TRAILING STOP + EXIT MANAGEMENT
     # ====================================================
     for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
         if live_info[leg]["trade_flag"] != 1:
@@ -858,22 +1026,17 @@ def real_order():
         if price is None or pd.isna(price):
             continue
 
-        # Delegate to unified process_order()
+        # Delegate to unified process_order() (already patched to use send_exit_order)
         process_order(side, name, price, live_info, hist_data)
 
     # ====================================================
     # 6. SAVE TRADES
     # ====================================================
-    frames = [
-        live_info["call_buy"]["filled_df"],
-        live_info["put_buy"]["filled_df"]
-    ]
-    frames = [f for f in frames if not f.empty]  # exclude empties
+    frames = [live_info["call_buy"]["filled_df"], live_info["put_buy"]["filled_df"]]
+    frames = [f for f in frames if not f.empty]
 
-    if frames:  # only concat if at least one non-empty
+    if frames:
         combined = pd.concat(frames)
-        combined.to_csv(
-            f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv"
-        )
+        combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv")
 
     store(live_info, account_type)

@@ -31,8 +31,14 @@ strike_diff = 100
 account_type = 'PAPER'   # 'PAPER' or 'LIVE'
 quantity = 150
 buffer = 5
-profit_loss_point = 20
+profit_loss_point = 10
 MAX_TRADES_PER_DAY = 5
+
+# ========== Entry Params ==================
+
+# config.py
+ORDER_TYPE = "LIMIT"   # options: "LIMIT" or "MARKET"
+ENTRY_OFFSET = 5       # only used if LIMIT, e.g. ltp - 5
 
 time_zone = "Asia/Kolkata"
 start_hour, start_min = 9, 30

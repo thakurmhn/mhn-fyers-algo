@@ -3,7 +3,7 @@ import logging
 import pandas as pd
 import pendulum as dt
 
-from config import time_zone, ATR_PERIOD
+from config import time_zone, profit_loss_point
 from setup import spot_price, hist_data
 
 # globals (must exist once in your script)
@@ -12,21 +12,45 @@ candles_3m = pd.DataFrame(columns=["open","high","low","close","time"])
 current_3m_start = None
 
 # ===== Level calculators =====
+# def calculate_cpr(high, low, close):
+#     pivot = (high + low + close) / 3
+#     bc = (high + low) / 2
+#     tc = (pivot - bc) + pivot
+#     return {"Pivot": round(pivot, 2), "BC": round(bc, 2), "TC": round(tc, 2)}
+
 def calculate_cpr(high, low, close):
     pivot = (high + low + close) / 3
     bc = (high + low) / 2
     tc = (pivot - bc) + pivot
-    return {"Pivot": round(pivot, 2), "BC": round(bc, 2), "TC": round(tc, 2)}
-
-def calculate_camarilla_pivots(high, low, close):
-    range_val = high - low
-    pivots = {
-        "R3": close + (range_val * 1.1 / 4),
-        "R4": close + (range_val * 1.1 / 2),
-        "S3": close - (range_val * 1.1 / 4),
-        "S4": close - (range_val * 1.1 / 2),
+    return {
+        "pivot": round(pivot, 2),
+        "bc": round(bc, 2),
+        "tc": round(tc, 2)
     }
-    return {k: round(v, 2) for k, v in pivots.items()}
+
+# def calculate_camarilla_pivots(high, low, close):
+#     range_val = high - low
+#     pivots = {
+#         "R3": close + (range_val * 1.1 / 4),
+#         "R4": close + (range_val * 1.1 / 2),
+#         "S3": close - (range_val * 1.1 / 4),
+#         "S4": close - (range_val * 1.1 / 2),
+#     }
+#     return {k: round(v, 2) for k, v in pivots.items()}
+
+# def calculate_traditional_pivots(high, low, close):
+#     pivot = (high + low + close) / 3
+#     r1 = (2 * pivot) - low
+#     s1 = (2 * pivot) - high
+#     r2 = pivot + (high - low)
+#     s2 = pivot - (high - low)
+#     return {
+#         "Pivot": round(pivot, 2),
+#         "R1": round(r1, 2),
+#         "S1": round(s1, 2),
+#         "R2": round(r2, 2),
+#         "S2": round(s2, 2)
+#     }
 
 def calculate_traditional_pivots(high, low, close):
     pivot = (high + low + close) / 3
@@ -35,11 +59,24 @@ def calculate_traditional_pivots(high, low, close):
     r2 = pivot + (high - low)
     s2 = pivot - (high - low)
     return {
-        "Pivot": round(pivot, 2),
-        "R1": round(r1, 2),
-        "S1": round(s1, 2),
-        "R2": round(r2, 2),
-        "S2": round(s2, 2)
+        "pivot": round(pivot, 2),
+        "r1": round(r1, 2),
+        "s1": round(s1, 2),
+        "r2": round(r2, 2),
+        "s2": round(s2, 2)
+    }
+
+def calculate_camarilla_pivots(high, low, close):
+    range_val = high - low
+    r3 = close + (range_val * 1.1 / 4)
+    r4 = close + (range_val * 1.1 / 2)
+    s3 = close - (range_val * 1.1 / 4)
+    s4 = close - (range_val * 1.1 / 2)
+    return {
+        "r3": round(r3, 2),
+        "r4": round(r4, 2),
+        "s3": round(s3, 2),
+        "s4": round(s4, 2)
     }
 
 # ===== ATR =====
@@ -144,14 +181,16 @@ def build_3min_candle(price):
 # ===== Build levels once (optional print) + Daily ATR =====
 prev_day = hist_data.iloc[-1]
 prev_high, prev_low, prev_close = float(prev_day['high']), float(prev_day['low']), float(prev_day['close'])
+
 cpr_levels_base = calculate_cpr(prev_high, prev_low, prev_close)
 traditional_levels_base = calculate_traditional_pivots(prev_high, prev_low, prev_close)
 camarilla_levels_base = calculate_camarilla_pivots(prev_high, prev_low, prev_close)
+
 print(
-    f"CPR: Pivot={cpr_levels_base['Pivot']}, TC={cpr_levels_base['TC']}, BC={cpr_levels_base['BC']}\n"
-    f"Traditional: Pivot={traditional_levels_base['Pivot']}, R1={traditional_levels_base['R1']}, S1={traditional_levels_base['S1']}, "
-    f"R2={traditional_levels_base['R2']}, S2={traditional_levels_base['S2']}\n"
-    f"Camarilla: R3={camarilla_levels_base['R3']}, R4={camarilla_levels_base['R4']}, S3={camarilla_levels_base['S3']}, S4={camarilla_levels_base['S4']}"
+    f"CPR: Pivot={cpr_levels_base['pivot']}, TC={cpr_levels_base['tc']}, BC={cpr_levels_base['bc']}\n"
+    f"Traditional: Pivot={traditional_levels_base['pivot']}, R1={traditional_levels_base['r1']}, S1={traditional_levels_base['s1']}, "
+    f"R2={traditional_levels_base['r2']}, S2={traditional_levels_base['s2']}\n"
+    f"Camarilla: R3={camarilla_levels_base['r3']}, R4={camarilla_levels_base['r4']}, S3={camarilla_levels_base['s3']}, S4={camarilla_levels_base['s4']}"
 )
 
 daily_atr = calculate_atr(hist_data, period=14)
@@ -164,6 +203,7 @@ logging.info(
 
 def get_dynamic_target(side, entry_price, pivots, cpr, camarilla, method="auto"):
     """
+    Decide dynamic target based on method and side.
     side: "CALL" or "PUT"
     entry_price: option entry price
     pivots: dict with classic pivot levels {"pivot":..., "r1":..., "s1":..., ...}
@@ -175,26 +215,26 @@ def get_dynamic_target(side, entry_price, pivots, cpr, camarilla, method="auto")
     target = None
 
     if method == "classic":
-        target = pivots["r1"] if side == "CALL" else pivots["s1"]
+        target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
 
     elif method == "cpr":
-        # Use top central for CALL, bottom central for PUT
-        target = cpr["tc"] if side == "CALL" else cpr["bc"]
+        # For option BUY (CALL or PUT), premium profits when price rises → use tc
+        target = cpr.get("tc", entry_price + profit_loss_point)
 
     elif method == "camarilla":
-        target = camarilla["r3"] if side == "CALL" else camarilla["s3"]
+        target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
 
     elif method == "auto":
-        # Example auto logic:
-        # If ATR is small → use CPR (tight levels)
-        # If ATR is medium → use Classic pivots
-        # If ATR is large → use Camarilla (wider bands)
         atr = pivots.get("atr", 0)
         if atr < 20:
-            target = cpr["tc"] if side == "CALL" else cpr["bc"]
+            target = cpr.get("tc", entry_price + profit_loss_point)
         elif atr < 40:
-            target = pivots["r1"] if side == "CALL" else pivots["s1"]
+            target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
         else:
-            target = camarilla["r3"] if side == "CALL" else camarilla["s3"]
+            target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
+
+    # Fallback
+    if target is None:
+        target = entry_price + profit_loss_point
 
     return target
