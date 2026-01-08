@@ -14,6 +14,13 @@ import pendulum as dt
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
 
+# ANSI COLORS
+
+ 
+RESET = "\033[0m"
+GRAY = "\033[90m"
+
+
 async def main_strategy_code():
     global df
     while True:
@@ -33,7 +40,7 @@ async def main_strategy_code():
 
                 pos1 = await fyers_asysc.positions()
                 pnl = int(pos1.get('overall', {}).get('pl_total', 0))
-                logging.info(f"Live PnL from broker: {pnl}")
+                logging.info(f"{GRAY}Live PnL from broker: {pnl}")
             except Exception as e:
                 logging.error(f"Unable to fetch pnl or chase order: {e}")
 

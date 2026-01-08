@@ -11,13 +11,6 @@ ticks_buffer = []
 candles_3m = pd.DataFrame(columns=["open","high","low","close","time"])
 current_3m_start = None
 
-# ===== Level calculators =====
-# def calculate_cpr(high, low, close):
-#     pivot = (high + low + close) / 3
-#     bc = (high + low) / 2
-#     tc = (pivot - bc) + pivot
-#     return {"Pivot": round(pivot, 2), "BC": round(bc, 2), "TC": round(tc, 2)}
-
 def calculate_cpr(high, low, close):
     pivot = (high + low + close) / 3
     bc = (high + low) / 2
@@ -27,30 +20,6 @@ def calculate_cpr(high, low, close):
         "bc": round(bc, 2),
         "tc": round(tc, 2)
     }
-
-# def calculate_camarilla_pivots(high, low, close):
-#     range_val = high - low
-#     pivots = {
-#         "R3": close + (range_val * 1.1 / 4),
-#         "R4": close + (range_val * 1.1 / 2),
-#         "S3": close - (range_val * 1.1 / 4),
-#         "S4": close - (range_val * 1.1 / 2),
-#     }
-#     return {k: round(v, 2) for k, v in pivots.items()}
-
-# def calculate_traditional_pivots(high, low, close):
-#     pivot = (high + low + close) / 3
-#     r1 = (2 * pivot) - low
-#     s1 = (2 * pivot) - high
-#     r2 = pivot + (high - low)
-#     s2 = pivot - (high - low)
-#     return {
-#         "Pivot": round(pivot, 2),
-#         "R1": round(r1, 2),
-#         "S1": round(s1, 2),
-#         "R2": round(r2, 2),
-#         "S2": round(s2, 2)
-#     }
 
 def calculate_traditional_pivots(high, low, close):
     pivot = (high + low + close) / 3
