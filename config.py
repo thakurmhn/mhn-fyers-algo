@@ -31,8 +31,8 @@ strike_diff = 100
 account_type = 'PAPER'   # 'PAPER' or 'LIVE'
 quantity = 130
 buffer = 5
-profit_loss_point = 20
-MAX_TRADES_PER_DAY = 10
+profit_loss_point = 15
+MAX_TRADES_PER_DAY = 20
 
 # ========== Entry Params ==================
 
