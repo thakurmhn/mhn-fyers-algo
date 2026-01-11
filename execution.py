@@ -20,12 +20,16 @@ from indicators import (
 )
 from signals import detect_signal
 
+# ===========================================================
 # ANSI COLORS for order logs
 RESET   = "\033[0m"
 GREEN   = "\033[92m"
 YELLOW  = "\033[93m"
 RED     = "\033[91m"
 MAGENTA = "\033[95m"
+GRAY    = "\033[90m"
+
+#===========================================================
 
 
 def map_status_code(code):
@@ -333,7 +337,7 @@ def send_paper_exit_order(symbol, qty, reason):
     """
     Simulated exit for paper mode.
     """
-    logging.info(f"[PAPER EXIT][{reason}] {symbol} Qty={qty}")
+    logging.info(f"{MAGENTA}[PAPER EXIT][{reason}] {symbol} Qty={qty}{RESET}")
     return True, f"paper_exit_{symbol}_{reason}"
 
 def update_order_status(order_id, status, filled_qty, avg_price, symbol):
