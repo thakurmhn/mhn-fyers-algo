@@ -279,15 +279,18 @@ else:
 # ===== Broker order functions =====
 def send_live_entry_order(symbol, qty, side, buffer=ENTRY_OFFSET):
     try:
+        # Get LTP
         quote = fyers.quotes({"symbols": symbol})
         ltp = quote["d"][0]["v"]["lp"]
+
+        # Calculate limit price with buffer
         limit_price = max(ltp - buffer, 0.05)
 
         order_data = {
             "symbol": symbol,
             "qty": qty,
             "type": 1,              # LIMIT
-            "side": 1,              # BUY
+            "side": side,           # <-- use parameter (1=BUY, -1=SELL)
             "productType": "INTRADAY",
             "limitPrice": limit_price,
             "stopPrice": 0,
@@ -297,10 +300,12 @@ def send_live_entry_order(symbol, qty, side, buffer=ENTRY_OFFSET):
             "offlineOrder": False,
             "disclosedQty": 0,
             "isSliceOrder": False,
-            "orderTag": side
+            "orderTag": str(side)   # optional tag, stringified
         }
 
-        response = fyers.place_order(order_data)
+        # Correct call with data= keyword
+        response = fyers.place_order(data=order_data)
+
         if response.get("s") == "ok":
             return True, response.get("id")
         else:
@@ -326,20 +331,22 @@ def send_live_exit_order(symbol, qty, reason):
             "offlineOrder": False,
             "disclosedQty": 0,
             "isSliceOrder": False,
-            "orderTag": reason
+            "orderTag": str(reason) # ensure string tag
         }
 
-        response = fyers.place_order(order_data)
+        # ✅ Correct call with data= keyword
+        response = fyers.place_order(data=order_data)
+
         if response.get("s") == "ok":
-            logging.info(f"[LIVE EXIT][{reason}] {symbol} Qty={qty} OrderID={response.get('id')}")
+            logging.info(f"{MAGENTA}[LIVE EXIT][{reason}] {symbol} Qty={qty} OrderID={response.get('id')}{RESET}")
             return True, response.get("id")
         else:
             logging.error(f"[LIVE EXIT FAILED] {symbol} {response}")
             return False, None
     except Exception as e:
-        logging.error(f"[LIVE EXIT ERROR] {symbol} {e}")
+        logging.error(f"{RED}[LIVE EXIT ERROR] {symbol} {e}{RESET}")
         return False, None
-
+    
 def send_paper_exit_order(symbol, qty, reason):
     """
     Simulated exit for paper mode.
