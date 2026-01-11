@@ -173,16 +173,15 @@ def on_orders(message):
         order_id = orders.get("id")
         status_code = orders.get("status")
         filled_qty = orders.get("filledQty", 0)
-        avg_price = orders.get("limitPrice", 0)
+        traded_price = orders.get("tradedPrice", 0)   # <-- use tradedPrice
         symbol = orders.get("symbol")
 
-        # Use centralized mapping + ledger update
         status = map_status_code(status_code)
-        update_order_status(order_id, status, filled_qty, avg_price, symbol)
+        update_order_status(order_id, status, filled_qty, traded_price, symbol)
 
     except Exception as e:
         logging.error(f"[ORDER UPDATE ERROR] {e}")
-
+        
 def on_order_error(message):
     logging.error(f"[ORDER WS ERROR] {message}")
 

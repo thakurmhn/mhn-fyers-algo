@@ -33,7 +33,14 @@ GRAY    = "\033[90m"
 
 
 def map_status_code(code):
-    status_map = {6: "PENDING", 2: "CANCELLED", 4: "REJECTED", 90: "TRADED"}
+    status_map = {
+        1: "CANCELLED",
+        2: "TRADED",
+        4: "TRANSIT",
+        5: "REJECTED",
+        6: "PENDING",
+        7: "EXPIRED"
+    }
     return status_map.get(code, str(code))
 
 def status_color(status):
@@ -361,20 +368,24 @@ def update_order_status(order_id, status, filled_qty, avg_price, symbol):
 # ===== Order status polling =====
 def check_order_status(order_id, fyers):
     try:
-        response = fyers.order_status({"id": order_id})
+        response = fyers.orderbook(data={"id": order_id})   
         if response.get("s") == "ok":
-            status_code = response.get("orderStatus")
-            filled_price = response.get("filledPrice", 0)
-            symbol = response.get("symbol", "")
+            order = response.get("orderBook", [{}])[0]
+            status_code = order.get("status")
+            filled_qty = order.get("filledQty", 0)
+            traded_price = order.get("tradedPrice", 0)  
+            symbol = order.get("symbol")
+
             status = map_status_code(status_code)
-            update_order_status(order_id, status, response.get("filledQty", 0), filled_price, symbol)
-            return status, filled_price
+            update_order_status(order_id, status, filled_qty, traded_price, symbol)
+            return status, traded_price
         else:
-            logging.error(f"[ORDER STATUS FAILED] {order_id} {response}")
+            logging.warning(f"{RED}[ORDER STATUS] Failed for {order_id}: {response}{RESET}")
             return None, None
     except Exception as e:
-        logging.error(f"[ORDER STATUS ERROR] {order_id} {e}")
+        logging.error(f"[ORDER STATUS ERROR] {e}")
         return None, None
+
 
 # ===== Unified order processing =====
 def process_order(side, symbol, price, info, hist_data):
