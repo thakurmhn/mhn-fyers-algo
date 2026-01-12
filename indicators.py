@@ -11,6 +11,18 @@ ticks_buffer = []
 candles_3m = pd.DataFrame(columns=["open","high","low","close","time"])
 current_3m_start = None
 
+# ===========================================================
+# ANSI COLORS for order logs
+RESET   = "\033[0m"
+GREEN   = "\033[92m"
+YELLOW  = "\033[93m"
+RED     = "\033[91m"
+MAGENTA = "\033[95m"
+GRAY    = "\033[90m"
+
+#===========================================================
+
+
 def calculate_cpr(high, low, close):
     pivot = (high + low + close) / 3
     bc = (high + low) / 2
@@ -135,10 +147,10 @@ def build_3min_candle(price):
             candles_3m.loc[len(candles_3m)] = candle
 
             logging.info(
-                f"[3M CANDLE CLOSED] {current_3m_start.strftime('%H:%M:%S')} | "
+                f"{YELLOW}[3M CANDLE CLOSED] {current_3m_start.strftime('%H:%M:%S')} | "
                 f"O={candle['open']} H={candle['high']} "
                 f"L={candle['low']} C={candle['close']} |"
-                f"Spot={spot_price}"
+                f"Spot={spot_price}{RESET}"
             )
 
         # --- 4️⃣ Advance to next 3-minute window ---

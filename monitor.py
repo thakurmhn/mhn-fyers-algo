@@ -1,11 +1,26 @@
-import logging
-from setup import fyers_asysc   # async client instance
-from execution import RESET, GREEN, RED, YELLOW 
 
-def monitor_positions():
+from config import account_type
+from setup import fyers_asysc
+import logging
+
+# ANSI COLORS
+RESET   = "\033[0m"
+YELLOW  = "\033[93m"
+GRAY    = "\033[90m"
+
+async def monitor_positions():
+    """
+    Monitor broker positions every 5 seconds.
+    - Skips broker call in PAPER mode.
+    - Awaits async Fyers API in LIVE mode.
+    """
+    if account_type == "PAPER":
+        logging.info(f"{GRAY}[POSITION] Skipped broker positions (Paper mode){RESET}")
+        return
+
     try:
-        response = fyers_asysc.positions()
-        if response.get("s") == "ok":
+        response = await fyers_asysc.positions()   # ✅ await async call
+        if response and response.get("s") == "ok":
             net_positions = response.get("netPositions", [])
             overall = response.get("overall", {})
 
@@ -24,9 +39,9 @@ def monitor_positions():
                 )
 
             logging.info(
-                f"[PORTFOLIO] Total={overall.get('count_total',0)} "
+                f"{GRAY}[PORTFOLIO] Total={overall.get('count_total',0)} "
                 f"Open={overall.get('count_open',0)} "
-                f"PnL={overall.get('pl_total',0)}"
+                f"PnL={overall.get('pl_total',0)}{RESET}"
             )
         else:
             logging.warning(f"[POSITION] Failed: {response}")

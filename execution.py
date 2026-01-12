@@ -30,6 +30,14 @@ MAGENTA = "\033[95m"
 GRAY    = "\033[90m"
 
 #===========================================================
+# Initalize filled_df
+try:
+    filled_df
+except NameError:
+    filled_df = pd.DataFrame(columns=["status", "filled_qty", "avg_price", "symbol"])
+
+
+#===================================================================
 
 
 def map_status_code(code):
@@ -357,11 +365,12 @@ def send_paper_exit_order(symbol, qty, reason):
 def update_order_status(order_id, status, filled_qty, avg_price, symbol):
     global filled_df
     color = status_color(status)
+
     if order_id in filled_df.index:
         filled_df.loc[order_id, "status"] = status
         filled_df.loc[order_id, "filled_qty"] = filled_qty
         filled_df.loc[order_id, "avg_price"] = avg_price
-        logging.info(f"{color}[LEDGER UPDATED] {order_id} → {status}{RESET}")
+        logging.info(f"{YELLOW}[LEDGER UPDATED] {order_id} -> {status}{RESET}")  # ASCII arrow
     else:
         new_row = pd.DataFrame({
             "status": [status],
@@ -370,7 +379,8 @@ def update_order_status(order_id, status, filled_qty, avg_price, symbol):
             "symbol": [symbol]
         }, index=[order_id])
         filled_df = pd.concat([filled_df, new_row])
-        logging.info(f"{color}[LEDGER APPENDED] {order_id} → {status}{RESET}")
+        logging.info(f"{YELLOW}[LEDGER APPENDED] {order_id} -> {status}{RESET}")  # ASCII arrow
+
 
 # ===== Order status polling =====
 def check_order_status(order_id, fyers):
@@ -538,7 +548,7 @@ def paper_order():
             last_signal_candle_time = last_candle_time
 
             atr, atr_source = resolve_atr(candles_3m, daily_atr)
-            logging.info(f"[SIGNAL EVAL][PAPER] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}")
+            logging.info(f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}")
 
             prev_day = hist_data.iloc[-1]
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
@@ -550,7 +560,7 @@ def paper_order():
     # 4. PAPER ENTRY LOGIC
     if signal:
         side, reason = signal
-        logging.info(f"[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}")
+        logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}{RESET}")
 
         if paper_info["call_buy"]["trade_flag"] == 1 or paper_info["put_buy"]["trade_flag"] == 1:
             logging.info(f"{MAGENTA}[ENTRY BLOCKED][PAPER] Existing trade active, skipping new signal{RESET}")

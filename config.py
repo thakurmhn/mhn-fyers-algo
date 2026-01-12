@@ -1,6 +1,7 @@
 import os
 import logging
 import pendulum as dt
+import sys
 
 from dotenv import load_dotenv, find_dotenv
 
@@ -31,7 +32,7 @@ strike_diff = 100
 account_type = 'PAPER'   # 'PAPER' or 'LIVE'
 quantity = 130
 buffer = 5
-profit_loss_point = 15
+profit_loss_point = 10
 MAX_TRADES_PER_DAY = 20
 
 # ========== Entry Params ==================
@@ -55,6 +56,17 @@ ATR_TGT_MULT   = 2.0
 TRAIL_TRIGGER  = 1.0
 TRAIL_STEP     = 0.5
 
+# # ===== Logging =====
+# log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"
+
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format="%(asctime)s - %(levelname)s - %(message)s",
+#     handlers=[
+#         logging.StreamHandler(),  # defaults to sys.stderr
+#         logging.FileHandler(log_file, mode="a")
+#     ]
+# )
 # ===== Logging =====
 log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"
 
@@ -62,7 +74,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.StreamHandler(),  # defaults to sys.stderr
-        logging.FileHandler(log_file, mode="a")
+        logging.StreamHandler(stream=sys.stdout),  # force stdout
+        logging.FileHandler(log_file, mode="a", encoding="utf-8")  # ensure UTF-8 for file
     ]
 )

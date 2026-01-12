@@ -3,9 +3,21 @@ import logging
 from setup import spot_price
 from indicators import momentum_ok
 
+
+# ===========================================================
+# ANSI COLORS for order logs
+RESET   = "\033[0m"
+GREEN   = "\033[92m"
+YELLOW  = "\033[93m"
+RED     = "\033[91m"
+MAGENTA = "\033[95m"
+GRAY    = "\033[90m"
+
+#===========================================================
+
 def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles_3m_):
     logging.info(
-        f"[DETECT_SIGNAL CALLED] candles={len(candles_3m_)} atr={atr}"
+        f"{YELLOW}[DETECT_SIGNAL CALLED] candles={len(candles_3m_)} atr={atr}{RESET}"
     )
 
     # ---- Guards ----
@@ -47,10 +59,10 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
 
     # ---- DEBUG LOG ----
     logging.info(
-        f"[SIGNAL CHECK] "
+        f"{YELLOW}[SIGNAL CHECK] "
         f"close={last.close:.2f} spot={spot_price:.2f} "
         f"ATR={atr:.2f} body/range={body/rng:.2f} "
-        f"CALL_mom={call_momentum:.2f} PUT_mom={put_momentum:.2f}"
+        f"CALL_mom={call_momentum:.2f} PUT_mom={put_momentum:.2f}{RESET}"
     )
 
     # ===============================

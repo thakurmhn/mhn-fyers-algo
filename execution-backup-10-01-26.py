@@ -97,28 +97,28 @@ def get_option_by_moneyness(spot_price_, side, moneyness='OTM', points=0):
 # DO NOT DELETE
 # During Volatility provide Fix SL and increasing Targets with ATR
 
-# def build_dynamic_levels(entry_price, side, atr_value=None):
-#     """
-#     Build SL / TG / partial TG / trailing levels for OPTION BUY trades.
-#     Uses fixed profit_loss_point from config.py.
-#     - Partial exit at +profit_loss_point
-#     - Full exit at +2*profit_loss_point
-#     - Hard stop at -15 points
-#     - Trail in profit_loss_point increments
-#     """
+def build_dynamic_levels(entry_price, side, atr_value=None):
+    """
+    Build SL / TG / partial TG / trailing levels for OPTION BUY trades.
+    Uses fixed profit_loss_point from config.py.
+    - Partial exit at +profit_loss_point
+    - Full exit at +2*profit_loss_point
+    - Hard stop at -15 points
+    - Trail in profit_loss_point increments
+    """
 
-#     # Fixed stop at -15 points
-#     sl = entry_price - 15
+    # Fixed stop at -15 points
+    sl = entry_price - 15
 
-#     # Partial and full targets
-#     partial_tg = entry_price + profit_loss_point
-#     full_tg    = entry_price + 2 * profit_loss_point
+    # Partial and full targets
+    partial_tg = entry_price + profit_loss_point
+    full_tg    = entry_price + 2 * profit_loss_point
 
-#     # Trailing setup
-#     trail_start = profit_loss_point
-#     trail_step  = profit_loss_point
+    # Trailing setup
+    trail_start = profit_loss_point
+    trail_step  = profit_loss_point
 
-#     return round(sl, 2), round(full_tg, 2), round(partial_tg, 2), trail_start, trail_step
+    return round(sl, 2), round(full_tg, 2), round(partial_tg, 2), trail_start, trail_step
 
 def build_dynamic_levels(entry_price, side, atr, rr_ratio=2.0):
     """

@@ -74,7 +74,7 @@ import pandas as pd
 from config import account_type, time_zone
 from setup import fyers_asysc, df, end_time
 from execution import paper_order, real_order
-from data_feed import fyers_socket, fyers_order_socket, chase_order 
+from data_feed import fyers_socket, fyers_order_socket, chase_order
 from monitor import monitor_positions
 
 import pendulum as dt
@@ -106,8 +106,10 @@ async def main_strategy_code():
 
                 pos1 = await fyers_asysc.positions()
                 pnl = int(pos1.get('overall', {}).get('pl_total', 0))
-                #logging.info(f"{GRAY}Live PnL from broker: {pnl}{RESET}")
-                monitor_positions()
+                logging.info(f"{GRAY}Live PnL from broker: {pnl}{RESET}")
+
+                # ✅ Await monitor_positions since it's async
+                await monitor_positions()
 
             except Exception as e:
                 logging.error(f"Unable to fetch pnl or chase order: {e}")
