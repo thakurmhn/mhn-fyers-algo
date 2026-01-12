@@ -16,10 +16,6 @@ secret_key = os.getenv("FYERS_SECRET_KEY")
 access_token = os.getenv("FYERS_ACCESS_TOKEN")
 redirect_uri = os.getenv("FYERS_REDIRECT_URI")
 
-# ===== Credentials =====
-# client_id = ""
-# secret_key = ""
-# redirect_uri = ""
 
 # ===== Strategy parameters =====
 strategy_name = 'option_buying_pivot'
@@ -33,7 +29,10 @@ account_type = 'PAPER'   # 'PAPER' or 'LIVE'
 quantity = 130
 buffer = 5
 profit_loss_point = 10
-MAX_TRADES_PER_DAY = 20
+hard_stop_points  = 15
+TRAILING_SL_BUFFER = 0.5        # 50% Buffer of profit_loss_point
+
+MAX_TRADES_PER_DAY = 30
 
 # ========== Entry Params ==================
 
@@ -56,17 +55,6 @@ ATR_TGT_MULT   = 2.0
 TRAIL_TRIGGER  = 1.0
 TRAIL_STEP     = 0.5
 
-# # ===== Logging =====
-# log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"
-
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format="%(asctime)s - %(levelname)s - %(message)s",
-#     handlers=[
-#         logging.StreamHandler(),  # defaults to sys.stderr
-#         logging.FileHandler(log_file, mode="a")
-#     ]
-# )
 # ===== Logging =====
 log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"
 

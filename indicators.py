@@ -3,7 +3,7 @@ import logging
 import pandas as pd
 import pendulum as dt
 
-from config import time_zone, profit_loss_point
+from config import time_zone, profit_loss_point, hard_stop_points
 from setup import spot_price, hist_data
 
 # globals (must exist once in your script)
@@ -149,8 +149,7 @@ def build_3min_candle(price):
             logging.info(
                 f"{YELLOW}[3M CANDLE CLOSED] {current_3m_start.strftime('%H:%M:%S')} | "
                 f"O={candle['open']} H={candle['high']} "
-                f"L={candle['low']} C={candle['close']} |"
-                f"Spot={spot_price}{RESET}"
+                f"L={candle['low']} C={candle['close']}{RESET}"
             )
 
         # --- 4️⃣ Advance to next 3-minute window ---
@@ -219,3 +218,33 @@ def get_dynamic_target(side, entry_price, pivots, cpr, camarilla, method="auto")
         target = entry_price + profit_loss_point
 
     return target
+
+def get_dynamic_stop(side, entry_price, pivots, cpr, camarilla, method="auto"):
+    """
+    Decide dynamic stoploss based on method and side.
+    """
+    stop = None
+
+    if method == "classic":
+        stop = pivots.get("s1") if side == "CALL" else pivots.get("r1")
+
+    elif method == "cpr":
+        stop = cpr.get("bc", entry_price - hard_stop_points)
+
+    elif method == "camarilla":
+        stop = camarilla.get("s3") if side == "CALL" else camarilla.get("r3")
+
+    elif method == "auto":
+        atr = pivots.get("atr", 0)
+        if atr < 20:
+            stop = cpr.get("bc", entry_price - hard_stop_points)
+        elif atr < 40:
+            stop = pivots.get("s1") if side == "CALL" else pivots.get("r1")
+        else:
+            stop = camarilla.get("s3") if side == "CALL" else camarilla.get("r3")
+
+    # Fallback
+    if stop is None:
+        stop = entry_price - hard_stop_points
+
+    return stop

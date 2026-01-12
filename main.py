@@ -1,3 +1,4 @@
+
 # # ===== main.py =====
 # import asyncio
 # import time
@@ -7,19 +8,17 @@
 # from config import account_type, time_zone
 # from setup import fyers_asysc, df, end_time
 # from execution import paper_order, real_order
-# from data_feed import fyers_socket, chase_order
+# from data_feed import fyers_socket, fyers_order_socket, chase_order
+# from monitor import monitor_positions
 
 # import pendulum as dt
-
 # import warnings
 # warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
 
 # # ANSI COLORS
-
- 
-# RESET = "\033[0m"
-# GRAY = "\033[90m"
-
+# RESET   = "\033[0m"
+# GRAY    = "\033[90m"
+# CYAN    = "\033[96m"
 
 # async def main_strategy_code():
 #     global df
@@ -36,11 +35,16 @@
 #             try:
 #                 order_response = await fyers_asysc.orderbook()
 #                 order_df = pd.DataFrame(order_response['orderBook']) if order_response.get('orderBook') else pd.DataFrame()
+#                 logging.info(f"{CYAN}[CHASE] Checking pending orders...{RESET}")
 #                 chase_order(order_df)
 
 #                 pos1 = await fyers_asysc.positions()
 #                 pnl = int(pos1.get('overall', {}).get('pl_total', 0))
-#                 logging.info(f"{GRAY}Live PnL from broker: {pnl}")
+#                 logging.info(f"{GRAY}Live PnL from broker: {pnl}{RESET}")
+
+#                 # ✅ Await monitor_positions since it's async
+#                 await monitor_positions()
+
 #             except Exception as e:
 #                 logging.error(f"Unable to fetch pnl or chase order: {e}")
 
@@ -53,7 +57,9 @@
 #         await asyncio.sleep(1)
 
 # def run():
+#     # Connect both sockets: market data + order status
 #     fyers_socket.connect()
+#     fyers_order_socket.connect()
 #     time.sleep(2)
 #     try:
 #         asyncio.run(main_strategy_code())
@@ -70,6 +76,7 @@ import asyncio
 import time
 import logging
 import pandas as pd
+import sys
 
 from config import account_type, time_zone
 from setup import fyers_asysc, df, end_time
@@ -132,7 +139,16 @@ def run():
     except KeyboardInterrupt:
         logging.info("Manual interrupt received, shutting down.")
     finally:
+        # ✅ Explicitly disconnect sockets
+        try:
+            fyers_socket.disconnect()
+            fyers_order_socket.disconnect()
+            logging.info("Sockets disconnected.")
+        except Exception as e:
+            logging.warning(f"Error disconnecting sockets: {e}")
+
         logging.info("Program terminated.")
+        sys.exit(0)  # ✅ Force exit to kill any lingering threads
 
 if __name__ == "__main__":
     run()
