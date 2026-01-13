@@ -35,17 +35,14 @@ def onmessage(ticks):
         build_3min_candle(spot_price)
 
 def onerror(message):
-    logging.error(f"Socket error: {message}")
+    logging.error(f"[DATA WS ERROR] {message}")
 
 def onclose(message):
-    logging.info(f"Connection closed: {message}")
+    logging.info(f"[DATA WS CLOSED] {message}")
 
 def onopen():
-    # Subscribe to option symbols (you can also subscribe to underlying ticker if available)
-    data_type = "SymbolUpdate"
-    fyers_socket.subscribe(symbols=symbols, data_type=data_type)
-    fyers_socket.keep_running()
-    logging.info("Starting market data socket")
+    logging.info("[DATA WS CONNECTED] Subscribing to symbols...")
+    fyers_socket.subscribe(symbols=symbols, data_type="SymbolUpdate")
 
 # ===== Data socket =====
 fyers_socket = data_ws.FyersDataSocket(
@@ -59,6 +56,20 @@ fyers_socket = data_ws.FyersDataSocket(
     on_error=onerror,
     on_message=onmessage
 )
+
+# Safe start
+def start_data_socket():
+    fyers_socket.connect()
+    fyers_socket.keep_running()
+
+def stop_data_socket():
+    try:
+        if hasattr(fyers_socket, "stop_running"):
+            fyers_socket.stop_running()
+        elif hasattr(fyers_socket, "close"):
+            fyers_socket.close()
+    except Exception as e:
+        logging.warning(f"[DATA WS SHUTDOWN ERROR] {e}")
 
 # ===== Order chasing =====
 def chase_order(ord_df):
@@ -109,7 +120,6 @@ def on_order_close(message):
 def on_order_open():
     logging.info("[ORDER WS CONNECTED] Subscribing to OnOrders...")
     fyers_order_socket.subscribe(data_type="OnOrders")
-    fyers_order_socket.keep_running()
 
 # ===== Order socket =====
 fyers_order_socket = order_ws.FyersOrderSocket(
@@ -122,3 +132,15 @@ fyers_order_socket = order_ws.FyersOrderSocket(
     on_orders=on_orders,
 )
 
+def start_order_socket():
+    fyers_order_socket.connect()
+    fyers_order_socket.keep_running()
+
+def stop_order_socket():
+    try:
+        if hasattr(fyers_order_socket, "stop_running"):
+            fyers_order_socket.stop_running()
+        elif hasattr(fyers_order_socket, "close"):
+            fyers_order_socket.close()
+    except Exception as e:
+        logging.warning(f"[ORDER WS SHUTDOWN ERROR] {e}")

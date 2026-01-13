@@ -4,6 +4,7 @@ import pendulum as dt
 import sys
 
 from dotenv import load_dotenv, find_dotenv
+import datetime
 
 #load_dotenv("C:\\Users\\mohan\\mhn-fyers-algo\\.env")
 
@@ -26,13 +27,25 @@ ticker = f"{exchange}:{index_name}-INDEX"
 strike_count = 10
 strike_diff = 100
 account_type = 'PAPER'   # 'PAPER' or 'LIVE'
-quantity = 130
-buffer = 5
-profit_loss_point = 10
-hard_stop_points  = 15
-TRAILING_SL_BUFFER = 0.5        # 50% Buffer of profit_loss_point
 
-MAX_TRADES_PER_DAY = 30
+
+
+quantity = 130
+buffer = 5          # Limit Order Buffer
+
+
+# ======================== Trade setup variables ================================
+MAX_TRADES_PER_DAY = 5
+profit_loss_point = 10
+hard_stop_points = 15
+TRAILING_SL_BUFFER = 0.5
+
+# Expiry day overrides
+if datetime.date.today().weekday() == 1:  # Tuesday
+    profit_loss_point = 8
+    MAX_TRADES_PER_DAY = 5
+    MIN_MOMENTUM = 30
+    ATR_MAX = 60
 
 # ========== Entry Params ==================
 
@@ -54,6 +67,10 @@ ATR_STOP_MULT  = 1.0
 ATR_TGT_MULT   = 2.0
 TRAIL_TRIGGER  = 1.0
 TRAIL_STEP     = 0.5
+
+# ===== Backtesting ========
+
+TEST_MODE = 'live'      # 'replay/live' 'replay' for backtesting 
 
 # ===== Logging =====
 log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"
