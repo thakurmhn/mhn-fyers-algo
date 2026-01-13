@@ -69,8 +69,17 @@ TRAIL_TRIGGER  = 1.0
 TRAIL_STEP     = 0.5
 
 # ===== Backtesting ========
+"""
+replay/live
 
-TEST_MODE = 'live'      # 'replay/live' 'replay' for backtesting 
+With replay more signal will be produced with relaxed thresholds (atr and other parameters)
+Where as live mode it will only take trades on strong signals
+
+essentially replay mode is used for backtesting to generate trades 
+
+"""
+
+TEST_MODE = 'replay'
 
 # ===== Logging =====
 log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"
