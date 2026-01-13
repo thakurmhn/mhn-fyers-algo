@@ -1,6 +1,7 @@
 # ===== indicators.py =====
 import logging
 import pandas as pd
+import numpy as np
 import pendulum as dt
 
 from config import time_zone, profit_loss_point, hard_stop_points
@@ -248,3 +249,188 @@ def get_dynamic_stop(side, entry_price, pivots, cpr, camarilla, method="auto"):
         stop = entry_price - hard_stop_points
 
     return stop
+
+
+
+def calculate_cci(
+    df: pd.DataFrame,
+    length: int = 20,
+    smoothing: str = "EMA",
+    smoothing_length: int = 20
+):
+    """
+    Calculate Commodity Channel Index (CCI) with optional smoothing.
+
+    Required columns in df: ['high', 'low', 'close']
+
+    Returns:
+        DataFrame with columns:
+        - CCI
+        - CCI_SMOOTH (EMA-smoothed CCI)
+    """
+
+    required_cols = {"high", "low", "close"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError(f"DataFrame must contain {required_cols}")
+
+    # Typical Price
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+
+    # SMA of TP
+    sma_tp = tp.rolling(length).mean()
+
+    # Mean Deviation
+    mean_dev = (
+        tp.rolling(length)
+        .apply(lambda x: np.mean(np.abs(x - x.mean())), raw=False)
+    )
+
+    # CCI
+    cci = (tp - sma_tp) / (0.015 * mean_dev)
+    df["CCI"] = cci
+
+    # Smoothing
+    if smoothing.upper() == "EMA":
+        df["CCI_SMOOTH"] = df["CCI"].ewm(
+            span=smoothing_length, adjust=False
+        ).mean()
+    elif smoothing.upper() == "SMA":
+        df["CCI_SMOOTH"] = df["CCI"].rolling(smoothing_length).mean()
+    else:
+        df["CCI_SMOOTH"] = df["CCI"]
+
+    return df
+
+def cci_cross_signal(df):
+    """
+    Detect CCI crossing its EMA.
+
+    Returns:
+        "BULLISH" | "BEARISH" | None
+    """
+
+    if len(df) < 2:
+        return None
+
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+
+    # Safety check
+    if any(pd.isna(x) for x in [
+        prev.CCI, prev.CCI_SMOOTH,
+        curr.CCI, curr.CCI_SMOOTH
+    ]):
+        return None
+
+    # Bullish cross: below -> above
+    if prev.CCI < prev.CCI_SMOOTH and curr.CCI > curr.CCI_SMOOTH:
+        return "BULLISH"
+
+    # Bearish cross: above -> below
+    if prev.CCI > prev.CCI_SMOOTH and curr.CCI < curr.CCI_SMOOTH:
+        return "BEARISH"
+
+    return None
+
+def cci_cross_signal(df):
+    """
+    Detect CCI crossing its EMA.
+
+    Returns:
+        "BULLISH" | "BEARISH" | None
+    """
+
+    if len(df) < 2:
+        return None
+
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+
+    # Safety check
+    if any(pd.isna(x) for x in [
+        prev.CCI, prev.CCI_SMOOTH,
+        curr.CCI, curr.CCI_SMOOTH
+    ]):
+        return None
+
+    # Bullish cross: below -> above
+    if prev.CCI < prev.CCI_SMOOTH and curr.CCI > curr.CCI_SMOOTH:
+        return "BULLISH"
+
+    # Bearish cross: above -> below
+    if prev.CCI > prev.CCI_SMOOTH and curr.CCI < curr.CCI_SMOOTH:
+        return "BEARISH"
+
+    return None
+
+def cci_cross_up(df, margin=0):
+    """
+    Detect bullish CCI crossover with optional margin.
+    Returns True if CCI has crossed above EMA by at least `margin`.
+    """
+    if len(df) < 2:
+        return False
+    p, c = df.iloc[-2], df.iloc[-1]
+    return (
+        p.CCI < p.CCI_SMOOTH and
+        c.CCI > c.CCI_SMOOTH and
+        (c.CCI - c.CCI_SMOOTH) > margin
+    )
+
+def cci_cross_up_strict(df, margin=0):
+    if len(df) < 2:
+        return False
+    p, c = df.iloc[-2], df.iloc[-1]
+    return (
+        p.CCI < p.CCI_SMOOTH and
+        c.CCI > c.CCI_SMOOTH and
+        (c.CCI - c.CCI_SMOOTH) > margin
+    )
+
+def cci_cross_down(df, margin=0):
+    """
+    Detect bearish CCI crossover with optional margin.
+    Returns True if CCI has crossed below EMA by at least `margin`.
+    """
+    if len(df) < 2:
+        return False
+    p, c = df.iloc[-2], df.iloc[-1]
+    return (
+        p.CCI > p.CCI_SMOOTH and
+        c.CCI < c.CCI_SMOOTH and
+        (p.CCI - c.CCI) > margin
+    )
+
+def cci_cross_down_strict(df, margin=0):
+    if len(df) < 2:
+        return False
+    p, c = df.iloc[-2], df.iloc[-1]
+    return (
+        p.CCI > p.CCI_SMOOTH and
+        c.CCI < c.CCI_SMOOTH and
+        (p.CCI - c.CCI) > margin
+    )
+
+def strong_trade_with_cci(df, side, momentum, rng, atr, body_ratio, margin=5):
+    """
+    Extended strong trade check that includes CCI crossover.
+    """
+    # --- Candle strength check (existing logic) ---
+    strength_ok = body_ratio > 0.6
+    
+    mom_ok = momentum > 0  # or your momentum_ok logic
+
+    # --- CCI crossover check ---
+    if side == "CALL":
+        cci_ok = cci_cross_up_strict(df, margin=margin)
+    else:
+        cci_ok = cci_cross_down_strict(df, margin=margin)
+
+    # --- ATR filter ---
+    atr_ok = atr > 20
+
+    # Final decision
+    ok = strength_ok and mom_ok and cci_ok and atr_ok
+    reason = None if ok else f"strength={strength_ok}, mom={mom_ok}, cci={cci_ok}, atr={atr_ok}"
+    return ok, reason
+

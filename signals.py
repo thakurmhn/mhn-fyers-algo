@@ -1,7 +1,7 @@
 # ===== signals.py =====
 import logging
 from setup import spot_price
-from indicators import momentum_ok
+from indicators import momentum_ok, calculate_cci, cci_cross_up_strict, cci_cross_down_strict, cci_cross_up, cci_cross_down
 import datetime
 import config
 import numpy as np
@@ -488,7 +488,25 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
                 signal = ("CALL", "CONTINUATION_R4_BREAK")
     
     if signal:
-        # Always compute rng and body_ratio from the last candle
+        # --- ATR filter ---
+        if atr <= 20:
+            logging.info(f"{CYAN}[SIGNAL REJECTED][FILTER] {signal}{RESET} | ATR={atr:.2f} below threshold")
+            return None
+
+        # --- CCI strict crossover filter ---
+        df = calculate_cci(candles_3m_)
+
+        if signal[0] == "CALL":
+            if not cci_cross_up_strict(df, margin=5):  # margin optional
+                logging.info(f"{CYAN}[SIGNAL REJECTED][FILTER] {signal}{RESET} | CPR CALL but no strict bullish CCI cross")
+                return None
+
+        if signal[0] == "PUT":
+            if not cci_cross_down_strict(df, margin=2):  # margin optional
+                logging.info(f"{CYAN}[SIGNAL REJECTED][FILTER] {signal}{RESET} | CPR PUT but no strict bearish CCI cross")
+                return None
+
+        # --- Existing strong_trade_fn filter ---
         last = candles_3m_.iloc[-1]
         rng = last["high"] - last["low"]
         body = abs(last["close"] - last["open"])
@@ -501,14 +519,13 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
             body_ratio
         )
         if ok:
-            logging.info(f"{CYAN}[SIGNAL ACCEPTED][FILTER] {signal}{RESET}")
+            logging.info(f"{CYAN}[SIGNAL ACCEPTED][FILTER] {signal}{RESET} | Strict CCI confirmed")
             return signal, None
         else:
             logging.info(f"{CYAN}[SIGNAL REJECTED][FILTER] {signal}{RESET} | {reason}")
             return None
+
     return None
-
-
 
 
 
