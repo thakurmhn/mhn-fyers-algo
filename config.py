@@ -35,7 +35,7 @@ buffer = 5          # Limit Order Buffer
 
 
 # ======================== Trade setup variables ================================
-MAX_TRADES_PER_DAY = 5
+MAX_TRADES_PER_DAY = 50
 profit_loss_point = 10
 hard_stop_points = 15
 TRAILING_SL_BUFFER = 0.5
@@ -45,9 +45,12 @@ if datetime.date.today().weekday() == 1:  # Tuesday
     profit_loss_point = 8
     MAX_TRADES_PER_DAY = 5
     MIN_MOMENTUM = 30
-    ATR_MAX = 60
+    # ATR_MAX = 60
 
 # ========== Entry Params ==================
+
+MIN_MOMENTUM = 0
+ATR_MAX = None  # legacy placeholder, not used
 
 # config.py
 ORDER_TYPE = "LIMIT"   # options: "LIMIT" or "MARKET"
