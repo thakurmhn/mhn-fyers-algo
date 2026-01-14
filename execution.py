@@ -116,19 +116,50 @@ def build_dynamic_levels(entry_price, side, atr, rr_ratio=2.0):
     trail_step  = atr * 0.1
     return stop, full_target, partial_target, trail_start, trail_step
 
-def update_trailing_stop(side, current_price, entry_price, current_stop, trail_start_pnl, trail_step_points):
+def update_trailing_stop(
+    side,
+    current_price,
+    entry_price,
+    current_stop,
+    trail_start_pnl,
+    trail_step_points,
+    min_gap_factor=0.5
+):
+    """
+    SAFE trailing stop update:
+    - Activates only after trail_start_pnl
+    - Enforces minimum gap from LTP
+    - Prevents micro-adjustments
+    """
+
+    # Calculate PnL from entry
+    pnl = (current_price - entry_price) if side == "CALL" else (entry_price - current_price)
+
+    # Trailing not active yet
+    if pnl < trail_start_pnl:
+        return current_stop
+
+    # Minimum distance between LTP and SL
+    min_gap = trail_step_points * min_gap_factor
+
     if side == "CALL":
-        pnl = current_price - entry_price
-        if pnl >= trail_start_pnl:
-            candidate = current_price - trail_step_points
-            return max(current_stop, candidate)
-        return current_stop
+        candidate = current_price - trail_step_points
+
+        # Do not trail too close to price
+        if current_price - candidate < min_gap:
+            return current_stop
+
+        return max(current_stop, candidate)
+
     else:
-        pnl = entry_price - current_price
-        if pnl >= trail_start_pnl:
-            candidate = current_price + trail_step_points
-            return min(current_stop, candidate)
-        return current_stop
+        candidate = current_price + trail_step_points
+
+        # Do not trail too close to price
+        if candidate - current_price < min_gap:
+            return current_stop
+
+        return min(current_stop, candidate)
+
 
 # ===== PAPER/LIVE STATE INIT =====
 if account_type == 'PAPER':
@@ -408,8 +439,11 @@ def check_order_status(order_id, fyers):
 def process_order(side, symbol, price, info, hist_data):
     """
     Unified MTM loop for both paper and live trades with partial profit booking.
-    Exits are broker-confirmed in live mode, simulated in paper mode.
-    Stores order_id into trade['order_id'] for audit trail.
+    SAFE PATCHES:
+    - Delay trailing by one candle after partial booking
+    - Minimum locked profit after partial
+    - Trailing step floor to reduce noise
+    - Prevent same-candle SL hit after trailing update
     """
 
     leg = "call_buy" if side == "CALL" else "put_buy"
@@ -420,8 +454,11 @@ def process_order(side, symbol, price, info, hist_data):
 
     entry = trade["buy_price"]
     qty   = trade["quantity"]
+    ct    = dt.now(time_zone)
 
-    # --- Stop-loss check (side-aware) ---
+    # -------------------------------
+    # STOP-LOSS CHECK (side-aware)
+    # -------------------------------
     sl_hit = (side == "CALL" and price <= trade["current_stop_price"]) or \
              (side == "PUT"  and price >= trade["current_stop_price"])
     if sl_hit:
@@ -437,19 +474,24 @@ def process_order(side, symbol, price, info, hist_data):
             info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
             trade["trade_flag"] = 0
             trade["quantity"] = 0
-            trade["filled_df"].loc[dt.now(time_zone)] = [
+            trade["filled_df"].loc[ct] = [
                 symbol, price, "SELL", trade["current_stop_price"],
                 trade.get("full_target_price", 0), spot_price, qty
             ]
-            # Initialize global ledger entry
             update_order_status(order_id, "PENDING", qty, price, symbol)
         return
 
-    # --- Partial Profit Booking (side-aware) ---
+    # -------------------------------
+    # PARTIAL PROFIT BOOKING
+    # -------------------------------
     partial_hit = (side == "CALL" and price >= trade["partial_target_price"]) or \
                   (side == "PUT"  and price <= trade["partial_target_price"])
+
     if not trade.get("partial_booked", False) and partial_hit:
         half_qty = qty // 2
+        if half_qty <= 0:
+            return
+
         if account_type.lower() == "paper":
             success, order_id = send_paper_exit_order(trade["option_name"], half_qty, "PARTIAL")
         else:
@@ -460,19 +502,36 @@ def process_order(side, symbol, price, info, hist_data):
             pnl_points = (price - entry) if side == "CALL" else (entry - price)
             trade["pnl"] += pnl_points * half_qty
             info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
+
             trade["quantity"] -= half_qty
             trade["partial_booked"] = True
-            trade["current_stop_price"] = entry  # move SL to cost
-            trade["filled_df"].loc[dt.now(time_zone)] = [
+            trade["partial_candle_time"] = ct  # SAFE FIX #1: mark candle
+
+            # SAFE FIX #2: lock minimum profit (avoid BE churn)
+            min_lock = 0.25 * profit_loss_point
+            if side == "CALL":
+                trade["current_stop_price"] = max(
+                    trade["current_stop_price"],
+                    entry + min_lock
+                )
+            else:
+                trade["current_stop_price"] = min(
+                    trade["current_stop_price"],
+                    entry - min_lock
+                )
+
+            trade["filled_df"].loc[ct] = [
                 symbol, price, "SELL", trade["current_stop_price"],
                 trade.get("full_target_price", 0), spot_price, half_qty
             ]
-            # Initialize global ledger entry
             update_order_status(order_id, "PENDING", half_qty, price, symbol)
 
-    # --- Full Target Check (side-aware) ---
+    # -------------------------------
+    # FULL TARGET CHECK
+    # -------------------------------
     full_hit = (side == "CALL" and price >= trade["full_target_price"]) or \
                (side == "PUT"  and price <= trade["full_target_price"])
+
     if full_hit:
         if account_type.lower() == "paper":
             success, order_id = send_paper_exit_order(trade["option_name"], trade["quantity"], "TARGET")
@@ -487,28 +546,48 @@ def process_order(side, symbol, price, info, hist_data):
             info["total_pnl"] = info["call_buy"]["pnl"] + info["put_buy"]["pnl"]
             trade["trade_flag"] = 0
             trade["quantity"] = 0
-            trade["filled_df"].loc[dt.now(time_zone)] = [
+            trade["filled_df"].loc[ct] = [
                 symbol, price, "SELL", trade["current_stop_price"],
                 trade.get("full_target_price", 0), spot_price, qty_exit
             ]
-            # Initialize global ledger entry
             update_order_status(order_id, "PENDING", qty_exit, price, symbol)
         return
 
-    # --- Trailing logic (use helper for side-awareness) ---
+    # -------------------------------
+    # TRAILING STOP (SAFE)
+    # -------------------------------
     if trade.get("partial_booked", False):
+        # SAFE FIX #3: do not trail on the same candle as partial
+        if ct == trade.get("partial_candle_time"):
+            return
+
+        # SAFE FIX #4: trailing step floor to reduce noise
+        trail_step = max(
+            trade["trail_step_points"],
+            0.15 * profit_loss_point
+        )
+
         new_stop = update_trailing_stop(
             side, price, entry,
             trade["current_stop_price"],
             trade["trail_start_pnl"],
-            trade["trail_step_points"]
+            trail_step
         )
+
         if new_stop != trade["current_stop_price"]:
             trade["current_stop_price"] = new_stop
-            logging.info(f"[TRAIL STOP UPDATE] {symbol} new SL={new_stop:.2f}")
+            logging.info(
+                f"[TRAIL] {symbol} new SL={new_stop:.2f}"
+            )
 
-    # --- MTM Logging ---
-    logging.info(f"{'Paper' if account_type.lower() == 'paper' else 'Live'} MTM {side} {symbol} LTP={price:.2f} Entry={entry:.2f}")
+    # -------------------------------
+    # MTM LOG
+    # -------------------------------
+    logging.info(
+        f"{'Paper' if account_type.lower() == 'paper' else 'Live'} MTM "
+        f"{side} {symbol} LTP={price:.2f} Entry={entry:.2f} "
+        f"SL={trade['current_stop_price']:.2f}"
+    )
 
 # ===== paper_order =====
 def paper_order():

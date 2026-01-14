@@ -15,132 +15,149 @@ GRAY    = "\033[90m"
 
 #===========================================================
 
-def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles_3m_):
-    logging.info(
-        f"{YELLOW}[DETECT_SIGNAL CALLED] candles={len(candles_3m_)} atr={atr}{RESET}"
-    )
-
-    # ---- Guards ----
-    if len(candles_3m_) < 2 or atr is None:
-        return None
-
-    last = candles_3m_.iloc[-1]
-    prev = candles_3m_.iloc[-2]
-
-    body = abs(last.close - last.open)
-    rng  = last.high - last.low
+def candle_accepts_direction(candle, side, atr):
+    body = abs(candle.close - candle.open)
+    rng  = candle.high - candle.low
     if rng == 0:
-        return None
+        return False
 
-    # ---- Levels (lowercase keys) ----
-    pivot = traditional_levels["pivot"]
-    r1, s1, r2, s2 = (
-        traditional_levels["r1"],
-        traditional_levels["s1"],
-        traditional_levels["r2"],
-        traditional_levels["s2"],
-    )
-    r3, r4, s3, s4 = (
-        camarilla_levels["r3"],
-        camarilla_levels["r4"],
-        camarilla_levels["s3"],
-        camarilla_levels["s4"],
-    )
-    tc, bc = cpr_levels["tc"], cpr_levels["bc"]
+    # Avoid weak / noise candles
+    if body < 0.25 * atr:
+        return False
 
-    # ---- Strength + Momentum ----
-    def strong(side):
-        mom_ok, momentum = momentum_ok(candles_3m_, side)
-        strength_ok = (body / rng) > 0.6
-        return strength_ok and mom_ok, momentum
+    if side == "CALL":
+        return candle.close > candle.open and body > 0.4 * rng
+    else:
+        return candle.close < candle.open and body > 0.4 * rng
 
-    call_ok, call_momentum = strong("CALL")
-    put_ok,  put_momentum  = strong("PUT")
 
-    # ---- DEBUG LOG ----
+def atr_is_sane(atr, atr_prev):
+    if atr_prev == 0:
+        return False
+    return atr > 0.8 * atr_prev
+
+
+def level_accepted(candle, level, side):
+    if side == "CALL":
+        return candle.close > level and candle.low > level
+    else:
+        return candle.close < level and candle.high < level
+
+
+def detect_signal(df, pivots):
     logging.info(
-        f"{YELLOW}[SIGNAL CHECK] "
-        f"close={last.close:.2f} spot={spot_price:.2f} "
-        f"ATR={atr:.2f} body/range={body/rng:.2f} "
-        f"CALL_mom={call_momentum:.2f} PUT_mom={put_momentum:.2f}{RESET}"
+        f"{YELLOW}[DETECT_SIGNAL] candles={len(df)}{RESET}"
+    )
+
+    if len(df) < 3:
+        logging.info("[DETECT_SIGNAL] Not enough candles")
+        return None, None
+
+    last     = df.iloc[-1]
+    prev     = df.iloc[-2]
+    atr      = last.atr
+    atr_prev = prev.atr
+
+    logging.info(
+        f"[MARKET] close={last.close:.2f} open={last.open:.2f} "
+        f"high={last.high:.2f} low={last.low:.2f} ATR={atr:.2f}"
     )
 
     # ===============================
-    # Priority 1: CPR
+    # GLOBAL NO-TRADE FILTERS
     # ===============================
-    if last.close > tc + 0.1 * atr and call_ok:
-        return "CALL", "BREAKOUT_CPR_TC"
+    if abs(last.close - last.open) < 0.2 * atr:
+        logging.info("[FILTER] Weak candle body — skipping")
+        return None, None
 
-    if last.close < bc - 0.1 * atr and put_ok:
-        return "PUT", "BREAKOUT_CPR_BC"
-
-    # ===============================
-    # Priority 2: Camarilla
-    # ===============================
-    if last.close > r3 + 0.1 * atr and call_ok:
-        return "CALL", "BREAKOUT_R3"
-
-    if last.close > r4 + 0.1 * atr and call_ok:
-        return "CALL", "BREAKOUT_R4"
-
-    if last.close < s3 - 0.1 * atr and put_ok:
-        return "PUT", "BREAKOUT_S3"
-
-    if last.close < s4 - 0.1 * atr and put_ok:
-        return "PUT", "BREAKOUT_S4"
-
-    if last.low <= s3 and (last.close - last.low) > 0.5 * rng and call_ok:
-        return "CALL", "REJECTION_S3"
-
-    if last.low <= s4 and (last.close - last.low) > 0.5 * rng and call_ok:
-        return "CALL", "REJECTION_S4"
-
-    if last.high >= r3 and (last.high - last.close) > 0.5 * rng and put_ok:
-        return "PUT", "REJECTION_R3"
-
-    if last.high >= r4 and (last.high - last.close) > 0.5 * rng and put_ok:
-        return "PUT", "REJECTION_R4"
-    
-    # ===============================
-    # Continuation helpers
-    # ===============================
-    def continuation_long(level):
-        return last.low <= level and last.close > level + 0.05 * atr
-
-    def continuation_short(level):
-        return last.high >= level and last.close < level - 0.05 * atr
+    if atr_prev and atr < 0.8 * atr_prev:
+        logging.info(
+            f"[FILTER] ATR compression detected atr={atr:.2f} prev={atr_prev:.2f}"
+        )
+        return None, None
 
     # ===============================
-    # Continuation signals
+    # LEVELS
     # ===============================
-    if continuation_long(r4) and call_ok:
-        return "CALL", "CONTINUATION_R4"
+    tc    = pivots.get("TC")
+    bc    = pivots.get("BC")
+    pivot = pivots.get("P")
+    r3    = pivots.get("R3")
+    s3    = pivots.get("S3")
+    r4    = pivots.get("R4")
+    s4    = pivots.get("S4")
 
-    if continuation_short(s4) and put_ok:
-        return "PUT", "CONTINUATION_S4"
-
-    # ===============================
-    # Priority 3: Traditional
-    # ===============================
-    if last.close > r2 + 0.1 * atr and call_ok:
-        return "CALL", "BREAKOUT_R2"
-
-    if last.close < s2 - 0.1 * atr and put_ok:
-        return "PUT", "BREAKOUT_S2"
-
-    if last.low <= s1 and (last.close - last.low) > 0.5 * rng and call_ok:
-        return "CALL", "REJECTION_S1"
-
-    if last.high >= r1 and (last.high - last.close) > 0.5 * rng and put_ok:
-        return "PUT", "REJECTION_R1"
+    logging.info(
+        f"[LEVELS] TC={tc} BC={bc} P={pivot} "
+        f"R3={r3} S3={s3} R4={r4} S4={s4}"
+    )
 
     # ===============================
-    # Priority 4: Pivot
+    # CPR BREAKOUT
     # ===============================
-    if prev.close < pivot and last.close > pivot + 0.1 * atr and call_ok:
-        return "CALL", "BREAKOUT_PIVOT"
+    if tc and last.close > tc + 0.1 * atr:
+        logging.info("[CHECK] CPR TC breakout attempt")
+        if candle_accepts_direction(last, "CALL", atr) and level_accepted(last, tc, "CALL"):
+            logging.info(f"{GREEN}[SIGNAL] CALL | CPR_TC_BREAK{RESET}")
+            return "CALL", "CPR_TC_BREAK"
 
-    if prev.close > pivot and last.close < pivot - 0.1 * atr and put_ok:
-        return "PUT", "BREAKOUT_PIVOT"
+    if bc and last.close < bc - 0.1 * atr:
+        logging.info("[CHECK] CPR BC breakout attempt")
+        if candle_accepts_direction(last, "PUT", atr) and level_accepted(last, bc, "PUT"):
+            logging.info(f"{RED}[SIGNAL] PUT | CPR_BC_BREAK{RESET}")
+            return "PUT", "CPR_BC_BREAK"
 
-    return None
+    # ===============================
+    # CPR REJECTION
+    # ===============================
+    if tc and last.high > tc and last.close < tc:
+        logging.info("[CHECK] CPR TC rejection attempt")
+        if candle_accepts_direction(last, "PUT", atr):
+            logging.info(f"{RED}[SIGNAL] PUT | CPR_TC_REJECT{RESET}")
+            return "PUT", "CPR_TC_REJECT"
+
+    if bc and last.low < bc and last.close > bc:
+        logging.info("[CHECK] CPR BC rejection attempt")
+        if candle_accepts_direction(last, "CALL", atr):
+            logging.info(f"{GREEN}[SIGNAL] CALL | CPR_BC_REJECT{RESET}")
+            return "CALL", "CPR_BC_REJECT"
+
+    # ===============================
+    # CAMARILLA S3 / R3 REJECTION
+    # ===============================
+    if s3 and last.low <= s3:
+        rejection = last.close - last.low
+        logging.info(
+            f"[CHECK] S3 rejection wick={rejection:.2f}"
+        )
+        if rejection > 0.35 * atr and candle_accepts_direction(last, "CALL", atr):
+            logging.info(f"{GREEN}[SIGNAL] CALL | S3_REJECTION{RESET}")
+            return "CALL", "S3_REJECTION"
+
+    if r3 and last.high >= r3:
+        rejection = last.high - last.close
+        logging.info(
+            f"[CHECK] R3 rejection wick={rejection:.2f}"
+        )
+        if rejection > 0.35 * atr and candle_accepts_direction(last, "PUT", atr):
+            logging.info(f"{RED}[SIGNAL] PUT | R3_REJECTION{RESET}")
+            return "PUT", "R3_REJECTION"
+
+    # ===============================
+    # CAMARILLA R4 / S4 TREND BREAK
+    # ===============================
+    if r4 and last.close > r4 + 0.15 * atr:
+        logging.info("[CHECK] R4 trend breakout attempt")
+        if candle_accepts_direction(last, "CALL", atr):
+            logging.info(f"{GREEN}[SIGNAL] CALL | R4_TREND_BREAK{RESET}")
+            return "CALL", "R4_TREND_BREAK"
+
+    if s4 and last.close < s4 - 0.15 * atr:
+        logging.info("[CHECK] S4 trend breakout attempt")
+        if candle_accepts_direction(last, "PUT", atr):
+            logging.info(f"{RED}[SIGNAL] PUT | S4_TREND_BREAK{RESET}")
+            return "PUT", "S4_TREND_BREAK"
+
+    logging.info("[DETECT_SIGNAL] No valid setup found")
+    return None, None
+
