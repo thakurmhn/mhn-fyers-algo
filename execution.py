@@ -595,7 +595,9 @@ def paper_order():
 
     ct = dt.now(time_zone)
 
-    # 1. Refresh spot price (simulated)
+    # =========================================================
+    # 1. REFRESH SPOT PRICE
+    # =========================================================
     try:
         quote = fyers.quotes(data={"symbols": ticker})
         spot_price = quote["d"][0]["v"]["lp"]
@@ -603,128 +605,217 @@ def paper_order():
     except Exception as e:
         logging.warning(f"[PAPER] Spot fetch failed: {e}")
 
+    # =========================================================
     # 2. EOD FORCE EXIT
+    # =========================================================
     if ct > end_time:
         logging.info("[PAPER] End time reached, closing open positions")
         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
             if paper_info[leg]["trade_flag"] == 1:
                 name = paper_info[leg]["option_name"]
-                qty  = paper_info[leg]["quantity"]
-                success, order_id = send_paper_exit_order(name, qty, "EOD")
+                qty = paper_info[leg]["quantity"]
+
+                success, _ = send_paper_exit_order(name, qty, "EOD")
                 if success:
                     paper_info[leg]["trade_flag"] = 2
                     paper_info[leg]["quantity"] = 0
                     exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
-                    paper_info[leg]["filled_df"].loc[ct] = [name, exit_price, "SELL", 0, 0, spot_price, 0]
-                    logging.info(f"{RED}[EXIT][PAPER] {side} {name} Qty={qty} Price={exit_price}{RESET}")
+                    paper_info[leg]["filled_df"].loc[ct] = [
+                        name, exit_price, "SELL", 0, 0, spot_price, 0
+                    ]
+                    logging.info(
+                        f"{RED}[EXIT][PAPER] {side} {name} Qty={qty} Price={exit_price}{RESET}"
+                    )
         return
 
-    # 3. SIGNAL EVALUATION (NEW 3M CANDLE ONLY)
-    signal = None
-    if not candles_3m.empty:
-        last_candle_time = candles_3m.iloc[-1]["time"]
-        if last_signal_candle_time != last_candle_time:
-            last_signal_candle_time = last_candle_time
+    # =========================================================
+    # 3. SIGNAL EVALUATION (ONLY ON NEW 3M CANDLE)
+    # =========================================================
+    if candles_3m.empty:
+        return
 
-            atr, atr_source = resolve_atr(candles_3m, daily_atr)
-            logging.info(f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}")
+    last_candle_time = candles_3m.iloc[-1]["time"]
+    if last_signal_candle_time == last_candle_time:
+        return
 
-            prev_day = hist_data.iloc[-1]
-            cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
-            trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-            cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
+    last_signal_candle_time = last_candle_time
 
-            signal = detect_signal(cpr, trad, cam, atr, candles_3m)
+    # ---------- ATR Resolution ----------
+    atr, atr_source = resolve_atr(candles_3m, daily_atr)
 
-    # 4. PAPER ENTRY LOGIC
-    if signal:
-        side, reason = signal
-        logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}{RESET}")
+    logging.info(
+        f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} "
+        f"candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}"
+    )
 
-        if paper_info["call_buy"]["trade_flag"] == 1 or paper_info["put_buy"]["trade_flag"] == 1:
-            logging.info(f"{MAGENTA}[ENTRY BLOCKED][PAPER] Existing trade active, skipping new signal{RESET}")
-            return
+    # ---------- HARD WARM-UP GUARDS ----------
+    if atr is None or len(candles_3m) < 3:
+        logging.info("[WARMUP] Insufficient data — skipping signal eval")
+        return
 
-        if paper_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
-            logging.info(f"{MAGENTA}[ENTRY][PAPER] Max trades reached{RESET}")
-            return
+    if hist_data.empty:
+        logging.warning("[SIGNAL] Historical data missing — skipping")
+        return
 
-        leg = "call_buy" if side == "CALL" else "put_buy"
+    # =========================================================
+    # 4. PREVIOUS DAY PIVOTS
+    # =========================================================
+    prev_day = hist_data.iloc[-1]
 
-        if paper_info[leg]["trade_flag"] == 0:
-            opt_type = "CE" if side == "CALL" else "PE"
-            opt_name, _ = get_option_by_moneyness(
-                spot_price, opt_type,
-                moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
-            )
+    cpr = calculate_cpr(
+        prev_day["high"], prev_day["low"], prev_day["close"]
+    )
+    trad = calculate_traditional_pivots(
+        prev_day["high"], prev_day["low"], prev_day["close"]
+    )
+    cam = calculate_camarilla_pivots(
+        prev_day["high"], prev_day["low"], prev_day["close"]
+    )
 
-            if opt_name and opt_name in df.index:
-                ltp = df.loc[opt_name, "ltp"]
+    # =========================================================
+    # 5. BUILD SIGNAL CONTEXT (CRITICAL)
+    # =========================================================
+    signal_ctx = {
+        "candles_3m": candles_3m,
+        "pivots": {
+            **cpr,
+            **cam,
+            **trad
+        },
+        "atr": atr,
+        "spot": spot_price,
+        "mode": "PAPER"
+    }
 
-                # ATR-scaled but ratio-balanced levels
-                risk_points = max(profit_loss_point, atr * 0.25)
-                reward_points = risk_points * 2.0
-                # Long options: both CALL and PUT targets are above entry (option price rises when trade works)
-                stop  = ltp - risk_points
-                partial_target = ltp + reward_points / 2
-                full_target    = ltp + reward_points
+    # =========================================================
+    # 6. SIGNAL DECISION (SINGLE SOURCE OF TRUTH)
+    # =========================================================
+    side, reason = detect_signal(signal_ctx) or (None, None)
 
-                trail_start = reward_points / 2
-                trail_step  = atr * 0.1
+    if side not in ("CALL", "PUT"):
+        logging.info("[SIGNAL][PAPER] No actionable signal — skipping entry")
+        return
 
-                # Entry price logic (MARKET vs LIMIT)
-                entry_price = ltp if ORDER_TYPE == "MARKET" else max(ltp - ENTRY_OFFSET, 0.05)
+    logging.info(
+        f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}{RESET}"
+    )
 
-                # Update ledger
-                paper_info[leg].update({
-                    "option_name": opt_name,
-                    "quantity": quantity,
-                    "buy_price": entry_price,
-                    "order_type": ORDER_TYPE,
-                    "current_stop_price": stop,
-                    "full_target_price": full_target,
-                    "partial_target_price": partial_target,
-                    "trail_start_pnl": trail_start,
-                    "trail_step_points": trail_step,
-                    "trade_flag": 1,
-                    "partial_booked": False,
-                    "pnl": 0,
-                    "reason": reason,
-                    "order_id": f"paper_{opt_name}_{ct}",
-                    "entry_time": ct,
-                })
+    # =========================================================
+    # 7. ENTRY GUARDS
+    # =========================================================
+    if (
+        paper_info["call_buy"]["trade_flag"] == 1
+        or paper_info["put_buy"]["trade_flag"] == 1
+    ):
+        logging.info(
+            f"{MAGENTA}[ENTRY BLOCKED][PAPER] Existing trade active{RESET}"
+        )
+        return
 
-                paper_info[leg]["filled_df"].loc[ct] = [
-                    opt_name, entry_price, "BUY", stop, full_target, spot_price, quantity
-                ]
-                paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
+    if paper_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
+        logging.info(
+            f"{MAGENTA}[ENTRY BLOCKED][PAPER] Max trades reached{RESET}"
+        )
+        return
 
-                # logging.info(
-                #     f"[{side} ENTRY][PAPER] {opt_name} @ {entry_price:.2f} "
-                #     f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}"
-                # )
-                logging.info(f"{GREEN}[ENTRY][PAPER] {side} {opt_name} @ {entry_price:.2f}"
-                 f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}")
+    leg = "call_buy" if side == "CALL" else "put_buy"
+    if paper_info[leg]["trade_flag"] != 0:
+        return
 
-    # 5. TRAILING STOP + EXIT MANAGEMENT (continuous)
+    # =========================================================
+    # 8. OPTION SELECTION + ENTRY
+    # =========================================================
+    opt_type = "CE" if side == "CALL" else "PE"
+
+    opt_name, _ = get_option_by_moneyness(
+        spot_price,
+        opt_type,
+        moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
+    )
+
+    if not opt_name or opt_name not in df.index:
+        logging.warning("[ENTRY] Option not available in df")
+        return
+
+    ltp = df.loc[opt_name, "ltp"]
+
+    # ---------- Risk / Reward ----------
+    risk_points = max(profit_loss_point, atr * 0.25)
+    reward_points = risk_points * 2.0
+
+    stop = ltp - risk_points
+    partial_target = ltp + reward_points / 2
+    full_target = ltp + reward_points
+
+    trail_start = reward_points / 2
+    trail_step = atr * 0.1
+
+    entry_price = (
+        ltp if ORDER_TYPE == "MARKET"
+        else max(ltp - ENTRY_OFFSET, 0.05)
+    )
+
+    # ---------- Ledger Update ----------
+    paper_info[leg].update({
+        "option_name": opt_name,
+        "quantity": quantity,
+        "buy_price": entry_price,
+        "order_type": ORDER_TYPE,
+        "current_stop_price": stop,
+        "full_target_price": full_target,
+        "partial_target_price": partial_target,
+        "trail_start_pnl": trail_start,
+        "trail_step_points": trail_step,
+        "trade_flag": 1,
+        "partial_booked": False,
+        "pnl": 0,
+        "reason": reason,              # signal reason
+        "entry_structure": reason,     # future structure-aware mgmt
+        "order_id": f"paper_{opt_name}_{ct}",
+        "entry_time": ct,
+    })
+
+    paper_info[leg]["filled_df"].loc[ct] = [
+        opt_name, entry_price, "BUY",
+        stop, full_target, spot_price, quantity
+    ]
+
+    paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
+
+    logging.info(
+        f"{GREEN}[ENTRY][PAPER] {side} {opt_name} @ {entry_price:.2f} "
+        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
+    )
+
+    # =========================================================
+    # 9. TRAILING STOP + EXIT MANAGEMENT
+    # =========================================================
     for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
         if paper_info[leg]["trade_flag"] != 1:
             continue
 
         name = paper_info[leg]["option_name"]
         price = df.loc[name, "ltp"] if name in df.index else None
+
         if price is None or pd.isna(price):
             continue
 
         process_order(side, name, price, paper_info, hist_data)
 
-    # 6. SAVE TRADES
-    frames = [paper_info["call_buy"]["filled_df"], paper_info["put_buy"]["filled_df"]]
+    # =========================================================
+    # 10. SAVE TRADES
+    # =========================================================
+    frames = [
+        paper_info["call_buy"]["filled_df"],
+        paper_info["put_buy"]["filled_df"]
+    ]
     frames = [f for f in frames if not f.empty]
 
     if frames:
         combined = pd.concat(frames)
-        combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv")
+        combined.to_csv(
+            f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv"
+        )
 
     store(paper_info, account_type)
 
