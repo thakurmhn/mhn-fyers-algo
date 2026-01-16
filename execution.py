@@ -73,22 +73,33 @@ def load(account_type_):
         raise
 
 # ===== Option selection by moneyness =====
-def get_option_by_moneyness(spot_price_, side, moneyness='OTM', points=0):
+def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
+    """
+    Select ITM option strike with strike_diff points inside ATM.
+    Jan 8th baseline: always ITM with 100-point difference.
+    CALL: ATM - strike_diff
+    PUT:  ATM + strike_diff
+    """
     from config import strike_diff
     if spot_price_ is None or pd.isna(spot_price_):
         return None, None
 
-    base_strike = round(spot_price_ / strike_diff) * strike_diff
-    if side == 'CE':
-        strike = base_strike + strike_diff if moneyness == 'OTM' else base_strike - strike_diff
-    else:  # 'PE'
-        strike = base_strike - strike_diff if moneyness == 'OTM' else base_strike + strike_diff
+    # Round to nearest strike
+    atm_strike = round(spot_price_ / strike_diff) * strike_diff
+
+    if side == 'CE':  # CALL
+        strike = atm_strike - strike_diff
+    else:             # PUT
+        strike = atm_strike + strike_diff
+
+    # Apply any manual offset
     strike += points
 
     sel = option_chain[
         (option_chain['strike_price'] == strike) &
         (option_chain['option_type'] == side)
     ]['symbol']
+
     if sel.empty:
         side_df = option_chain[option_chain['option_type'] == side].copy()
         if side_df.empty:
@@ -98,43 +109,63 @@ def get_option_by_moneyness(spot_price_, side, moneyness='OTM', points=0):
         side_df = side_df.sort_values('strike_diff_abs')
         symbol = side_df.iloc[0]['symbol']
         strike = side_df.iloc[0]['strike_price']
-        logging.warning(f"Fallback {moneyness} for {side}: requested {strike}, using nearest available")
+        logging.warning(f"Fallback ITM for {side}: requested {strike}, using nearest available")
         return symbol, strike
+
     return sel.squeeze(), strike
 
+
+# ===== Dynamic levels =====
 # ===== Dynamic levels =====
 def build_dynamic_levels(entry_price, side, atr, rr_ratio=2.0):
+    """
+    Build stop-loss, partial/full targets, and trailing parameters.
+    Baseline logic (8th Jan):
+    - Risk points = max(profit_loss_point, 0.25 * ATR)
+    - Reward points = risk_points * rr_ratio
+    - Both CALL and PUT options: targets above entry, stop below entry
+    """
     risk_points = max(profit_loss_point, atr * 0.25)
     reward_points = risk_points * rr_ratio
 
-    # Long options: both CALL and PUT targets above entry, stop below entry
     stop  = entry_price - risk_points
     partial_target = entry_price + reward_points / 2
     full_target    = entry_price + reward_points
 
     trail_start = reward_points / 2
     trail_step  = atr * 0.1
+
     return stop, full_target, partial_target, trail_start, trail_step
 
+
 def update_trailing_stop(side, current_price, entry_price, current_stop, trail_start_pnl, trail_step_points):
+    """
+    Update trailing stop once partial target booked.
+    Baseline logic (8th Jan):
+    - CALL: move stop up as price rises
+    - PUT: move stop down as price falls
+    """
     if side == "CALL":
         pnl = current_price - entry_price
         if pnl >= trail_start_pnl:
             candidate = current_price - trail_step_points
             return max(current_stop, candidate)
         return current_stop
-    else:
+
+    elif side == "PUT":
         pnl = entry_price - current_price
         if pnl >= trail_start_pnl:
             candidate = current_price + trail_step_points
             return min(current_stop, candidate)
         return current_stop
 
+    return current_stop
+
 # ===== PAPER/LIVE STATE INIT =====
 if account_type == 'PAPER':
     try:
         paper_info = load(account_type)
-    except:
+    except Exception:
         column_names = ['time', 'ticker', 'price', 'action', 'stop_price', 'take_profit', 'spot_price', 'quantity']
         filled_df = pd.DataFrame(columns=column_names)
         filled_df.set_index('time', inplace=True)
@@ -166,8 +197,8 @@ if account_type == 'PAPER':
             return symbol, otm_strike
 
         call_option, call_buy_strike = _init_otm(spot_price, 'CE', 0)
-        put_option,  put_buy_strike  = _init_otm(spot_price, 'PE', 0)
-        logging.info('started')
+        put_option, put_buy_strike   = _init_otm(spot_price, 'PE', 0)
+        logging.info('[PAPER INIT] started')
 
         paper_info = {
             'call_buy': {
@@ -207,10 +238,11 @@ if account_type == 'PAPER':
             'trade_count': 0,
             'max_trades': MAX_TRADES_PER_DAY
         }
+
 else:
     try:
         live_info = load(account_type)
-    except:
+    except Exception:
         column_names = ['time', 'ticker', 'price', 'action', 'stop_price', 'take_profit', 'spot_price', 'quantity']
         filled_df = pd.DataFrame(columns=column_names)
         filled_df.set_index('time', inplace=True)
@@ -242,8 +274,8 @@ else:
             return symbol, otm_strike
 
         call_option, call_buy_strike = _init_otm(spot_price, 'CE', 0)
-        put_option,  put_buy_strike  = _init_otm(spot_price, 'PE', 0)
-        logging.info('started')
+        put_option, put_buy_strike   = _init_otm(spot_price, 'PE', 0)
+        logging.info('[LIVE INIT] started')
 
         live_info = {
             'call_buy': {
@@ -286,6 +318,10 @@ else:
 
 # ===== Broker order functions =====
 def send_live_entry_order(symbol, qty, side, buffer=ENTRY_OFFSET):
+    """
+    Place a live LIMIT entry order via Fyers API.
+    Baseline logic: entry price = LTP - buffer (min 0.05).
+    """
     try:
         # Get LTP
         quote = fyers.quotes({"symbols": symbol})
@@ -298,7 +334,7 @@ def send_live_entry_order(symbol, qty, side, buffer=ENTRY_OFFSET):
             "symbol": symbol,
             "qty": qty,
             "type": 1,              # LIMIT
-            "side": side,           # <-- use parameter (1=BUY, -1=SELL)
+            "side": side,           # 1=BUY, -1=SELL
             "productType": "INTRADAY",
             "limitPrice": limit_price,
             "stopPrice": 0,
@@ -308,10 +344,9 @@ def send_live_entry_order(symbol, qty, side, buffer=ENTRY_OFFSET):
             "offlineOrder": False,
             "disclosedQty": 0,
             "isSliceOrder": False,
-            "orderTag": str(side)   # optional tag, stringified
+            "orderTag": str(side)
         }
 
-        # Correct call with data= keyword
         response = fyers.place_order(data=order_data)
 
         if response.get("s") == "ok":
@@ -319,11 +354,20 @@ def send_live_entry_order(symbol, qty, side, buffer=ENTRY_OFFSET):
         else:
             logging.error(f"[LIVE ENTRY FAILED] {symbol} {response}")
             return False, None
+
     except Exception as e:
         logging.error(f"[LIVE ENTRY ERROR] {symbol} {e}")
         return False, None
 
+
 def send_live_exit_order(symbol, qty, reason):
+    """
+    Place a live MARKET exit order via Fyers API.
+    Baseline logic (8th Jan):
+    - Always SELL (-1 side)
+    - MARKET type (type=2)
+    - Tag order with exit reason for audit trail
+    """
     try:
         order_data = {
             "symbol": symbol,
@@ -339,18 +383,21 @@ def send_live_exit_order(symbol, qty, reason):
             "offlineOrder": False,
             "disclosedQty": 0,
             "isSliceOrder": False,
-            "orderTag": str(reason) # ensure string tag
+            "orderTag": str(reason)  # ensure string tag
         }
 
-        # ✅ Correct call with data= keyword
         response = fyers.place_order(data=order_data)
 
         if response.get("s") == "ok":
-            logging.info(f"{MAGENTA}[LIVE EXIT][{reason}] {symbol} Qty={qty} OrderID={response.get('id')}{RESET}")
+            logging.info(
+                f"{MAGENTA}[LIVE EXIT][{reason}] {symbol} Qty={qty} "
+                f"OrderID={response.get('id')}{RESET}"
+            )
             return True, response.get("id")
         else:
             logging.error(f"[LIVE EXIT FAILED] {symbol} {response}")
             return False, None
+
     except Exception as e:
         logging.error(f"{RED}[LIVE EXIT ERROR] {symbol} {e}{RESET}")
         return False, None
@@ -358,11 +405,22 @@ def send_live_exit_order(symbol, qty, reason):
 def send_paper_exit_order(symbol, qty, reason):
     """
     Simulated exit for paper mode.
+    Baseline logic (8th Jan):
+    - Always log the exit with reason and quantity
+    - Return success flag and synthetic order_id
     """
     logging.info(f"{MAGENTA}[PAPER EXIT][{reason}] {symbol} Qty={qty}{RESET}")
     return True, f"paper_exit_{symbol}_{reason}"
 
+
 def update_order_status(order_id, status, filled_qty, avg_price, symbol):
+    """
+    Update the global filled_df ledger with order status.
+    Baseline logic (8th Jan):
+    - If order_id exists, update row
+    - Else, append new row
+    - Log every update for audit trail
+    """
     global filled_df
     color = status_color(status)
 
@@ -370,7 +428,7 @@ def update_order_status(order_id, status, filled_qty, avg_price, symbol):
         filled_df.loc[order_id, "status"] = status
         filled_df.loc[order_id, "filled_qty"] = filled_qty
         filled_df.loc[order_id, "avg_price"] = avg_price
-        logging.info(f"{YELLOW}[LEDGER UPDATED] {order_id} -> {status}{RESET}")  # ASCII arrow
+        logging.info(f"{YELLOW}[LEDGER UPDATED] {order_id} -> {status}{RESET}")
     else:
         new_row = pd.DataFrame({
             "status": [status],
@@ -379,28 +437,43 @@ def update_order_status(order_id, status, filled_qty, avg_price, symbol):
             "symbol": [symbol]
         }, index=[order_id])
         filled_df = pd.concat([filled_df, new_row])
-        logging.info(f"{YELLOW}[LEDGER APPENDED] {order_id} -> {status}{RESET}")  # ASCII arrow
+        logging.info(f"{YELLOW}[LEDGER APPENDED] {order_id} -> {status}{RESET}")
 
 
 # ===== Order status polling =====
 def check_order_status(order_id, fyers):
+    """
+    Poll broker for order status and update ledger.
+    Baseline logic (8th Jan):
+    - Query orderbook by order_id
+    - Map status code to human-readable string
+    - Update global filled_df via update_order_status
+    - Return (status, traded_price)
+    """
     try:
-        response = fyers.orderbook(data={"id": order_id})   
+        response = fyers.orderbook(data={"id": order_id})
+
         if response.get("s") == "ok":
             order = response.get("orderBook", [{}])[0]
-            status_code = order.get("status")
-            filled_qty = order.get("filledQty", 0)
-            traded_price = order.get("tradedPrice", 0)  
-            symbol = order.get("symbol")
+
+            status_code   = order.get("status")
+            filled_qty    = order.get("filledQty", 0)
+            traded_price  = order.get("tradedPrice", 0)
+            symbol        = order.get("symbol")
 
             status = map_status_code(status_code)
             update_order_status(order_id, status, filled_qty, traded_price, symbol)
+
             return status, traded_price
+
         else:
-            logging.warning(f"{RED}[ORDER STATUS] Failed for {order_id}: {response}{RESET}")
+            logging.warning(
+                f"{RED}[ORDER STATUS] Failed for {order_id}: {response}{RESET}"
+            )
             return None, None
+
     except Exception as e:
-        logging.error(f"[ORDER STATUS ERROR] {e}")
+        logging.error(f"{RED}[ORDER STATUS ERROR] {e}{RESET}")
         return None, None
 
 
@@ -408,8 +481,12 @@ def check_order_status(order_id, fyers):
 def process_order(side, symbol, price, info, hist_data):
     """
     Unified MTM loop for both paper and live trades with partial profit booking.
-    Exits are broker-confirmed in live mode, simulated in paper mode.
-    Stores order_id into trade['order_id'] for audit trail.
+    Baseline logic (8th Jan):
+    - Stop-loss check (side-aware)
+    - Partial profit booking (half qty, move SL to cost)
+    - Full target exit
+    - Trailing stop update after partial booked
+    - MTM logging for audit trail
     """
 
     leg = "call_buy" if side == "CALL" else "put_buy"
@@ -441,7 +518,6 @@ def process_order(side, symbol, price, info, hist_data):
                 symbol, price, "SELL", trade["current_stop_price"],
                 trade.get("full_target_price", 0), spot_price, qty
             ]
-            # Initialize global ledger entry
             update_order_status(order_id, "PENDING", qty, price, symbol)
         return
 
@@ -467,7 +543,6 @@ def process_order(side, symbol, price, info, hist_data):
                 symbol, price, "SELL", trade["current_stop_price"],
                 trade.get("full_target_price", 0), spot_price, half_qty
             ]
-            # Initialize global ledger entry
             update_order_status(order_id, "PENDING", half_qty, price, symbol)
 
     # --- Full Target Check (side-aware) ---
@@ -491,11 +566,10 @@ def process_order(side, symbol, price, info, hist_data):
                 symbol, price, "SELL", trade["current_stop_price"],
                 trade.get("full_target_price", 0), spot_price, qty_exit
             ]
-            # Initialize global ledger entry
             update_order_status(order_id, "PENDING", qty_exit, price, symbol)
         return
 
-    # --- Trailing logic (use helper for side-awareness) ---
+    # --- Trailing logic (side-aware) ---
     if trade.get("partial_booked", False):
         new_stop = update_trailing_stop(
             side, price, entry,
@@ -508,7 +582,10 @@ def process_order(side, symbol, price, info, hist_data):
             logging.info(f"[TRAIL STOP UPDATE] {symbol} new SL={new_stop:.2f}")
 
     # --- MTM Logging ---
-    logging.info(f"{'Paper' if account_type.lower() == 'paper' else 'Live'} MTM {side} {symbol} LTP={price:.2f} Entry={entry:.2f}")
+    logging.info(
+        f"{'Paper' if account_type.lower() == 'paper' else 'Live'} MTM "
+        f"{side} {symbol} LTP={price:.2f} Entry={entry:.2f}"
+    )
 
 # ===== paper_order =====
 def paper_order():
@@ -536,8 +613,12 @@ def paper_order():
                     paper_info[leg]["trade_flag"] = 2
                     paper_info[leg]["quantity"] = 0
                     exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
-                    paper_info[leg]["filled_df"].loc[ct] = [name, exit_price, "SELL", 0, 0, spot_price, 0]
-                    logging.info(f"{RED}[EXIT][PAPER] {side} {name} Qty={qty} Price={exit_price}{RESET}")
+                    paper_info[leg]["filled_df"].loc[ct] = [
+                        name, exit_price, "SELL", 0, 0, spot_price, 0
+                    ]
+                    logging.info(
+                        f"{RED}[EXIT][PAPER] {side} {name} Qty={qty} Price={exit_price}{RESET}"
+                    )
         return
 
     # 3. SIGNAL EVALUATION (NEW 3M CANDLE ONLY)
@@ -548,7 +629,10 @@ def paper_order():
             last_signal_candle_time = last_candle_time
 
             atr, atr_source = resolve_atr(candles_3m, daily_atr)
-            logging.info(f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}")
+            logging.info(
+                f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} "
+                f"candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}"
+            )
 
             prev_day = hist_data.iloc[-1]
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
@@ -562,10 +646,12 @@ def paper_order():
         side, reason = signal
         logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}{RESET}")
 
+        # Block if existing trade active
         if paper_info["call_buy"]["trade_flag"] == 1 or paper_info["put_buy"]["trade_flag"] == 1:
             logging.info(f"{MAGENTA}[ENTRY BLOCKED][PAPER] Existing trade active, skipping new signal{RESET}")
             return
 
+        # Block if max trades reached
         if paper_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
             logging.info(f"{MAGENTA}[ENTRY][PAPER] Max trades reached{RESET}")
             return
@@ -585,7 +671,6 @@ def paper_order():
                 # ATR-scaled but ratio-balanced levels
                 risk_points = max(profit_loss_point, atr * 0.25)
                 reward_points = risk_points * 2.0
-                # Long options: both CALL and PUT targets are above entry (option price rises when trade works)
                 stop  = ltp - risk_points
                 partial_target = ltp + reward_points / 2
                 full_target    = ltp + reward_points
@@ -620,12 +705,10 @@ def paper_order():
                 ]
                 paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
 
-                # logging.info(
-                #     f"[{side} ENTRY][PAPER] {opt_name} @ {entry_price:.2f} "
-                #     f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}"
-                # )
-                logging.info(f"{GREEN}[ENTRY][PAPER] {side} {opt_name} @ {entry_price:.2f}"
-                 f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}")
+                logging.info(
+                    f"{GREEN}[ENTRY][PAPER] {side} {opt_name} @ {entry_price:.2f} "
+                    f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
+                )
 
     # 5. TRAILING STOP + EXIT MANAGEMENT (continuous)
     for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
@@ -650,6 +733,7 @@ def paper_order():
     store(paper_info, account_type)
 
 # =============================== Live Trading =======================================
+# ===== real_order =====
 def real_order():
     global quantity, live_info, df, spot_price, last_signal_candle_time
 
@@ -675,9 +759,12 @@ def real_order():
                     live_info[leg]["trade_flag"] = 2
                     live_info[leg]["quantity"] = 0
                     exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
-                    live_info[leg]["filled_df"].loc[ct] = [name, exit_price, "SELL", 0, 0, spot_price, 0]
-                    logging.info(f"{RED}[EXIT][LIVE] {side} {name} Qty={qty} Price={exit_price}{RESET}")
-
+                    live_info[leg]["filled_df"].loc[ct] = [
+                        name, exit_price, "SELL", 0, 0, spot_price, 0
+                    ]
+                    logging.info(
+                        f"{RED}[EXIT][LIVE] {side} {name} Qty={qty} Price={exit_price}{RESET}"
+                    )
         return
 
     # 3. SIGNAL EVALUATION (new 3M candle only)
@@ -687,7 +774,10 @@ def real_order():
         if last_signal_candle_time != last_candle_time:
             last_signal_candle_time = last_candle_time
             atr, atr_source = resolve_atr(candles_3m, daily_atr)
-            logging.info(f"{YELLOW}[SIGNAL EVAL][LIVE] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}")
+            logging.info(
+                f"{YELLOW}[SIGNAL EVAL][LIVE] candle={last_candle_time} "
+                f"candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}"
+            )
             prev_day = hist_data.iloc[-1]
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
             trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
@@ -699,9 +789,12 @@ def real_order():
         side, reason = signal
         logging.info(f"{GREEN}[SIGNAL][LIVE] {side} ({reason}) at spot={spot_price}{RESET}")
 
+        # Block if existing trade active
         if live_info["call_buy"]["trade_flag"] == 1 or live_info["put_buy"]["trade_flag"] == 1:
             logging.info(f"{MAGENTA}[ENTRY BLOCKED][LIVE] Existing trade active, skipping new signal{RESET}")
             return
+
+        # Block if max trades reached
         if live_info.get("trade_count", 0) >= MAX_TRADES_PER_DAY:
             logging.info(f"{MAGENTA}[ENTRY][LIVE] Max trades reached{RESET}")
             return
@@ -752,7 +845,10 @@ def real_order():
                         opt_name, filled_price, "BUY", stop, full_target, spot_price, quantity
                     ]
                     live_info["trade_count"] = live_info.get("trade_count", 0) + 1
-                    logging.info(f"{GREEN}[{side} ENTRY CONFIRMED][LIVE] {opt_name} @ {filled_price:.2f} SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}")
+                    logging.info(
+                        f"{GREEN}[{side} ENTRY CONFIRMED][LIVE] {opt_name} @ {filled_price:.2f} "
+                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
+                    )
                 elif status == "PENDING":
                     logging.info(f"{YELLOW}[LIVE ENTRY STILL PENDING] {side} {opt_name} OrderID={order_id}{RESET}")
                 elif status == "CANCELLED":

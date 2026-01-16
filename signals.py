@@ -3,7 +3,6 @@ import logging
 from setup import spot_price
 from indicators import momentum_ok
 
-
 # ===========================================================
 # ANSI COLORS for order logs
 RESET   = "\033[0m"
@@ -12,8 +11,7 @@ YELLOW  = "\033[93m"
 RED     = "\033[91m"
 MAGENTA = "\033[95m"
 GRAY    = "\033[90m"
-
-#===========================================================
+# ===========================================================
 
 def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles_3m_):
     logging.info(
@@ -100,7 +98,7 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
 
     if last.high >= r4 and (last.high - last.close) > 0.5 * rng and put_ok:
         return "PUT", "REJECTION_R4"
-    
+
     # ===============================
     # Continuation helpers
     # ===============================
@@ -144,3 +142,4 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
         return "PUT", "BREAKOUT_PIVOT"
 
     return None
+
