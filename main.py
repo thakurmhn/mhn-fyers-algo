@@ -70,15 +70,15 @@ import asyncio
 import time
 import logging
 import pandas as pd
+import pendulum as dt
+import warnings
 
 from config import account_type, time_zone
-from setup import fyers_asysc, df, end_time
+from setup import fyers_asysc, df, end_time, refresh_option_chain, log_bid_ask_spread   # ✅ import helper
 from execution import paper_order, real_order
 from data_feed import fyers_socket, fyers_order_socket, chase_order
 from monitor import monitor_positions
 
-import pendulum as dt
-import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
 
 # ANSI COLORS
@@ -90,6 +90,8 @@ async def main_strategy_code():
     global df
     while True:
         ct = dt.now(time_zone)
+        # Logging Bid/Ask Spred 
+        # log_bid_ask_spread()
 
         # Close program 2 min after end time
         if ct > end_time + dt.duration(minutes=2):
@@ -123,10 +125,14 @@ async def main_strategy_code():
         await asyncio.sleep(1)
 
 def run():
+    # ✅ Start auto-refresh loop for option chain every 10s
+    # refresh_option_chain()
+
     # Connect both sockets: market data + order status
     fyers_socket.connect()
     fyers_order_socket.connect()
     time.sleep(2)
+
     try:
         asyncio.run(main_strategy_code())
     except KeyboardInterrupt:
