@@ -151,7 +151,7 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
         return None
 
     # ---- Volatility Regime Filter ----
-    if atr < 20:
+    if atr < 13:  #                     updted from 20 to 15
         logging.info(f"{MAGENTA}[SIGNAL FILTERED] ATR too low ({atr:.2f}), skipping trade{RESET}")
         return None
     if atr > 120:
@@ -181,7 +181,7 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
     # ---- Strength + Momentum ----
     def strong(side):
         mom_ok, momentum = momentum_ok(candles_3m_, side)
-        strength_ok = (body / rng) > 0.6
+        strength_ok = (body / rng) > 0.54               # update from 0.6 to 0.54
         return strength_ok and mom_ok, momentum
 
     call_ok, call_momentum = strong("CALL")
