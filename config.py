@@ -33,7 +33,7 @@ account_type = 'PAPER'   # 'PAPER' or 'LIVE'
 quantity = 130
 buffer = 5
 profit_loss_point = 10
-MAX_TRADES_PER_DAY = 20
+MAX_TRADES_PER_DAY = 30
 
 # ========== Entry Params ==================
 
