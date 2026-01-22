@@ -1,6 +1,6 @@
 # # ===== signals.py =====
 # import logging
-# from setup import spot_price
+# from setup import spot_price, hist_data
 # from indicators import momentum_ok, resample_to_15m, check_bias
 # from config import CANDLE_BODY_RANGE, ATR_VALUE
 
@@ -13,6 +13,11 @@
 # MAGENTA = "\033[95m"
 # GRAY    = "\033[90m"
 # # ===========================================================
+
+# logging.info(
+#     f"{YELLOW}[BIAS CHECK] bias={bias}{RESET}"
+#     )
+
 
 # def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles_3m_):
 #     logging.info(f"{YELLOW}[DETECT_SIGNAL CALLED] candles={len(candles_3m_)} atr={atr}{RESET}")
@@ -70,10 +75,25 @@
 #     # Priority 1: CPR
 #     # ===============================
 #     if last.close > tc + 0.1 * atr and call_ok:
-#         return "CALL", "BREAKOUT_CPR_TC"
-#     if last.close < bc - 0.1 * atr and put_ok:
-#         return "PUT", "BREAKOUT_CPR_BC"
+#         hist_data_15m = resample_to_15m(hist_data)
+#         bias = check_bias(hist_data_15m)
+#         logging.info(f"[BIAS CHECK] side=CALL bias={bias}")
+#         if bias == "BULLISH":
+#             return "CALL", "BREAKOUT_CPR_TC"
+#         else:
+#             logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
+#             return None
 
+#     if last.close < bc - 0.1 * atr and put_ok:
+#         hist_data_15m = resample_to_15m(hist_data)
+#         bias = check_bias(hist_data_15m)
+#         logging.info(f"[BIAS CHECK] side=PUT bias={bias}")
+#         if bias == "BEARISH":
+#             return "PUT", "BREAKOUT_CPR_BC"
+#         else:
+#             logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+#             return None
+        
 #     # ===============================
 #     # Priority 2: Camarilla
 #     # ===============================
@@ -134,7 +154,7 @@
 
 # ===== signals.py =====
 import logging
-from setup import spot_price, hist_data   # hist_data is your master OHLCV dataframe
+from setup import spot_price, hist_data
 from indicators import momentum_ok, resample_to_15m, check_bias
 from config import CANDLE_BODY_RANGE, ATR_VALUE
 
@@ -200,83 +220,158 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
         f"CALL_mom={call_momentum:.2f} PUT_mom={put_momentum:.2f}{RESET}"
     )
 
-    side, reason = None, None
+    # Helper for bias validation
+    def bias_ok(side):
+        hist_data_15m = resample_to_15m(hist_data)
+        bias = check_bias(hist_data_15m)
+        logging.info(f"[BIAS CHECK] side={side} bias={bias}")
+        return (side == "CALL" and bias == "BULLISH") or (side == "PUT" and bias == "BEARISH")
 
     # ===============================
     # Priority 1: CPR
     # ===============================
     if last.close > tc + 0.1 * atr and call_ok:
-        side, reason = "CALL", "BREAKOUT_CPR_TC"
-    elif last.close < bc - 0.1 * atr and put_ok:
-        side, reason = "PUT", "BREAKOUT_CPR_BC"
+        if bias_ok("CALL"):
+            return "CALL", "BREAKOUT_CPR_TC"
+        else:
+            logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
+            return None
+
+    if last.close < bc - 0.1 * atr and put_ok:
+        if bias_ok("PUT"):
+            return "PUT", "BREAKOUT_CPR_BC"
+        else:
+            logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+            return None
 
     # ===============================
     # Priority 2: Camarilla
     # ===============================
-    elif last.close > r3 + 0.1 * atr and call_ok:
-        side, reason = "CALL", "BREAKOUT_R3"
-    elif last.close > r4 + 0.1 * atr and call_ok:
-        side, reason = "CALL", "BREAKOUT_R4"
-    elif last.close < s3 - 0.1 * atr and put_ok:
-        side, reason = "PUT", "BREAKOUT_S3"
-    elif last.close < s4 - 0.1 * atr and put_ok:
-        side, reason = "PUT", "BREAKOUT_S4"
-    elif last.low <= s3 and (last.close - last.low) > 0.5 * rng and call_ok:
-        side, reason = "CALL", "REJECTION_S3"
-    elif last.low <= s4 and (last.close - last.low) > 0.5 * rng and call_ok:
-        side, reason = "CALL", "REJECTION_S4"
-    elif last.high >= r3 and (last.high - last.close) > 0.5 * rng and put_ok:
-        side, reason = "PUT", "REJECTION_R3"
-    elif last.high >= r4 and (last.high - last.close) > 0.5 * rng and put_ok:
-        side, reason = "PUT", "REJECTION_R4"
+    if last.close > r3 + 0.1 * atr and call_ok:
+        if bias_ok("CALL"):
+            return "CALL", "BREAKOUT_R3"
+        else:
+            logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
+            return None
 
+    if last.close > r4 + 0.1 * atr and call_ok:
+        if bias_ok("CALL"):
+            return "CALL", "BREAKOUT_R4"
+        else:
+            logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
+            return None
+
+    if last.close < s3 - 0.1 * atr and put_ok:
+        if bias_ok("PUT"):
+            return "PUT", "BREAKOUT_S3"
+        else:
+            logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+            return None
+
+    if last.close < s4 - 0.1 * atr and put_ok:
+        if bias_ok("PUT"):
+            return "PUT", "BREAKOUT_S4"
+        else:
+            logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+            return None
+
+    if last.low <= s3 and (last.close - last.low) > 0.5 * rng and call_ok:
+        if bias_ok("CALL"):
+            return "CALL", "REJECTION_S3"
+        else:
+            logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
+            return None
+
+    if last.low <= s4 and (last.close - last.low) > 0.5 * rng and call_ok:
+        if bias_ok("CALL"):
+            return "CALL", "REJECTION_S4"
+        else:
+            logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
+            return None
+
+    if last.high >= r3 and (last.high - last.close) > 0.5 * rng and put_ok:
+        if bias_ok("PUT"):
+            return "PUT", "REJECTION_R3"
+        else:
+            logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+            return None
+
+    if last.high >= r4 and (last.high - last.close) > 0.5 * rng and put_ok:
+        if bias_ok("PUT"):
+            return "PUT", "REJECTION_R4"
+        else:
+            logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+            return None
+
+    # ===============================
     # Continuation helpers
+    # ===============================
     def continuation_long(level):
         return last.low <= level and last.close > level + 0.05 * atr
     def continuation_short(level):
         return last.high >= level and last.close < level - 0.05 * atr
 
+    # Continuation signals
     if continuation_long(r4) and call_ok:
-        side, reason = "CALL", "CONTINUATION_R4"
-    elif continuation_short(s4) and put_ok:
-        side, reason = "PUT", "CONTINUATION_S4"
+        if bias_ok("CALL"):
+            return "CALL", "CONTINUATION_R4"
+        else:
+            logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
+            return None
+
+    if continuation_short(s4) and put_ok:
+        if bias_ok("PUT"):
+            return "PUT", "CONTINUATION_S4"
+        else:
+            logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+            return None
 
     # ===============================
     # Priority 3: Traditional
     # ===============================
-    elif last.close > r2 + 0.1 * atr and call_ok:
-        side, reason = "CALL", "BREAKOUT_R2"
-    elif last.close < s2 - 0.1 * atr and put_ok:
-        side, reason = "PUT", "BREAKOUT_S2"
-    elif last.low <= s1 and (last.close - last.low) > 0.5 * rng and call_ok:
-        side, reason = "CALL", "REJECTION_S1"
-    elif last.high >= r1 and (last.high - last.close) > 0.5 * rng and put_ok:
-        side, reason = "PUT", "REJECTION_R1"
+    if last.close > r2 + 0.1 * atr and call_ok:
+        if bias_ok("CALL"):
+            return "CALL", "BREAKOUT_R2"
+        else:
+            logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
+            return None
 
+    if last.close < s2 - 0.1 * atr and put_ok:
+        if bias_ok("PUT"):
+            return "PUT", "BREAKOUT_S2"
+        else:
+            logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+            return None
+
+    if last.low <= s1 and (last.close - last.low) > 0.5 * rng and call_ok:
+        if bias_ok("CALL"):
+            return "CALL", "REJECTION_S1"
+        else:
+            logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
+            return None
+
+    if last.high >= r1 and (last.high - last.close) > 0.5 * rng and put_ok:
+        if bias_ok("PUT"):
+            return "PUT", "REJECTION_R1"
+        else:
+            logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+            return None
+        
     # ===============================
     # Priority 4: Pivot
     # ===============================
-    elif prev.close < pivot and last.close > pivot + 0.1 * atr and call_ok:
-        side, reason = "CALL", "BREAKOUT_PIVOT"
-    elif prev.close > pivot and last.close < pivot - 0.1 * atr and put_ok:
-        side, reason = "PUT", "BREAKOUT_PIVOT"
-
-    # ===============================
-    # Bias Filter (EMA + CCI on 15m)
-    # ===============================
-    if side:
-        hist_data_15m = resample_to_15m(hist_data)
-        bias = check_bias(hist_data_15m)
-
-        logging.info(
-        f"{YELLOW}[BIAS CHECK] side={side} bias={bias}{RESET}"
-        )
-
-        if side == "CALL" and bias != "BULLISH":
-            logging.info(f"{MAGENTA}[SIGNAL BLOCKED] CALL skipped due to bias={bias}{RESET}")
-            return None
-        if side == "PUT" and bias != "BEARISH":
-            logging.info(f"{MAGENTA}[SIGNAL BLOCKED] PUT skipped due to bias={bias}{RESET}")
+    if prev.close < pivot and last.close > pivot + 0.1 * atr and call_ok:
+        if bias_ok("CALL"):
+            return "CALL", "BREAKOUT_PIVOT"
+        else:
+            logging.info("[SIGNAL BLOCKED] CALL skipped due to bias mismatch")
             return None
 
-    return (side, reason) if side else None
+    if prev.close > pivot and last.close < pivot - 0.1 * atr and put_ok:
+        if bias_ok("PUT"):
+            return "PUT", "BREAKOUT_PIVOT"
+        else:
+            logging.info("[SIGNAL BLOCKED] PUT skipped due to bias mismatch")
+            return None
+
+    return None
