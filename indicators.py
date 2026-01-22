@@ -182,40 +182,105 @@ logging.info(
     "[INIT] Daily ATR unavailable"
 )
 
-def get_dynamic_target(side, entry_price, pivots, cpr, camarilla, method="auto"):
+# ===== Trend & Bias Filters =====
+
+# ===== EMA =====
+def calculate_ema(series, period=20):
+    """Calculate Exponential Moving Average (EMA)."""
+    return series.ewm(span=period, adjust=False).mean()
+
+# ===== CCI =====
+def calculate_cci(df, period=20):
+    """Calculate Commodity Channel Index (CCI)."""
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    ma = tp.rolling(period).mean()
+    md = tp.rolling(period).apply(lambda x: (x - x.mean()).abs().mean())
+    cci = (tp - ma) / (0.015 * md)
+    return cci
+
+# ===== Resample to 15m =====
+def resample_to_15m(df):
     """
-    Decide dynamic target based on method and side.
-    side: "CALL" or "PUT"
-    entry_price: option entry price
-    pivots: dict with classic pivot levels {"pivot":..., "r1":..., "s1":..., ...}
-    cpr: dict with CPR levels {"tc":..., "bc":..., "pivot":...}
-    camarilla: dict with camarilla levels {"r3":..., "r4":..., "s3":..., "s4":...}
-    method: "classic", "cpr", "camarilla", or "auto"
+    Resample OHLCV dataframe to 15-minute candles.
+    Input: df with datetime index and columns [open, high, low, close, volume]
+    Output: 15m OHLCV dataframe
     """
+    df_15m = df.resample("15T").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    }).dropna()
+    return df_15m
 
-    target = None
+# ===== Bias Filter =====
+def check_bias(hist_data_15m):
+    """
+    Determine bias using EMA trend and CCI momentum.
+    Returns: "BULLISH", "BEARISH", or "NEUTRAL"
+    """
+    # --- EMA Trend ---
+    ema20 = calculate_ema(hist_data_15m["close"], period=20)
+    last_close = hist_data_15m["close"].iloc[-1]
+    ema_slope = ema20.iloc[-1] - ema20.iloc[-2]
 
-    if method == "classic":
-        target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
+    ema_bias = None
+    if last_close > ema20.iloc[-1] and ema_slope > 0:
+        ema_bias = "BULLISH"
+    elif last_close < ema20.iloc[-1] and ema_slope < 0:
+        ema_bias = "BEARISH"
 
-    elif method == "cpr":
-        # For option BUY (CALL or PUT), premium profits when price rises → use tc
-        target = cpr.get("tc", entry_price + profit_loss_point)
+    # --- CCI Momentum ---
+    cci = calculate_cci(hist_data_15m, period=20)
+    last_cci = cci.iloc[-1]
 
-    elif method == "camarilla":
-        target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
+    cci_bias = None
+    if last_cci > 100:
+        cci_bias = "BULLISH"
+    elif last_cci < -100:
+        cci_bias = "BEARISH"
 
-    elif method == "auto":
-        atr = pivots.get("atr", 0)
-        if atr < 20:
-            target = cpr.get("tc", entry_price + profit_loss_point)
-        elif atr < 40:
-            target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
-        else:
-            target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
+    # --- Combined Bias ---
+    if ema_bias == cci_bias and ema_bias is not None:
+        return ema_bias
+    else:
+        return "NEUTRAL"
 
-    # Fallback
-    if target is None:
-        target = entry_price + profit_loss_point
+# def get_dynamic_target(side, entry_price, pivots, cpr, camarilla, method="auto"):
+#     """
+#     Decide dynamic target based on method and side.
+#     side: "CALL" or "PUT"
+#     entry_price: option entry price
+#     pivots: dict with classic pivot levels {"pivot":..., "r1":..., "s1":..., ...}
+#     cpr: dict with CPR levels {"tc":..., "bc":..., "pivot":...}
+#     camarilla: dict with camarilla levels {"r3":..., "r4":..., "s3":..., "s4":...}
+#     method: "classic", "cpr", "camarilla", or "auto"
+#     """
 
-    return target
+#     target = None
+
+#     if method == "classic":
+#         target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
+
+#     elif method == "cpr":
+#         # For option BUY (CALL or PUT), premium profits when price rises → use tc
+#         target = cpr.get("tc", entry_price + profit_loss_point)
+
+#     elif method == "camarilla":
+#         target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
+
+#     elif method == "auto":
+#         atr = pivots.get("atr", 0)
+#         if atr < 20:
+#             target = cpr.get("tc", entry_price + profit_loss_point)
+#         elif atr < 40:
+#             target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
+#         else:
+#             target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
+
+#     # Fallback
+#     if target is None:
+#         target = entry_price + profit_loss_point
+
+#     return target

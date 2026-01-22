@@ -16,7 +16,7 @@ from setup import (
     start_time, end_time, hist_data, time_zone )
 from indicators import (
     calculate_cpr, calculate_traditional_pivots, calculate_camarilla_pivots,
-    resolve_atr, daily_atr, candles_3m, get_dynamic_target
+    resolve_atr, daily_atr, candles_3m
 )
 from signals import detect_signal
 
