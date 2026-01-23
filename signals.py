@@ -224,7 +224,7 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
     def bias_ok(side):
         hist_data_15m = resample_to_15m(hist_data)
         bias = check_bias(hist_data_15m)
-        logging.info(f"[BIAS CHECK] side={side} bias={bias}")
+        logging.info(f"{YELLOW}[BIAS CHECK] side={side} bias={bias}{RESET}")
         return (side == "CALL" and bias == "BULLISH") or (side == "PUT" and bias == "BEARISH")
 
     # ===============================

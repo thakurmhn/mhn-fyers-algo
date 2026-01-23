@@ -1,6 +1,7 @@
 # ===== indicators.py =====
 import logging
 import pandas as pd
+import numpy as np
 import pendulum as dt
 
 from config import time_zone, profit_loss_point
@@ -189,12 +190,12 @@ def calculate_ema(series, period=20):
     """Calculate Exponential Moving Average (EMA)."""
     return series.ewm(span=period, adjust=False).mean()
 
-# ===== CCI =====
 def calculate_cci(df, period=20):
     """Calculate Commodity Channel Index (CCI)."""
     tp = (df["high"] + df["low"] + df["close"]) / 3
     ma = tp.rolling(period).mean()
-    md = tp.rolling(period).apply(lambda x: (x - x.mean()).abs().mean())
+    # Mean Absolute Deviation (MAD)
+    md = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
     cci = (tp - ma) / (0.015 * md)
     return cci
 
@@ -202,50 +203,123 @@ def calculate_cci(df, period=20):
 def resample_to_15m(df):
     """
     Resample OHLCV dataframe to 15-minute candles.
-    Input: df with datetime index and columns [open, high, low, close, volume]
+    Input: df with datetime index or a 'datetime' column.
     Output: 15m OHLCV dataframe
     """
-    df_15m = df.resample("15T").agg({
+    # Ensure datetime index
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if "datetime" in df.columns:
+            df = df.copy()
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.set_index("datetime")
+        else:
+            raise ValueError("DataFrame must have a DatetimeIndex or a 'datetime' column")
+
+    # Use '15min' instead of '15T' (FutureWarning fix)
+    df_15m = df.resample("15min").agg({
         "open": "first",
         "high": "max",
         "low": "min",
         "close": "last",
         "volume": "sum"
     }).dropna()
+
     return df_15m
 
-# ===== Bias Filter =====
-def check_bias(hist_data_15m):
+# ===== Supertrend =====
+def calculate_supertrend(df, period=10, multiplier=3):
+    hl2 = (df['high'] + df['low']) / 2
+    atr = calculate_atr(df, period)
+
+    upperband = hl2 + (multiplier * atr)
+    lowerband = hl2 - (multiplier * atr)
+
+    supertrend = pd.Series(index=df.index, dtype="object")
+    trend = None
+
+    for i in range(period, len(df)):
+        if df['close'].iloc[i] > upperband.iloc[i-1]:
+            trend = "BULLISH"
+        elif df['close'].iloc[i] < lowerband.iloc[i-1]:
+            trend = "BEARISH"
+        supertrend.iloc[i] = trend
+
+    return supertrend
+
+# ===== ADX =====
+def calculate_adx(df, period=14):
+    df = df.copy()
+    df['up_move'] = df['high'] - df['high'].shift()
+    df['down_move'] = df['low'].shift() - df['low']
+
+    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0.0)
+    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0.0)
+
+    tr = calculate_atr(df, period)
+    plus_di = 100 * (df['plus_dm'].rolling(period).sum() / tr)
+    minus_di = 100 * (df['minus_dm'].rolling(period).sum() / tr)
+
+    dx = (np.abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    adx = dx.rolling(period).mean()
+    return adx
+
+
+def is_sideways(df, daily_atr=None, atr_threshold=30, adx_threshold=20):
     """
-    Determine bias using EMA trend and CCI momentum.
+    Detect sideways market using ATR and ADX filters.
+    Returns True if sideways, False otherwise.
+    """
+    atr, atr_source = resolve_atr(df, daily_atr)
+    if atr is None:
+        logging.info("[SIDEWAYS CHECK] ATR unavailable, treating as sideways")
+        return True
+
+    adx = calculate_adx(df, period=14).iloc[-1]
+
+    logging.info(f"[SIDEWAYS CHECK] ATR={atr:.2f} ({atr_source}) ADX={adx:.2f} thresholds=({atr_threshold},{adx_threshold})")
+
+    if atr < atr_threshold or adx < adx_threshold:
+        logging.info("[SIDEWAYS DETECTED] ATR/ADX too low, skipping signals")
+        return True
+
+    return False
+
+def check_bias(hist_data_3m, daily_atr=None, atr_threshold=15, adx_threshold=20, min_candles=7):
+    """
+    Determine bias using Supertrend, ADX, and ATR (via resolve_atr) on 3m candles.
     Returns: "BULLISH", "BEARISH", or "NEUTRAL"
     """
-    # --- EMA Trend ---
-    ema20 = calculate_ema(hist_data_15m["close"], period=20)
-    last_close = hist_data_15m["close"].iloc[-1]
-    ema_slope = ema20.iloc[-1] - ema20.iloc[-2]
 
-    ema_bias = None
-    if last_close > ema20.iloc[-1] and ema_slope > 0:
-        ema_bias = "BULLISH"
-    elif last_close < ema20.iloc[-1] and ema_slope < 0:
-        ema_bias = "BEARISH"
-
-    # --- CCI Momentum ---
-    cci = calculate_cci(hist_data_15m, period=20)
-    last_cci = cci.iloc[-1]
-
-    cci_bias = None
-    if last_cci > 100:
-        cci_bias = "BULLISH"
-    elif last_cci < -100:
-        cci_bias = "BEARISH"
-
-    # --- Combined Bias ---
-    if ema_bias == cci_bias and ema_bias is not None:
-        return ema_bias
-    else:
+    # --- Safety: need enough candles ---
+    if len(hist_data_3m) < min_candles:
+        logging.info(f"[BIAS CHECK] insufficient 3m candles (<{min_candles}), defaulting to NEUTRAL")
         return "NEUTRAL"
+
+    # --- ATR resolution ---
+    atr, atr_source = resolve_atr(hist_data_3m, daily_atr)
+    if atr is None:
+        logging.info("[BIAS CHECK] ATR unavailable, defaulting to NEUTRAL")
+        return "NEUTRAL"
+
+    # --- ADX ---
+    adx = calculate_adx(hist_data_3m, period=14).iloc[-1]
+
+    # --- Sideways filter ---
+    if atr < atr_threshold or adx < adx_threshold:
+        logging.info(f"[SIDEWAYS DETECTED] ATR={atr:.2f} ({atr_source}) ADX={adx:.2f}, skipping signals")
+        return "NEUTRAL"
+
+    # --- Supertrend ---
+    supertrend = calculate_supertrend(hist_data_3m, period=10, multiplier=4)  # smoother for 3m
+    st_bias = supertrend.iloc[-1]
+
+    # --- Debug log ---
+    logging.info(f"[BIAS DEBUG] ATR={atr:.2f} ({atr_source}) ADX={adx:.2f} Supertrend={st_bias}")
+
+    return st_bias if st_bias in ("BULLISH", "BEARISH") else "NEUTRAL"
+
+
+
 
 # def get_dynamic_target(side, entry_price, pivots, cpr, camarilla, method="auto"):
 #     """

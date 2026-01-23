@@ -32,7 +32,7 @@ account_type = 'PAPER'          # 'PAPER' or 'LIVE'
 quantity = 130                  # lot size - Nifty - 65
 buffer = 5
 profit_loss_point = 10          # Used for target profit/stoploss 
-MAX_TRADES_PER_DAY = 30         # Maximum trades per day
+MAX_TRADES_PER_DAY = 20         # Maximum trades per day
 
 CALL_MONEYNESS = 'ITM'          # strike/contract type - ITM/OTM  
 PUT_MONEYNESS  = 'ITM'

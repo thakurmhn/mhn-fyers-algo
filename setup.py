@@ -71,12 +71,26 @@ hist_req = {
     "range_from": f.strftime('%Y-%m-%d'), "range_to": p.strftime('%Y-%m-%d'),
     "cont_flag": "1"
 }
+# response2 = fyers.history(data=hist_req)
+# hist_data = pd.DataFrame(response2['candles'])
+# hist_data.columns = ['date','open','high','low','close','volume']
+# ist = pytz.timezone('Asia/Kolkata')
+# hist_data['date'] = pd.to_datetime(hist_data['date'], unit='s').dt.tz_localize('UTC').dt.tz_convert(ist)
+# hist_data = hist_data[hist_data['date'].dt.date < dt.now(time_zone).date()]
+
 response2 = fyers.history(data=hist_req)
 hist_data = pd.DataFrame(response2['candles'])
 hist_data.columns = ['date','open','high','low','close','volume']
+
+# Convert to timezone-aware datetime
 ist = pytz.timezone('Asia/Kolkata')
 hist_data['date'] = pd.to_datetime(hist_data['date'], unit='s').dt.tz_localize('UTC').dt.tz_convert(ist)
+
+# Filter out today's incomplete candles if needed
 hist_data = hist_data[hist_data['date'].dt.date < dt.now(time_zone).date()]
+
+# ✅ Set datetime as index for resampling
+hist_data = hist_data.set_index('date')
 
 import threading
 
