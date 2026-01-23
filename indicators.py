@@ -3,9 +3,10 @@ import logging
 import pandas as pd
 import numpy as np
 import pendulum as dt
+import datetime
 
 from config import time_zone, profit_loss_point
-from setup import spot_price, hist_data
+from setup import spot_price, hist_data, fyers
 
 # globals (must exist once in your script)
 ticks_buffer = []
@@ -185,37 +186,43 @@ logging.info(
 
 # ===== Trend & Bias Filters =====
 
-# ===== EMA =====
-def calculate_ema(series, period=20):
-    """Calculate Exponential Moving Average (EMA)."""
-    return series.ewm(span=period, adjust=False).mean()
+# Get Historical Previous day data
 
-def calculate_cci(df, period=20):
-    """Calculate Commodity Channel Index (CCI)."""
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    ma = tp.rolling(period).mean()
-    # Mean Absolute Deviation (MAD)
-    md = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
-    cci = (tp - ma) / (0.015 * md)
-    return cci
-
-# ===== Resample to 15m =====
-def resample_to_15m(df):
+def get_intraday_data(symbol, resolution="3", target_date=None):
     """
-    Resample OHLCV dataframe to 15-minute candles.
-    Input: df with datetime index or a 'datetime' column.
-    Output: 15m OHLCV dataframe
+    Fetch previous intraday historical data from Fyers for a given date.
+    Returns DataFrame with [timestamp, open, high, low, close, volume].
     """
-    # Ensure datetime index
-    if not isinstance(df.index, pd.DatetimeIndex):
-        if "datetime" in df.columns:
-            df = df.copy()
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.set_index("datetime")
-        else:
-            raise ValueError("DataFrame must have a DatetimeIndex or a 'datetime' column")
+    if target_date is None:
+        target_date = datetime.date.today() - datetime.timedelta(days=1)
 
-    # Use '15min' instead of '15T' (FutureWarning fix)
+    start = datetime.datetime.combine(target_date, datetime.time(9,15))
+    end   = datetime.datetime.combine(target_date, datetime.time(15,30))
+
+    data = {
+        "symbol": symbol,
+        "resolution": resolution,
+        "date_format": "0",
+        "range_from": int(start.timestamp()),
+        "range_to": int(end.timestamp()),
+        "cont_flag": "0"
+    }
+    response = fyers.history(data=data)
+    candles = response["candles"]
+    df = pd.DataFrame(candles, columns=["timestamp","open","high","low","close","volume"])
+    return df
+
+def build_15m_candles(df_intraday, target_date=None):
+    """
+    Resample previous intraday data into 15m OHLCV candles for a given date.
+    """
+    df = df_intraday.copy()
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
+    df = df.set_index("datetime")
+
+    if target_date is not None:
+        df = df[df.index.date == target_date]
+
     df_15m = df.resample("15min").agg({
         "open": "first",
         "high": "max",
@@ -226,8 +233,42 @@ def resample_to_15m(df):
 
     return df_15m
 
+def get_today_15m_candles(candles_3m):
+    """
+    Resample live 3m candles into 15m candles.
+    """
+    if not isinstance(candles_3m.index, pd.DatetimeIndex):
+        candles_3m = candles_3m.copy()
+        candles_3m["datetime"] = pd.to_datetime(candles_3m["time"])
+        candles_3m = candles_3m.set_index("datetime")
+
+    df_15m_today = candles_3m.resample("15min").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last"
+    }).dropna()
+
+    return df_15m_today
+
+
+# ===== EMA =====
+def calculate_ema(series, period=20):
+    """Calculate Exponential Moving Average (EMA)."""
+    return series.ewm(span=period, adjust=False).mean()
+
+# ============ CCI ================================
+def calculate_cci(df, period=20):
+    """Calculate Commodity Channel Index (CCI)."""
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    ma = tp.rolling(period).mean()
+    # Mean Absolute Deviation (MAD)
+    md = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+    cci = (tp - ma) / (0.015 * md)
+    return cci
+
 # ===== Supertrend =====
-def calculate_supertrend(df, period=10, multiplier=3):
+def calculate_supertrend(df, period=8, multiplier=3):
     hl2 = (df['high'] + df['low']) / 2
     atr = calculate_atr(df, period)
 
@@ -263,46 +304,25 @@ def calculate_adx(df, period=14):
     adx = dx.rolling(period).mean()
     return adx
 
-
-def is_sideways(df, daily_atr=None, atr_threshold=30, adx_threshold=20):
+def check_bias(hist_data_15m, daily_atr=None, atr_threshold=15, adx_threshold=20, min_candles=20):
     """
-    Detect sideways market using ATR and ADX filters.
-    Returns True if sideways, False otherwise.
-    """
-    atr, atr_source = resolve_atr(df, daily_atr)
-    if atr is None:
-        logging.info("[SIDEWAYS CHECK] ATR unavailable, treating as sideways")
-        return True
-
-    adx = calculate_adx(df, period=14).iloc[-1]
-
-    logging.info(f"[SIDEWAYS CHECK] ATR={atr:.2f} ({atr_source}) ADX={adx:.2f} thresholds=({atr_threshold},{adx_threshold})")
-
-    if atr < atr_threshold or adx < adx_threshold:
-        logging.info("[SIDEWAYS DETECTED] ATR/ADX too low, skipping signals")
-        return True
-
-    return False
-
-def check_bias(hist_data_3m, daily_atr=None, atr_threshold=15, adx_threshold=20, min_candles=7):
-    """
-    Determine bias using Supertrend, ADX, and ATR (via resolve_atr) on 3m candles.
+    Determine bias using Supertrend, EMA, CCI, ADX, and ATR (via resolve_atr) on 15m candles.
     Returns: "BULLISH", "BEARISH", or "NEUTRAL"
     """
 
     # --- Safety: need enough candles ---
-    if len(hist_data_3m) < min_candles:
-        logging.info(f"[BIAS CHECK] insufficient 3m candles (<{min_candles}), defaulting to NEUTRAL")
+    if len(hist_data_15m) < min_candles:
+        logging.info(f"[BIAS CHECK] insufficient 15m candles (<{min_candles}), defaulting to NEUTRAL")
         return "NEUTRAL"
 
     # --- ATR resolution ---
-    atr, atr_source = resolve_atr(hist_data_3m, daily_atr)
+    atr, atr_source = resolve_atr(hist_data_15m, daily_atr)
     if atr is None:
         logging.info("[BIAS CHECK] ATR unavailable, defaulting to NEUTRAL")
         return "NEUTRAL"
 
     # --- ADX ---
-    adx = calculate_adx(hist_data_3m, period=14).iloc[-1]
+    adx = calculate_adx(hist_data_15m, period=14).iloc[-1]
 
     # --- Sideways filter ---
     if atr < atr_threshold or adx < adx_threshold:
@@ -310,15 +330,35 @@ def check_bias(hist_data_3m, daily_atr=None, atr_threshold=15, adx_threshold=20,
         return "NEUTRAL"
 
     # --- Supertrend ---
-    supertrend = calculate_supertrend(hist_data_3m, period=10, multiplier=4)  # smoother for 3m
+    supertrend = calculate_supertrend(hist_data_15m, period=10, multiplier=3)
     st_bias = supertrend.iloc[-1]
 
+    # --- EMA ---
+    ema20 = calculate_ema(hist_data_15m["close"], period=20).iloc[-1]
+    last_close = hist_data_15m["close"].iloc[-1]
+    ema_bias = "BULLISH" if last_close > ema20 else "BEARISH"
+
+    # --- CCI ---
+    cci = calculate_cci(hist_data_15m, period=20).iloc[-1]
+    cci_bias = "BULLISH" if cci > 50 else "BEARISH" if cci < -50 else "NEUTRAL"
+
+    # --- Combine biases Voting system - at least two indicaors should be Bullish or Bearish---
+    biases = [st_bias, ema_bias, cci_bias]
+    bullish_votes = biases.count("BULLISH")
+    bearish_votes = biases.count("BEARISH")
+
+    if bullish_votes >= 2:
+        final_bias = "BULLISH"
+    elif bearish_votes >= 2:
+        final_bias = "BEARISH"
+    else:
+        final_bias = "NEUTRAL"
+
     # --- Debug log ---
-    logging.info(f"[BIAS DEBUG] ATR={atr:.2f} ({atr_source}) ADX={adx:.2f} Supertrend={st_bias}")
+    logging.info(f"[BIAS DEBUG] ATR={atr:.2f} ({atr_source}) ADX={adx:.2f} "
+                 f"Supertrend={st_bias} EMA={ema_bias} CCI={cci_bias} -> Bias={final_bias}")
 
-    return st_bias if st_bias in ("BULLISH", "BEARISH") else "NEUTRAL"
-
-
+    return final_bias
 
 
 # def get_dynamic_target(side, entry_price, pivots, cpr, camarilla, method="auto"):

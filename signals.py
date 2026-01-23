@@ -221,10 +221,18 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
     )
 
     # Helper for bias validation
-    def bias_ok(side):
-        hist_data_15m = resample_to_15m(hist_data)
+    def bias_ok(side, hist_data_15m):
+        """
+        Validate if trade side aligns with bias.
+        side: "CALL" or "PUT"
+        hist_data_15m: DataFrame of 15m candles (yesterday + today)
+        """
         bias = check_bias(hist_data_15m)
         logging.info(f"{YELLOW}[BIAS CHECK] side={side} bias={bias}{RESET}")
+
+        if bias == "NEUTRAL":
+            return False  # skip trades in sideways/uncertain conditions
+
         return (side == "CALL" and bias == "BULLISH") or (side == "PUT" and bias == "BEARISH")
 
     # ===============================
