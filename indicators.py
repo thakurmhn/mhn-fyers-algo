@@ -330,7 +330,7 @@ def check_bias(hist_data_15m, daily_atr=None, atr_threshold=15, adx_threshold=20
         return "NEUTRAL"
 
     # --- Supertrend ---
-    supertrend = calculate_supertrend(hist_data_15m, period=10, multiplier=3)
+    supertrend = calculate_supertrend(hist_data_15m, period=8, multiplier=3)
     st_bias = supertrend.iloc[-1]
 
     # --- EMA ---
@@ -360,41 +360,3 @@ def check_bias(hist_data_15m, daily_atr=None, atr_threshold=15, adx_threshold=20
 
     return final_bias
 
-
-# def get_dynamic_target(side, entry_price, pivots, cpr, camarilla, method="auto"):
-#     """
-#     Decide dynamic target based on method and side.
-#     side: "CALL" or "PUT"
-#     entry_price: option entry price
-#     pivots: dict with classic pivot levels {"pivot":..., "r1":..., "s1":..., ...}
-#     cpr: dict with CPR levels {"tc":..., "bc":..., "pivot":...}
-#     camarilla: dict with camarilla levels {"r3":..., "r4":..., "s3":..., "s4":...}
-#     method: "classic", "cpr", "camarilla", or "auto"
-#     """
-
-#     target = None
-
-#     if method == "classic":
-#         target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
-
-#     elif method == "cpr":
-#         # For option BUY (CALL or PUT), premium profits when price rises → use tc
-#         target = cpr.get("tc", entry_price + profit_loss_point)
-
-#     elif method == "camarilla":
-#         target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
-
-#     elif method == "auto":
-#         atr = pivots.get("atr", 0)
-#         if atr < 20:
-#             target = cpr.get("tc", entry_price + profit_loss_point)
-#         elif atr < 40:
-#             target = pivots.get("r1") if side == "CALL" else pivots.get("s1")
-#         else:
-#             target = camarilla.get("r3") if side == "CALL" else camarilla.get("s3")
-
-#     # Fallback
-#     if target is None:
-#         target = entry_price + profit_loss_point
-
-#     return target
