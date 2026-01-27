@@ -160,7 +160,7 @@ from setup import spot_price, hist_data
 from indicators import momentum_ok, check_bias
 from config import CANDLE_BODY_RANGE, ATR_VALUE
 from indicators import momentum_ok, check_bias, get_today_15m_candles, get_recent_atr_history
-
+from oscillator_filters import oscillator_entry_filter
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -172,9 +172,10 @@ MAGENTA = "\033[95m"
 GRAY    = "\033[90m"
 # ===========================================================
 
+
 def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles_3m_, hist_yesterday_15m=None):
     """
-    Detect trading signals based on pivots, ATR, and bias alignment.
+    Detect trading signals based on pivots, ATR, bias alignment, and oscillator filters.
     """
 
     # Build today's 15m candles from live 3m data
@@ -197,17 +198,11 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
     HIGH_ATR_LIMIT = 160
 
     if atr < LOW_ATR_LIMIT:
-        logging.info(
-            f"{MAGENTA}[SIGNAL FILTERED] ATR too low "
-            f"({atr:.2f} < {LOW_ATR_LIMIT}), skipping trade{RESET}"
-        )
+        logging.info(f"{MAGENTA}[SIGNAL FILTERED] ATR too low ({atr:.2f} < {LOW_ATR_LIMIT}), skipping trade{RESET}")
         return None
 
     if atr > HIGH_ATR_LIMIT:
-        logging.warning(
-            f"{RED}[SIGNAL FILTERED][EXTREME] ATR={atr:.2f} > {HIGH_ATR_LIMIT} "
-            f"→ Trade skipped due to excessive volatility{RESET}"
-        )
+        logging.warning(f"{RED}[SIGNAL FILTERED][EXTREME] ATR={atr:.2f} > {HIGH_ATR_LIMIT} → Trade skipped due to excessive volatility{RESET}")
         return None
 
     # ---- Bias validation ----
@@ -248,8 +243,7 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
     put_ok,  put_momentum  = strong("PUT")
 
     logging.info(
-        f"{YELLOW}[SIGNAL CHECK] "
-        f"close={last.close:.2f} spot={spot_price:.2f} "
+        f"{YELLOW}[SIGNAL CHECK] close={last.close:.2f} spot={spot_price:.2f} "
         f"ATR={atr:.2f} body/range={body/rng:.2f} "
         f"CALL_mom={call_momentum:.2f} PUT_mom={put_momentum:.2f}{RESET}"
     )
@@ -266,38 +260,48 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
     # Priority 1: CPR
     # ===============================
     if last.close > tc + 0.1 * atr and call_ok and bias_ok("CALL", full_hist):
-        return "CALL", "BREAKOUT_CPR_TC"
+        if oscillator_entry_filter("CALL", candles_3m_):
+            return "CALL", "BREAKOUT_CPR_TC"
 
     if last.close < bc - 0.1 * atr and put_ok and bias_ok("PUT", full_hist):
-        return "PUT", "BREAKOUT_CPR_BC"
+        if oscillator_entry_filter("PUT", candles_3m_):
+            return "PUT", "BREAKOUT_CPR_BC"
 
     # ===============================
     # Priority 2: Camarilla (Breakouts + Rejections)
     # ===============================
     if last.close > r3 + 0.1 * atr and call_ok and bias_ok("CALL", full_hist):
-        return "CALL", "BREAKOUT_R3"
+        if oscillator_entry_filter("CALL", candles_3m_):
+            return "CALL", "BREAKOUT_R3"
 
     if last.close > r4 + 0.1 * atr and call_ok and bias_ok("CALL", full_hist):
-        return "CALL", "BREAKOUT_R4"
+        if oscillator_entry_filter("CALL", candles_3m_):
+            return "CALL", "BREAKOUT_R4"
 
     if last.close < s3 - 0.1 * atr and put_ok and bias_ok("PUT", full_hist):
-        return "PUT", "BREAKOUT_S3"
+        if oscillator_entry_filter("PUT", candles_3m_):
+            return "PUT", "BREAKOUT_S3"
 
     if last.close < s4 - 0.1 * atr and put_ok and bias_ok("PUT", full_hist):
-        return "PUT", "BREAKOUT_S4"
+        if oscillator_entry_filter("PUT", candles_3m_):
+            return "PUT", "BREAKOUT_S4"
 
     # Rejections
     if last.low <= s3 and (last.close - last.low) > 0.5 * rng and call_ok and bias_ok("CALL", full_hist):
-        return "CALL", "REJECTION_S3"
+        if oscillator_entry_filter("CALL", candles_3m_):
+            return "CALL", "REJECTION_S3"
 
     if last.low <= s4 and (last.close - last.low) > 0.5 * rng and call_ok and bias_ok("CALL", full_hist):
-        return "CALL", "REJECTION_S4"
+        if oscillator_entry_filter("CALL", candles_3m_):
+            return "CALL", "REJECTION_S4"
 
     if last.high >= r3 and (last.high - last.close) > 0.5 * rng and put_ok and bias_ok("PUT", full_hist):
-        return "PUT", "REJECTION_R3"
+        if oscillator_entry_filter("PUT", candles_3m_):
+            return "PUT", "REJECTION_R3"
 
     if last.high >= r4 and (last.high - last.close) > 0.5 * rng and put_ok and bias_ok("PUT", full_hist):
-        return "PUT", "REJECTION_R4"
+        if oscillator_entry_filter("PUT", candles_3m_):
+            return "PUT", "REJECTION_R4"
 
     # ===============================
     # Continuation helpers
@@ -309,34 +313,41 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
         return last.high >= level and last.close < level - 0.05 * atr
 
     if continuation_long(r4) and call_ok and bias_ok("CALL", full_hist):
-        return "CALL", "CONTINUATION_R4"
+        if oscillator_entry_filter("CALL", candles_3m_):
+            return "CALL", "CONTINUATION_R4"
 
     if continuation_short(s4) and put_ok and bias_ok("PUT", full_hist):
-        return "PUT", "CONTINUATION_S4"
+        if oscillator_entry_filter("PUT", candles_3m_):
+            return "PUT", "CONTINUATION_S4"
 
     # ===============================
     # Priority 3: Traditional
     # ===============================
     if last.close > r2 + 0.1 * atr and call_ok and bias_ok("CALL", full_hist):
-        return "CALL", "BREAKOUT_R2"
+        if oscillator_entry_filter("CALL", candles_3m_):
+            return "CALL", "BREAKOUT_R2"
 
     if last.close < s2 - 0.1 * atr and put_ok and bias_ok("PUT", full_hist):
-        return "PUT", "BREAKOUT_S2"
+        if oscillator_entry_filter("PUT", candles_3m_):
+            return "PUT", "BREAKOUT_S2"
 
     if last.low <= s1 and (last.close - last.low) > 0.5 * rng and call_ok and bias_ok("CALL", full_hist):
-        return "CALL", "REJECTION_S1"
+        if oscillator_entry_filter("CALL", candles_3m_):
+            return "CALL", "REJECTION_S1"
 
     if last.high >= r1 and (last.high - last.close) > 0.5 * rng and put_ok and bias_ok("PUT", full_hist):
-        return "PUT", "REJECTION_R1"
-
-    # ===============================
+        if oscillator_entry_filter("PUT", candles_3m_):
+            return "PUT", "REJECTION_R1"
+    
+        # ===============================
     # Priority 4: Pivot
     # ===============================
     if prev.close < pivot and last.close > pivot + 0.1 * atr and call_ok and bias_ok("CALL", full_hist):
-        return "CALL", "BREAKOUT_PIVOT"
+        if oscillator_entry_filter("CALL", candles_3m_):
+            return "CALL", "BREAKOUT_PIVOT"
 
     if prev.close > pivot and last.close < pivot - 0.1 * atr and put_ok and bias_ok("PUT", full_hist):
-        return "PUT", "BREAKOUT_PIVOT"
-
-    # ---- No signal matched ----
+        if oscillator_entry_filter("PUT", candles_3m_):
+            return "PUT", "BREAKOUT_PIVOT"
+        
     return None

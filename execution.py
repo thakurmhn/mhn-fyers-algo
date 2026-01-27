@@ -18,6 +18,10 @@ from indicators import (
 )
 from signals import detect_signal
 
+from oscillator_filters import oscillator_exit_trigger
+
+
+
 # ===========================================================
 # ANSI COLORS for order logs
 RESET   = "\033[0m"
@@ -643,6 +647,15 @@ def check_order_status(order_id, fyers):
 
 #     return False   # No full exit occurred
 
+
+
+
+
+# ============ Process Order with Dynamic SL/PT/TG ===============================
+
+# Config flag: choose "HARD" or "TRAIL"
+OSCILLATOR_EXIT_MODE = "HARD"   # or "TRAIL"
+
 def process_order(side, symbol, price, info, hist_data):
     trade = info["call_buy"] if side == "CALL" else info["put_buy"]
     entry = trade["buy_price"]
@@ -678,6 +691,48 @@ def process_order(side, symbol, price, info, hist_data):
             update_order_status(order_id, "PENDING", qty, price, symbol)
             return True
         return False
+
+    # --- Oscillator exit check (15m candles) ---
+    candles_15m = get_today_15m_candles(hist_data)
+    triggered, reason = oscillator_exit_trigger(side, candles_15m)
+    if triggered:
+        if OSCILLATOR_EXIT_MODE == "HARD":
+            # Immediate full exit
+            if account_type.lower() == "paper":
+                success, order_id = send_paper_exit_order(trade["option_name"], qty, "OSCILLATOR")
+            else:
+                success, order_id = send_live_exit_order(trade["option_name"], qty, "OSCILLATOR")
+
+            if success:
+                trade["order_id"] = order_id
+                pnl_points = price - entry
+                pnl_value  = pnl_points * qty
+                trade["pnl"] += pnl_value
+                info["total_pnl"] = info["call_buy"].get("pnl", 0) + info["put_buy"].get("pnl", 0)
+                trade["trade_flag"] = 0
+                trade["quantity"] = 0
+                trade["filled_df"].loc[dt.now(time_zone)] = [
+                    symbol, price, "SELL", trade["current_stop_price"],
+                    trade.get("full_target_price", 0), spot_price, qty
+                ]
+                logging.info(
+                    f"{MAGENTA}[EXIT][{account_type.upper()} OSCILLATOR-HARD] LONG {side} {symbol} "
+                    f"Qty={qty} Entry={entry:.2f} Exit={price:.2f} "
+                    f"PnL={pnl_value:.2f} (points={pnl_points:.2f}) Reason={reason}{RESET}"
+                )
+                logging.info(f"[SESSION PnL] Total={info['total_pnl']:.2f}")
+                update_order_status(order_id, "PENDING", qty, price, symbol)
+                return True
+            return False
+
+        elif OSCILLATOR_EXIT_MODE == "TRAIL":
+            # Tighten SL to entry, continue trailing for TG
+            trade["current_stop_price"] = max(trade["current_stop_price"], entry)
+            logging.info(
+                f"{MAGENTA}[OSCILLATOR TRAIL] {symbol} SL tightened to {trade['current_stop_price']:.2f} "
+                f"Reason={reason}{RESET}"
+            )
+            # continue normal flow (partial/TG/trailing)
 
     # --- Partial Profit Booking ---
     partial_hit = price >= trade["partial_target_price"]
