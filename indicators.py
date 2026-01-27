@@ -280,8 +280,8 @@ import numpy as np
 import pendulum as dt
 import datetime
 
-from config import time_zone, profit_loss_point
-from setup import spot_price, hist_data, fyers
+from config import time_zone, ATR_VALUE
+from setup import spot_price, fyers
 
 # ===========================================================
 # Globals
@@ -453,6 +453,22 @@ def calculate_adx(df, period=14):
     df['DX'] = (abs(df['+DI14'] - df['-DI14']) / (df['+DI14'] + df['-DI14'])) * 100
     adx = df['DX'].rolling(window=period).mean()
     return adx
+
+def get_recent_atr_history(db, n=30):
+    """
+    Fetch last n days of ATR values from DB or cache.
+    Assumes you have a table 'daily_atr' with columns (date, atr).
+    """
+    atr_values = []
+    try:
+        rows = db.conn.execute(
+            "SELECT atr FROM daily_atr ORDER BY date DESC LIMIT ?", (n,)
+        )
+        atr_values = [row[0] for row in rows]
+    except Exception as e:
+        logging.warning(f"[ATR HISTORY] Failed to fetch: {e}")
+    return atr_values if atr_values else [ATR_VALUE, 120]  # fallback
+
 
 # ===== Bias Check =====
 def check_bias(hist_data_15m, daily_atr=None, atr_threshold=15, adx_threshold=20, min_candles=20):

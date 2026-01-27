@@ -66,6 +66,12 @@ ATR_VALUE = 15                      # Default is 20
 
 # ============================================================
 
+# ============ Risk Management ===========================
+MAX_DAILY_LOSS = -5000      # stop trading if net PnL < -5000
+MAX_DRAWDOWN   = -3000      # stop trading if drawdown exceeds 3000
+
+# =============================================================
+
 # ===== Logging =====
 log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"
 

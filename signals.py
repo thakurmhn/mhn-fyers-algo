@@ -155,10 +155,11 @@
 # ===== signals.py =====
 import logging
 import pandas as pd
+import numpy as np
 from setup import spot_price, hist_data
 from indicators import momentum_ok, check_bias
 from config import CANDLE_BODY_RANGE, ATR_VALUE
-from indicators import momentum_ok, check_bias, get_today_15m_candles
+from indicators import momentum_ok, check_bias, get_today_15m_candles, get_recent_atr_history
 
 
 # ===========================================================
@@ -191,14 +192,32 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
     if len(candles_3m_) < 2 or atr is None:
         return None
 
-    # ---- Volatility Regime Filter ----
-    if atr < ATR_VALUE:
-        logging.info(f"{MAGENTA}[SIGNAL FILTERED] ATR too low ({atr:.2f}), skipping trade{RESET}")
-        return None
-    if atr > 120:
-        logging.info(f"{MAGENTA}[SIGNAL FILTERED] ATR too high ({atr:.2f}), skipping trade{RESET}")
+    # ---- ATR Regime Filter ----
+    LOW_ATR_LIMIT  = 20
+    HIGH_ATR_LIMIT = 160
+
+    if atr < LOW_ATR_LIMIT:
+        logging.info(
+            f"{MAGENTA}[SIGNAL FILTERED] ATR too low "
+            f"({atr:.2f} < {LOW_ATR_LIMIT}), skipping trade{RESET}"
+        )
         return None
 
+    if atr > HIGH_ATR_LIMIT:
+        logging.warning(
+            f"{RED}[SIGNAL FILTERED][EXTREME] ATR={atr:.2f} > {HIGH_ATR_LIMIT} "
+            f"→ Trade skipped due to excessive volatility{RESET}"
+        )
+        return None
+
+    # ---- Bias validation ----
+    if hist_yesterday_15m is not None:
+        bias = check_bias(hist_yesterday_15m, candles_3m_)
+        if bias is None:
+            logging.info(f"{MAGENTA}[SIGNAL FILTERED] Bias not confirmed, skipping trade{RESET}")
+            return None
+
+    # ---- Candle references ----
     last = candles_3m_.iloc[-1]
     prev = candles_3m_.iloc[-2]
 
@@ -235,7 +254,7 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
         f"CALL_mom={call_momentum:.2f} PUT_mom={put_momentum:.2f}{RESET}"
     )
 
-    # Helper for bias validation
+    # ---- Bias helper ----
     def bias_ok(side, hist_data_15m):
         bias = check_bias(hist_data_15m)
         logging.info(f"{YELLOW}[BIAS CHECK] side={side} bias={bias}{RESET}")

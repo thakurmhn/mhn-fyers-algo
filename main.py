@@ -146,6 +146,9 @@ async def main_strategy_code():
                 real_order()
 
     # ✅ Step 4: Enter live async loop
+    # Track last bias refresh time
+    last_bias_refresh = None
+
     while True:
         ct = dt.now(time_zone)
 
@@ -155,18 +158,25 @@ async def main_strategy_code():
             db.close()
             return
 
+        # Intraday bias refresh every 60 minutes
+        if last_bias_refresh is None or (ct - last_bias_refresh).total_seconds() >= 3600:
+            hist_today_15m = build_15m_candles(df, target_date=datetime.date.today())
+            full_hist = pd.concat([hist_yesterday_15m, hist_today_15m]).reset_index(drop=True)
+            bias = check_bias(full_hist)
+            logging.info(f"[INTRADAY BIAS REFRESH] bias={bias} candles={len(full_hist)} at {ct}")
+            last_bias_refresh = ct
+
         # Order chasing every 5 seconds
         if ct.second % 5 == 0:
             chase_order(df)
 
         # Execute paper or live orders
         if account_type == "PAPER":
-            paper_order()
+            paper_order(hist_yesterday_15m)
         else:
-            real_order()
+            real_order(hist_yesterday_15m)
 
         await asyncio.sleep(1)
-
 
 def run():
     fyers_socket.connect()
