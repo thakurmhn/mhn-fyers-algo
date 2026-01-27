@@ -126,7 +126,7 @@
 
 import logging
 import pandas as pd
-
+import logging
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
 from setup import client_id, access_token, fyers, ticker, symbols, df
 from setup import spot_price as _spot_price
@@ -142,15 +142,51 @@ spot_price = _spot_price
 # Initialize SQLite tick database (rotates daily into ticks/ticks_YYYY-MM-DD.db)
 db = TickDatabase(base_path="ticks")
 
+# # ===== Market data callbacks =====
+# def onmessage(ticks):
+#     global df, spot_price
+
+#     if not ticks.get('symbol'):
+#         return
+
+#     symbol = ticks['symbol']
+
+#     if symbol not in df.index:
+#         df.loc[symbol] = [None] * len(df.columns)
+
+#     for key, value in ticks.items():
+#         if key in df.columns:
+#             df.loc[symbol, key] = value
+
+#     # Persist tick into SQLite
+#     try:
+#         ltp = ticks.get('ltp')
+#         bid = ticks.get('bid')
+#         ask = ticks.get('ask')
+#         vol = ticks.get('vol', 0)
+#         if ltp is not None:
+#             db.insert_tick(symbol, bid, ask, ltp, vol)
+#     except Exception as e:
+#         logging.error(f"[DB ERROR] Failed to insert tick: {e}")
+
+#     # Build 3m candle ONLY from underlying
+#     if symbol == ticker and 'ltp' in ticks:
+#         spot_price = ticks['ltp']
+#         build_3min_candle(spot_price)
+
 # ===== Market data callbacks =====
 def onmessage(ticks):
     global df, spot_price
+
+    # Log the raw payload for debugging
+    logging.debug(f"[RAW TICK] {ticks}")
 
     if not ticks.get('symbol'):
         return
 
     symbol = ticks['symbol']
 
+    # Update in-memory dataframe for all symbols
     if symbol not in df.index:
         df.loc[symbol] = [None] * len(df.columns)
 
@@ -158,21 +194,28 @@ def onmessage(ticks):
         if key in df.columns:
             df.loc[symbol, key] = value
 
-    # Persist tick into SQLite
-    try:
-        ltp = ticks.get('ltp')
-        bid = ticks.get('bid')
-        ask = ticks.get('ask')
-        vol = ticks.get('vol', 0)
-        if ltp is not None:
-            db.insert_tick(symbol, bid, ask, ltp, vol)
-    except Exception as e:
-        logging.error(f"[DB ERROR] Failed to insert tick: {e}")
+    # Persist tick ONLY for underlying index
+    if symbol == "NSE:NIFTY50-INDEX":
+        try:
+            # Fallback: use 'last_traded_price' if 'ltp' is missing
+            ltp = ticks.get('ltp') or ticks.get('last_traded_price')
+            bid = ticks.get('bid')
+            ask = ticks.get('ask')
+            vol = ticks.get('vol', 0)
 
-    # Build 3m candle ONLY from underlying
-    if symbol == ticker and 'ltp' in ticks:
-        spot_price = ticks['ltp']
-        build_3min_candle(spot_price)
+            if ltp is not None:
+                db.insert_tick(symbol, bid, ask, ltp, vol)
+                # logging.info(f"[DB FEED] Inserted {symbol} last={ltp} vol={vol}")
+            else:
+                logging.debug(f"[DB SKIP] No LTP found in tick for {symbol}")
+        except Exception as e:
+            logging.error(f"[DB ERROR] Failed to insert tick: {e}")
+
+        # Build 3m candle from underlying
+        spot_price = ltp
+        if spot_price is not None:
+            build_3min_candle(spot_price)
+
 
 def onerror(message):
     logging.error(f"Socket error: {message}")

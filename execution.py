@@ -8,8 +8,6 @@ from fyers_apiv3 import fyersModel
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
     CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point,ENTRY_OFFSET, ORDER_TYPE
-    
-    # ATR_STOP_MULT, ATR_TGT_MULT, TRAIL_TRIGGER, TRAIL_STEP,
 )
 from setup import (
     df, fyers, fyers_asysc, ticker, option_chain, df, spot_price,
@@ -602,8 +600,9 @@ def force_close_old_trades(info, mode):
                 exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
                 cleanup_trade_exit(info, leg, side, name, qty, exit_price, mode, "FORCE_CLEANUP")
 
+
 # ===== paper_order =====
-def paper_order():
+def paper_order(hist_yesterday_15m=None):
     global quantity, paper_info, df, spot_price, last_signal_candle_time
 
     # --- Safety reset: ensure no lingering trade_flag=2 ---
@@ -654,7 +653,9 @@ def paper_order():
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
             trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
             cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-            signal = detect_signal(cpr, trad, cam, atr, candles_3m)
+
+            # ✅ Pass hist_yesterday_15m into detect_signal for bias validation
+            signal = detect_signal(cpr, trad, cam, atr, candles_3m, hist_yesterday_15m=hist_yesterday_15m)
 
     # 4. PAPER ENTRY LOGIC
     if signal:
@@ -739,7 +740,7 @@ def paper_order():
 # =============================== Live Trading =======================================
 
 # ===== real_order =====
-def real_order():
+def real_order(hist_yesterday_15m=None):
     global quantity, live_info, df, spot_price, last_signal_candle_time
 
     # --- Safety reset: ensure no lingering trade_flag=2 ---
@@ -790,7 +791,9 @@ def real_order():
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
             trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
             cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-            signal = detect_signal(cpr, trad, cam, atr, candles_3m)
+
+            # ✅ Pass hist_yesterday_15m into detect_signal for bias validation
+            signal = detect_signal(cpr, trad, cam, atr, candles_3m, hist_yesterday_15m=hist_yesterday_15m)
 
     # 4. LIVE ENTRY LOGIC
     if signal:

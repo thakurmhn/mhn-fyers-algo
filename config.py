@@ -66,13 +66,6 @@ ATR_VALUE = 15                      # Default is 20
 
 # ============================================================
 
-
-# ATR_STOP_MULT  = 1.0
-# ATR_TGT_MULT   = 2.0
-# TRAIL_TRIGGER  = 1.0
-# TRAIL_STEP     = 0.5
-# ALLOW_SHORTS = False
-
 # ===== Logging =====
 log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"
 
