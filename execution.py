@@ -9,7 +9,6 @@ from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
     CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point,ENTRY_OFFSET, ORDER_TYPE
     
-    # ATR_STOP_MULT, ATR_TGT_MULT, TRAIL_TRIGGER, TRAIL_STEP,
 )
 from setup import (
     df, fyers, fyers_asysc, ticker, option_chain, df, spot_price,
