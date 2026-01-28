@@ -173,7 +173,8 @@ GRAY    = "\033[90m"
 # ===========================================================
 
 
-def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles_3m_, hist_yesterday_15m=None):
+def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles_3m_, hist_yesterday_15m=None, atr_src="ATR_3M"
+):
     """
     Detect trading signals based on pivots, ATR, bias alignment, and oscillator filters.
     """
@@ -194,15 +195,19 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
         return None
 
     # ---- ATR Regime Filter ----
-    LOW_ATR_LIMIT  = 20
-    HIGH_ATR_LIMIT = 160
+    if atr_src == "ATR_3M":
+        LOW_ATR_LIMIT, HIGH_ATR_LIMIT = 20, 160
+    elif atr_src == "ATR_DAILY":
+        LOW_ATR_LIMIT, HIGH_ATR_LIMIT = 100, 400
+    else:  # ATR_BOOTSTRAP or unknown
+        LOW_ATR_LIMIT, HIGH_ATR_LIMIT = 20, 300
 
     if atr < LOW_ATR_LIMIT:
         logging.info(f"{MAGENTA}[SIGNAL FILTERED] ATR too low ({atr:.2f} < {LOW_ATR_LIMIT}), skipping trade{RESET}")
         return None
 
     if atr > HIGH_ATR_LIMIT:
-        logging.warning(f"{RED}[SIGNAL FILTERED][EXTREME] ATR={atr:.2f} > {HIGH_ATR_LIMIT} → Trade skipped due to excessive volatility{RESET}")
+        logging.warning(f"{RED}[SIGNAL FILTERED][EXTREME] ATR={atr:.2f} > {HIGH_ATR_LIMIT} → Trade skipped{RESET}")
         return None
 
     # ---- Bias validation ----
@@ -248,14 +253,27 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels, atr, candles
         f"CALL_mom={call_momentum:.2f} PUT_mom={put_momentum:.2f}{RESET}"
     )
 
-    # ---- Bias helper ----
-    def bias_ok(side, hist_data_15m):
+   # ---- Bias helper ----
+    def bias_ok(side, hist_data_15m, hist_yesterday_15m=None):
+        """
+        Validate bias for the given side.
+        Falls back to yesterday's bias if today's 15m history is too short.
+        """
+        # If today's 15m history is too short, fall back to yesterday
+        if len(hist_data_15m) < 2 and hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
+            bias = check_bias(hist_yesterday_15m)
+            logging.info(f"{YELLOW}[BIAS CHECK] side={side} fallback yesterday bias={bias}{RESET}")
+            if bias == "NEUTRAL":
+                return False
+            return (side == "CALL" and bias == "BULLISH") or (side == "PUT" and bias == "BEARISH")
+
+        # Otherwise use today's combined history
         bias = check_bias(hist_data_15m)
         logging.info(f"{YELLOW}[BIAS CHECK] side={side} bias={bias}{RESET}")
         if bias == "NEUTRAL":
             return False
         return (side == "CALL" and bias == "BULLISH") or (side == "PUT" and bias == "BEARISH")
-
+   
     # ===============================
     # Priority 1: CPR
     # ===============================

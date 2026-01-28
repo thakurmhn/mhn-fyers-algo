@@ -17,6 +17,7 @@ __pycache__/
 *.log
 *.csv
 *.pickle
+*.db
 
 # IDE/editor files
 .vscode/

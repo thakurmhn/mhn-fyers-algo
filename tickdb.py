@@ -44,7 +44,7 @@ class TickDatabase:
         """)
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbol_time ON ticks(symbol, timestamp)")
 
-        # Merged candle storage
+        # Merged candle storage (legacy)
         self.cursor.execute("""
         CREATE TABLE IF NOT EXISTS merged_candles (
             ist_candle TEXT PRIMARY KEY,
@@ -52,6 +52,20 @@ class TickDatabase:
             high REAL,
             low REAL,
             close REAL
+        )
+        """)
+
+        # ✅ New 15m candle storage
+        self.cursor.execute("""
+        CREATE TABLE IF NOT EXISTS candles_15m_ist (
+            trade_date TEXT,
+            ist_slot TEXT,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume REAL,
+            PRIMARY KEY (trade_date, ist_slot)
         )
         """)
         self.conn.commit()
@@ -67,6 +81,16 @@ class TickDatabase:
             self.conn.commit()
         except Exception as e:
             logging.error(f"[ERROR] Failed to insert tick: {e}")
+
+    def insert_15m_candle(self, trade_date, ist_slot, open_, high, low, close, volume):
+        try:
+            self.cursor.execute("""
+                INSERT OR REPLACE INTO candles_15m_ist (trade_date, ist_slot, open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (trade_date, ist_slot, open_, high, low, close, volume))
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to insert 15m candle: {e}")
 
     def fetch_ticks(self, symbol, start_time=None, end_time=None):
         query = "SELECT timestamp, last_price, volume FROM ticks WHERE symbol=?"
@@ -85,8 +109,18 @@ class TickDatabase:
             return pd.DataFrame()
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
+
         ohlcv = df['last_price'].resample(interval).ohlc()
         ohlcv['volume'] = df['volume'].resample(interval).sum()
+        ohlcv = ohlcv.dropna()
+
+        # ✅ Persist into candles_15m_ist
+        for ts, row in ohlcv.iterrows():
+            trade_date = ts.date().isoformat()
+            ist_slot = ts.strftime("%H:%M")
+            self.insert_15m_candle(trade_date, ist_slot,
+                                   row['open'], row['high'], row['low'], row['close'], row['volume'])
+
         return ohlcv.reset_index()
 
     def replay_ticks(self, symbol):
@@ -115,61 +149,3 @@ class TickDatabase:
         if dfs:
             return pd.concat(dfs, ignore_index=True)
         return pd.DataFrame()
-
-
-# ===== Standalone Helpers =====
-
-def load_last_historical_candle(trade_date=None):
-    if trade_date is None:
-        trade_date = datetime.now().strftime("%Y-%m-%d")
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT ist_candle, open, high, low, close
-        FROM candles_15m_ist
-        WHERE date(ist_candle) = ?
-        ORDER BY ist_candle DESC
-        LIMIT 1;
-    """, (trade_date,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def merge_with_live_ticks(live_ticks, trade_date=None):
-    if trade_date is None:
-        trade_date = datetime.now().strftime("%Y-%m-%d")
-    last_hist = load_last_historical_candle(trade_date)
-    if not last_hist:
-        raise RuntimeError("No historical candle found for today")
-    prices = [tick['last_price'] for tick in live_ticks]
-    if not prices:
-        raise RuntimeError("No live ticks provided at 09:15 IST")
-    return {
-        "ist_candle": f"{trade_date} 09:15",
-        "open": prices[0],
-        "high": max(prices),
-        "low": min(prices),
-        "close": prices[-1]
-    }
-
-
-def write_candle_to_db(candle):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS merged_candles (
-            ist_candle TEXT PRIMARY KEY,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL
-        )
-    """)
-    cur.execute("""
-        INSERT OR REPLACE INTO merged_candles (ist_candle, open, high, low, close)
-        VALUES (?, ?, ?, ?, ?)
-    """, (candle["ist_candle"], candle["open"], candle["high"], candle["low"], candle["close"]))
-    conn.commit()
-    conn.close()
