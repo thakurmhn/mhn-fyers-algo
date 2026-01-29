@@ -816,7 +816,7 @@ def update_risk(trade_info, risk_info):
 
 # ===== paper_order =====
 # ===== paper_order =====
-def paper_order(hist_yesterday_15m=None):
+def paper_order(candles_3m, hist_yesterday_15m=None):
     global quantity, paper_info, df, spot_price, last_signal_candle_time, risk_info
 
     COOLDOWN_SECONDS = 180  # 3 minutes
@@ -979,7 +979,7 @@ def paper_order(hist_yesterday_15m=None):
 # =============================== Live Trading =======================================
 
 # ===== real_order =====
-def live_order(hist_yesterday_15m=None):
+def live_order(candles_3m, hist_yesterday_15m=None):
     global quantity, live_info, df, spot_price, last_signal_candle_time, risk_info
 
     COOLDOWN_SECONDS = 180  # 3 minutes
