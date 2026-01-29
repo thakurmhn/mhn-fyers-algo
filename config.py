@@ -18,7 +18,6 @@ redirect_uri = os.getenv("FYERS_REDIRECT_URI")
 
 # ===================================================================
 
-
 # ===== Strategy parameters ===========================================
 
 strategy_name = 'option_buying_pivot'
@@ -26,8 +25,8 @@ index_name = 'NIFTY50'
 exchange = 'NSE'
 ticker = f"{exchange}:{index_name}-INDEX"
 
-strike_count = 10               # Options Stikes from Option chain
-strike_diff = 100               # Differrence from ATM Option
+strike_count = 10               # Options strikes from Option chain
+strike_diff = 100               # Difference from ATM Option
 account_type = 'PAPER'          # 'PAPER' or 'LIVE'
 quantity = 130                  # lot size - Nifty - 65
 buffer = 5
@@ -45,6 +44,11 @@ time_zone = "Asia/Kolkata"
 start_hour, start_min = 9, 30
 end_hour, end_min = 15, 15
 
+# Proper timezone-aware datetime objects
+today = dt.today(time_zone)
+start_time = today.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
+end_time   = today.replace(hour=end_hour, minute=end_min, second=0, microsecond=0)
+
 # =======================================================================
 
 # ========== Live Entry Params ==================
@@ -52,7 +56,7 @@ end_hour, end_min = 15, 15
 ORDER_TYPE = "LIMIT"   # options: "LIMIT" or "MARKET"
 ENTRY_OFFSET = 5       # only used if LIMIT, e.g. ltp - 5
 
-# ========= Indicator Parms =====================
+# ========= Indicator Params =====================
 
 CANDLE_INTERVAL_MIN = 3
 ATR_PERIOD = 14
@@ -67,10 +71,20 @@ ATR_VALUE = 15                      # Default is 20
 # ============================================================
 
 # ============ Risk Management ===========================
+
 MAX_DAILY_LOSS = -5000      # stop trading if net PnL < -5000
 MAX_DRAWDOWN   = -3000      # stop trading if drawdown exceeds 3000
 
 # =============================================================
+
+# ===================== Oscilater Exit condition ====================
+# 	HARD → when oscillator exit triggers, you close the entire position immediately.
+# 	TRAIL → instead of closing, you tighten stop-loss to entry and let trailing logic handle the exit.
+
+OSCILLATOR_EXIT_MODE = "HARD"   # or "TRAIL"
+
+# ===================================================================
+
 
 # ===== Logging =====
 log_file = f"{strategy_name}_{dt.now(time_zone).date()}.log"

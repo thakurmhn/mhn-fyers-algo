@@ -1,11 +1,9 @@
-
-# ===== setup.py  =====
+# ===== setup.py =====
 
 import os, sys, webbrowser, certifi, pandas as pd, pytz
 import pendulum as dt
 from fyers_apiv3 import fyersModel
-from config import *
-#from config import client_id, secret_key, redirect_uri
+from config import client_id, secret_key, redirect_uri, ticker, strike_count, start_hour, start_min, end_hour, end_min, time_zone
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 
@@ -18,13 +16,24 @@ if os.path.exists(access_file):
 else:
     response_type = "code"
     state = "sample_state"
-    session = fyersModel.SessionModel(client_id=client_id, secret_key=secret_key, redirect_uri=redirect_uri, response_type=response_type)
+    session = fyersModel.SessionModel(
+        client_id=client_id,
+        secret_key=secret_key,
+        redirect_uri=redirect_uri,
+        response_type=response_type
+    )
     response = session.generate_authcode()
     webbrowser.open(response, new=1)
     newurl = input("Enter the url: ")
     auth_code = newurl[newurl.index('auth_code=')+10:newurl.index('&state')]
     grant_type = "authorization_code"
-    session = fyersModel.SessionModel(client_id=client_id, secret_key=secret_key, redirect_uri=redirect_uri, response_type=response_type, grant_type=grant_type)
+    session = fyersModel.SessionModel(
+        client_id=client_id,
+        secret_key=secret_key,
+        redirect_uri=redirect_uri,
+        response_type=response_type,
+        grant_type=grant_type
+    )
     session.set_token(auth_code)
     response = session.generate_token()
     access_token = response["access_token"]
@@ -46,7 +55,8 @@ expiry_e = response['expiryData'][0]['expiry']
 data = {"symbol": ticker, "strikecount": strike_count, "timestamp": expiry_e}
 response = fyers.optionchain(data=data)['data']
 option_chain = pd.DataFrame(response['optionsChain'])
-symbols = option_chain['symbol'].to_list()
+
+symbols_from_chain = option_chain['symbol'].to_list()
 
 spot_price = response.get('underlyingValue')
 if spot_price is None:
@@ -56,20 +66,22 @@ if spot_price is None:
     except Exception:
         spot_price = option_chain['ltp'].iloc[0] if 'ltp' in option_chain.columns else None
 
+# ✅ Merge underlying + option contracts
+symbols = ["NSE:NIFTY50-INDEX"] + symbols_from_chain
+
 # ===== df init =====
-df = pd.DataFrame(columns=[
-    'symbol','ltp','ch','chp','avg_trade_price','open_price','high_price','low_price',
-    'prev_close_price','vol_traded_today','oi','pdoi','oipercent','bid_price','ask_price',
-    'last_traded_time','exch_feed_time','bid_size','ask_size','last_traded_qty',
-    'tot_buy_qty','tot_sell_qty','lower_ckt','upper_ckt','type','expiry'
-])
-df['symbol'] = symbols
-df.set_index('symbol', inplace=True)
-
-
+df = pd.DataFrame(
+    index=symbols,
+    columns=[
+        'ltp','ch','chp','avg_trade_price','open_price','high_price','low_price',
+        'prev_close_price','vol_traded_today','oi','pdoi','oipercent','bid_price','ask_price',
+        'last_traded_time','exch_feed_time','bid_size','ask_size','last_traded_qty',
+        'tot_buy_qty','tot_sell_qty','lower_ckt','upper_ckt','type','expiry'
+    ]
+)
 
 # ===== Historical Daily data =====
-f = dt.now(time_zone).date() - dt.duration(days=90)   # go back ~3 months
+f = dt.now(time_zone).date() - dt.duration(days=5)
 p = dt.now(time_zone).date()
 
 hist_req = {

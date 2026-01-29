@@ -1,31 +1,19 @@
 # ===== data_feed.py =====
-
 import logging
 import pandas as pd
-from fyers_apiv3.FyersWebsocket import data_ws, order_ws
-from setup import client_id, access_token, fyers, symbols, df
-from setup import spot_price as _spot_price
-from indicators import build_3min_candle
-from execution import update_order_status, map_status_code
-from tickdb import TickDatabase
-import datetime
 
-# ANSI COLORS for order logs
-RESET   = "\033[0m"
-GREEN   = "\033[92m"
-YELLOW  = "\033[93m"
-RED     = "\033[91m"
-MAGENTA = "\033[95m"
-GRAY    = "\033[90m"
+from fyers_apiv3.FyersWebsocket import data_ws, order_ws
+from setup import client_id, access_token, fyers, fyers_asysc, ticker, symbols, df
+from setup import spot_price as _spot_price
+from candle_builder import build_3min_candle
+from execution import update_order_status, map_status_code
+from tickdb import TickDatabase   # dedicated DB helper
 
 # Keep a module-level spot reference
 spot_price = _spot_price
 
-# Initialize SQLite tick database (rotates daily into ticks/ticks_YYYY-MM-DD.db)
-db = TickDatabase(base_path="ticks")
-
-# ✅ Dedicated orders DataFrame (needed by main.py)
-orders_df = pd.DataFrame(columns=["id", "symbol", "status", "type", "limitPrice", "qty"])
+# Create a global TickDatabase instance
+tick_db = TickDatabase()
 
 # ===== Market data callbacks =====
 def onmessage(ticks):
@@ -36,48 +24,43 @@ def onmessage(ticks):
 
     symbol = ticks["symbol"]
 
-    # Update in-memory dataframe for all symbols (options + index)
-    if symbol not in df.index:
-        df.loc[symbol] = [None] * len(df.columns)
+    # ===== Option contracts → update df only =====
+    if symbol != "NSE:NIFTY50-INDEX":
+        if symbol not in df.index:
+            df.loc[symbol] = [None] * len(df.columns)
+        for key, value in ticks.items():
+            if key in df.columns:
+                df.at[symbol, key] = value
+        return
 
-    for key, value in ticks.items():
-        if key in df.columns:
-            df.loc[symbol, key] = value
+    # ===== Underlying index → persistence + candle building =====
+    ltp = ticks.get("ltp") or ticks.get("last_traded_price")
+    bid = ticks.get("bid") or ticks.get("bid_price")
+    ask = ticks.get("ask") or ticks.get("ask_price")
+    vol = ticks.get("vol") or ticks.get("last_traded_qty", 0)
 
-    # Persist/build candles ONLY for underlying index
-    if symbol == "NSE:NIFTY50-INDEX":
+    if ltp is not None:
+        # DB insert
         try:
-            ltp = ticks.get("ltp") or ticks.get("last_traded_price")
-            bid = ticks.get("bid")
-            ask = ticks.get("ask")
-            vol = ticks.get("vol", 0)
-
-            if ltp is not None:
-                db.insert_tick(symbol, bid, ask, ltp, vol)
-                logging.info(f"{GRAY}[TICK SAVED] {symbol} LTP={ltp} VOL={vol}{RESET}")
-            else:
-                pass
-                logging.debug(f"[DB SKIP] No LTP found in tick for {symbol}")
+            tick_db.insert_tick(symbol, bid, ask, ltp, vol)
+            logging.info(f"[TICK SAVED] {symbol} LTP={ltp} VOL={vol}")
         except Exception as e:
             logging.error(f"[DB ERROR] Failed to insert tick: {e}")
 
-        # Build 3m candle from underlying
+        # Candle building
         spot_price = ltp
-        if spot_price is not None:
-            build_3min_candle(df, target_date=datetime.date.today())
-            # logging.info(f"{YELLOW}[CANDLE BUILT] 3m candle updated for {symbol}{RESET}")
-
-def onerror(message):
-    logging.error(f"Socket error: {message}")
-
-def onclose(message):
-    logging.info(f"Connection closed: {message}")
+        try:
+            build_3min_candle(spot_price)
+        except Exception as e:
+            logging.error(f"[CANDLE ERROR] Failed to build candle: {e}")
+            
+def onerror(message): logging.error(f"[SOCKET ERROR] {message}")
+def onclose(message): logging.info(f"[SOCKET CLOSED] {message}")
 
 def onopen():
-    data_type = "SymbolUpdate"
-    fyers_socket.subscribe(symbols=symbols, data_type=data_type)
+    fyers_socket.subscribe(symbols=symbols, data_type="SymbolUpdate")
     fyers_socket.keep_running()
-    logging.info("Starting market data socket")
+    logging.info("[SOCKET OPEN] Market data subscription started")
 
 # ===== Data socket =====
 fyers_socket = data_ws.FyersDataSocket(
@@ -100,26 +83,20 @@ def chase_order(ord_df):
             name = o1["symbol"]
             current_price = df.loc[name, "ltp"] if name in df.index else None
             if current_price is None or pd.isna(current_price):
-                logging.warning(f"No LTP for {name}, skipping chase")
+                logging.warning(f"[CHASE] No LTP for {name}, skipping")
                 continue
             try:
                 if o1["type"] == 1:  # Limit order
                     id1 = o1["id"]
                     lmt_price = o1["limitPrice"]
                     qty = o1["qty"]
-                    new_lmt_price = (
-                        round(lmt_price + 0.1, 2)
-                        if current_price > lmt_price
-                        else round(lmt_price - 0.1, 2)
-                    )
-                    logging.info(
-                        f"Chasing order {name}: old={lmt_price}, new={new_lmt_price}, qty={qty}"
-                    )
+                    new_lmt_price = round(lmt_price + 0.1, 2) if current_price > lmt_price else round(lmt_price - 0.1, 2)
+                    logging.info(f"[CHASE] {name}: old={lmt_price}, new={new_lmt_price}, qty={qty}")
                     data = {"id": id1, "type": 1, "limitPrice": new_lmt_price, "qty": qty}
                     response = fyers.modify_order(data=data)
-                    logging.info(response)
+                    logging.info(f"[CHASE RESPONSE] {response}")
             except Exception as e:
-                logging.error(f"Error in chasing order: {e}")
+                logging.error(f"[CHASE ERROR] {e}")
 
 # ===== Order status callbacks =====
 def on_orders(message):
@@ -132,7 +109,6 @@ def on_orders(message):
         traded_price = orders.get("tradedPrice", 0)
         symbol = orders.get("symbol")
 
-        # ✅ Handle orders for option contracts (Calls/Puts)
         status = map_status_code(status_code)
         update_order_status(order_id, status, filled_qty, traded_price, symbol)
 
