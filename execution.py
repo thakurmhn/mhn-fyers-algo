@@ -4,6 +4,7 @@ import pickle
 import pandas as pd
 import pendulum as dt
 from fyers_apiv3 import fyersModel
+import time
 
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
@@ -24,6 +25,8 @@ from indicators import (
 )
 from candle_builder import build_3min_candle, build_15m_candles, get_today_15m_candles
 from signals import detect_signal, evaluate_candle
+from tickdb import tick_db
+from orchestration import update_candles_and_signals
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -1137,49 +1140,127 @@ def live_order(candles_3m, hist_yesterday_15m=None):
     store(live_info, account_type)
 
 
-def run_strategy(df_intraday, hist_yesterday_15m):
+# def run_strategy(df_intraday, hist_yesterday_15m):
+#     """
+#     Main strategy runner:
+#     - Refreshes spot price
+#     - Builds 3m and 15m candles
+#     - Routes to paper/live order management
+#     """
+
+#     global spot_price
+
+#     # --- Refresh spot price ---
+#     try:
+#         quote = fyers.quotes(data={"symbols": ticker})
+#         spot_price = quote["d"][0]["v"]["lp"]
+#         logging.info(f"[SPOT REFRESH] Spot={spot_price}")
+#     except Exception as e:
+#         logging.warning(f"[SPOT REFRESH FAILED] {e}")
+#         return
+
+#     # --- Build 3m candles ---
+#     candles_3m = build_3min_candle(spot_price)
+#     if candles_3m.empty:
+#         logging.info("[RUN STRATEGY] No 3m candles available yet")
+#         return
+
+#     # --- Build 15m candles ---
+#     candles_15m = build_15m_candles(df_intraday)
+#     if candles_15m.empty:
+#         logging.info("[RUN STRATEGY] No 15m candles available yet")
+#         return
+
+#     # --- Route to paper/live order with candles passed in ---
+#     if account_type.upper() == "PAPER":
+#         paper_order(hist_yesterday_15m, candles_3m)
+#     else:
+#         live_order(hist_yesterday_15m, candles_3m)
+
+# if __name__ == "__main__":
+#     # Example: run once
+#     run_strategy(df, hist_data)
+
+#     # Or: run continuously every 3 minutes until end_time
+#     import time
+#     while dt.now(time_zone) < end_time:
+#         run_strategy(df, hist_data)
+#         time.sleep(180)  # sleep for 3 minutes
+
+
+
+# --- Helper: sleep until next boundary ---
+def sleep_until_next_boundary(interval=180, tz="Asia/Kolkata"):
+    now = dt.now(tz)
+    seconds = now.minute * 60 + now.second
+    next_boundary = ((seconds // interval) + 1) * interval
+    sleep_time = next_boundary - seconds
+    time.sleep(sleep_time)
+
+# --- Main Orchestration Loop ---
+# ===== execution.py =====
+
+def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
     """
-    Main strategy runner:
-    - Refreshes spot price
-    - Builds 3m and 15m candles
-    - Routes to paper/live order management
+    Orchestration loop:
+    - Refresh spot price
+    - Delegate candle building + signal detection
+    - Route to paper/live order
+    - Run ATR/CPR bias logic on 15m closes
     """
+    while dt.now(tz) < end_time:
+        now = dt.now(tz)
 
-    global spot_price
+        for sym in symbols:
+            logging.info(f"{GRAY}[STRATEGY] Running for {sym}{RESET}")
 
-    # --- Refresh spot price ---
-    try:
-        quote = fyers.quotes(data={"symbols": ticker})
-        spot_price = quote["d"][0]["v"]["lp"]
-        logging.info(f"[SPOT REFRESH] Spot={spot_price}")
-    except Exception as e:
-        logging.warning(f"[SPOT REFRESH FAILED] {e}")
-        return
+            # --- Refresh spot price ---
+            try:
+                quote = fyers.quotes(data={"symbols": sym})
+                spot_price = quote["d"][0]["v"]["lp"]
+                logging.info(f"{GRAY}[SPOT REFRESH] {sym} Spot={spot_price}{RESET}")
+            except Exception as e:
+                logging.warning(f"[SPOT REFRESH FAILED] {sym}: {e}")
+                continue
 
-    # --- Build 3m candles ---
-    candles_3m = build_3min_candle(spot_price)
-    if candles_3m.empty:
-        logging.info("[RUN STRATEGY] No 3m candles available yet")
-        return
+            # --- Delegate candles + signal detection ---
+            signal = update_candles_and_signals(
+                symbol=sym,
+                hist_yesterday_15m=hist_yesterday_15m.get(sym),
+                spot_price=spot_price   # ✅ pass spot price down
+            )
 
-    # --- Build 15m candles ---
-    candles_15m = build_15m_candles(df_intraday)
-    if candles_15m.empty:
-        logging.info("[RUN STRATEGY] No 15m candles available yet")
-        return
+            # --- Route orders if signal fired ---
+            if signal:
+                side, reason = signal
+                logging.info(f"[SIGNAL FIRED] {sym} side={side} reason={reason}")
+                if account_type.upper() == "PAPER":
+                    paper_order(hist_yesterday_15m[sym], signal)
+                else:
+                    live_order(hist_yesterday_15m[sym], signal)
 
-    # --- Route to paper/live order with candles passed in ---
-    if account_type.upper() == "PAPER":
-        paper_order(hist_yesterday_15m, candles_3m)
-    else:
-        live_order(hist_yesterday_15m, candles_3m)
+            # --- Extra bias logic on 15m close ---
+            if now.minute % 15 == 0 and now.second == 0:
+                logging.info(f"[SYNC] 15m candle closed for {sym}, running ATR/CPR bias logic")
+                # Example: call ATR/pivot helpers here
+                hist_data = tick_db.fetch_candles("15m", symbol=sym)
+                if not hist_data.empty:
+                    atr_value, atr_source = resolve_atr(hist_data, daily_atr(hist_data))
+                    logging.info(f"[ATR] {sym} source={atr_source} value={atr_value:.2f}")
 
+
+                    
 if __name__ == "__main__":
-    # Example: run once
-    run_strategy(df, hist_data)
+    symbols = ["NSE:NIFTY50-INDEX"]  # restrict to indices only
 
-    # Or: run continuously every 3 minutes until end_time
-    import time
-    while dt.now(time_zone) < end_time:
-        run_strategy(df, hist_data)
-        time.sleep(180)  # sleep for 3 minutes
+    today = dt.now("Asia/Kolkata").date()
+    end_time = dt.datetime(today.year, today.month, today.day, 15, 30, tz="Asia/Kolkata")
+
+    logging.info(f"[SESSION] Trading until {end_time}")
+
+    hist_yesterday_15m = {
+        sym: tick_db.fetch_candles("15m", use_yesterday=True, symbol=sym)
+        for sym in symbols
+    }
+
+    run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=end_time)

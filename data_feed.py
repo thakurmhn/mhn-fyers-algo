@@ -9,6 +9,12 @@ from candle_builder import build_3min_candle
 from execution import update_order_status, map_status_code
 from tickdb import TickDatabase   # dedicated DB helper
 
+
+# ANSI COLORS
+RESET   = "\033[0m"
+GRAY    = "\033[90m"
+CYAN    = "\033[96m"
+
 # Keep a module-level spot reference
 spot_price = _spot_price
 
@@ -25,7 +31,8 @@ def onmessage(ticks):
     symbol = ticks["symbol"]
 
     # ===== Option contracts → update df only =====
-    if symbol != "NSE:NIFTY50-INDEX":
+    if symbol not in ["NSE:NIFTY50-INDEX"]:            # ["NSE:NIFTY50-INDEX", "NSE:BANKNIFTY-INDEX", "NSE:FINNIFTY-INDEX"]
+        # keep option LTPs in df for chasing orders
         if symbol not in df.index:
             df.loc[symbol] = [None] * len(df.columns)
         for key, value in ticks.items():
@@ -33,27 +40,26 @@ def onmessage(ticks):
                 df.at[symbol, key] = value
         return
 
-    # ===== Underlying index → persistence + candle building =====
+    # ===== Underlying indices → persistence + candle building =====
     ltp = ticks.get("ltp") or ticks.get("last_traded_price")
     bid = ticks.get("bid") or ticks.get("bid_price")
     ask = ticks.get("ask") or ticks.get("ask_price")
     vol = ticks.get("vol") or ticks.get("last_traded_qty", 0)
 
     if ltp is not None:
-        # DB insert
         try:
             tick_db.insert_tick(symbol, bid, ask, ltp, vol)
-            logging.info(f"[TICK SAVED] {symbol} LTP={ltp} VOL={vol}")
+            logging.info(f"{GRAY}[TICK SAVED] {symbol} LTP={ltp} VOL={vol}{RESET}")
         except Exception as e:
             logging.error(f"[DB ERROR] Failed to insert tick: {e}")
 
-        # Candle building
         spot_price = ltp
         try:
-            build_3min_candle(spot_price)
+            df_ticks = tick_db.fetch_ticks(symbol)
+            build_3min_candle(df_ticks, tick_db, symbol)
         except Exception as e:
-            logging.error(f"[CANDLE ERROR] Failed to build candle: {e}")
-            
+            logging.error(f"[CANDLE ERROR] Failed to build candle for {symbol}: {e}")
+
 def onerror(message): logging.error(f"[SOCKET ERROR] {message}")
 def onclose(message): logging.info(f"[SOCKET CLOSED] {message}")
 
@@ -115,11 +121,8 @@ def on_orders(message):
     except Exception as e:
         logging.error(f"[ORDER UPDATE ERROR] {e}")
 
-def on_order_error(message):
-    logging.error(f"[ORDER WS ERROR] {message}")
-
-def on_order_close(message):
-    logging.info(f"[ORDER WS CLOSED] {message}")
+def on_order_error(message): logging.error(f"[ORDER WS ERROR] {message}")
+def on_order_close(message): logging.info(f"[ORDER WS CLOSED] {message}")
 
 def on_order_open():
     logging.info("[ORDER WS CONNECTED] Subscribing to OnOrders...")

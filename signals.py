@@ -214,13 +214,74 @@ def detect_pivot_continuation(last, atr, traditional_levels, call_ok, put_ok):
 
 # ===== Orchestration =====
 # ===== Orchestration =====
+# def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
+#                   candles_3m, candles_15m, spot_price=None, daily_atr=None):
+
+#     # Resolve ATR (float + source string)
+#     atr, atr_source = resolve_atr(candles_3m, daily_atr)
+#     if atr is None:
+#         return None
+
+#     # Bias check
+#     bias = check_bias(candles_15m, daily_atr=daily_atr)
+#     if bias is None or bias == "NEUTRAL":
+#         logging.info("[SIGNAL FILTERED] Bias neutral, skipping trade")
+#         return None
+
+#     # Candle references
+#     last = candles_3m.iloc[-1]
+#     prev = candles_3m.iloc[-2]
+#     rng  = last.high - last.low
+
+#     # Candle strength + momentum
+#     call_ok, call_momentum = candle_strength(candles_3m, "CALL")
+#     put_ok,  put_momentum  = candle_strength(candles_3m, "PUT")
+
+#     # Oscillator entry filters
+#     if call_ok and not apply_oscillator_filter("CALL", candles_3m):
+#         return None
+#     if put_ok and not apply_oscillator_filter("PUT", candles_3m):
+#         return None
+
+#     # Priority order
+#     signal = (
+#         detect_cpr(last, atr, cpr_levels, call_ok, put_ok) or
+#         detect_camarilla(last, rng, atr, camarilla_levels, call_ok, put_ok) or
+#         detect_traditional_acceptance(last, atr, traditional_levels, call_ok, put_ok) or
+#         detect_traditional_rejection(last, rng, traditional_levels, call_ok, put_ok) or
+#         detect_traditional_continuation(last, atr, traditional_levels, call_ok, put_ok) or
+#         detect_pivot_acceptance(last, prev, atr, traditional_levels, call_ok, put_ok) or
+#         detect_pivot_rejection(last, rng, traditional_levels, call_ok, put_ok) or
+#         detect_pivot_continuation(last, atr, traditional_levels, call_ok, put_ok)
+#     )
+
+#     if signal:
+#         side, reason = signal
+#         logging.info(
+#             f"[SIGNAL FOUND] side={side} reason={reason} "
+#             f"Bias={bias} ATR={atr:.2f} spot={spot_price if spot_price else 'NA'}"
+#         )
+#         return side, reason
+
+#     logging.info("[NO SIGNAL] No valid breakout/rejection detected")
+#     return None
 def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
                   candles_3m, candles_15m, spot_price=None, daily_atr=None):
 
-    # Resolve ATR (float + source string)
+    # Guard clause
+    if candles_3m is None or len(candles_3m) < 2:
+        logging.warning("[SIGNAL] Not enough 3m candles to evaluate")
+        return None
+    if candles_15m is None or candles_15m.empty:
+        logging.warning("[SIGNAL] No 15m candles available for bias check")
+        return None
+
+    # Resolve ATR
     atr, atr_source = resolve_atr(candles_3m, daily_atr)
     if atr is None:
+        logging.info("[SIGNAL FILTERED] ATR unavailable, skipping")
         return None
+    logging.info(f"[ATR] {atr:.2f} (source={atr_source})")
 
     # Bias check
     bias = check_bias(candles_15m, daily_atr=daily_atr)

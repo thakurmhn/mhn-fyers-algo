@@ -1,63 +1,73 @@
-# ==== candle_builder.py =======
-
 import logging
 import pandas as pd
-import numpy as np
 import pendulum as dt
-from tickdb import tick_db
 from config import time_zone
-from indicators import (
-    calculate_atr,
-    daily_atr,
-    resolve_atr,
-    calculate_camarilla_pivots,
-    calculate_cpr,
-    calculate_traditional_pivots,
-    check_bias,
-    oscillator_entry_filter,
-    oscillator_exit_trigger
-)
 
 # ===== Candle Builder (3m) =====
-def build_3min_candle(spot_price, symbol="NSE:NIFTY50-INDEX"):
+def build_3min_candle(df_ticks, tick_db, symbol):
+    """Incrementally build and persist 3m candles for a given symbol."""
     try:
-        df = tick_db.fetch_ticks(symbol)
-        if df.empty or not isinstance(df, pd.DataFrame):
-            logging.warning("[CANDLE BUILDER] No tick data available, skipping")
+        if df_ticks.empty or not isinstance(df_ticks, pd.DataFrame):
+            logging.debug(f"[CANDLE BUILDER] No tick data available for {symbol}, skipping")
             return pd.DataFrame()
 
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-        df = df.dropna(subset=['timestamp'])
-        if df.empty:
-            logging.warning("[CANDLE BUILDER] No valid rows after cleaning, skipping")
+        required_cols = {"timestamp", "last_price", "volume"}
+        if not required_cols.issubset(df_ticks.columns):
+            logging.error(f"[CANDLE BUILDER] Missing required columns in tick data for {symbol}")
             return pd.DataFrame()
 
-        df.set_index('timestamp', inplace=True)
-        df['last_price'] = pd.to_numeric(df['last_price'], errors='coerce')
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+        # Clean timestamps
+        df_ticks['timestamp'] = pd.to_datetime(df_ticks['timestamp'], errors='coerce')
+        df_ticks = df_ticks.dropna(subset=['timestamp'])
+        if df_ticks.empty:
+            logging.debug(f"[CANDLE BUILDER] No valid rows after cleaning for {symbol}, skipping")
+            return pd.DataFrame()
 
-        ohlcv = df['last_price'].resample('3min').ohlc()
-        ohlcv['volume'] = df['volume'].resample('3min').sum()
+        df_ticks.set_index('timestamp', inplace=True)
+        df_ticks['last_price'] = pd.to_numeric(df_ticks['last_price'], errors='coerce')
+        df_ticks['volume'] = pd.to_numeric(df_ticks['volume'], errors='coerce').fillna(0)
 
-        logging.info(f"[CANDLE BUILDER] Built {len(ohlcv)} 3m candles")
+        # Use .loc with a time mask instead of .last()
+        end_time = df_ticks.index.max()
+        start_time = end_time - pd.Timedelta(minutes=30)
+        window = df_ticks.loc[start_time:end_time]
 
-        # Persist all candles
+        ohlcv = window['last_price'].resample('3min').ohlc()
+        ohlcv['volume'] = window['volume'].resample('3min').sum()
+
+        # Fetch already persisted candles to avoid duplicates
+        existing = tick_db.fetch_candles("3m", symbol=symbol)
+        existing_slots = set(existing['ist_slot']) if not existing.empty else set()
+
+        new_rows = []
         for ts, row in ohlcv.iterrows():
+            ist_slot = ts.strftime("%H:%M:%S")
+            if ist_slot in existing_slots:
+                continue
+
             trade_date = ts.date().isoformat()
-            ist_slot = ts.strftime("%H:%M")
             tick_db.insert_3m_candle(
                 trade_date, ist_slot,
-                row['open'], row['high'], row['low'], row['close'], row['volume']
+                row['open'], row['high'], row['low'], row['close'], row['volume'],
+                symbol
             )
+            new_rows.append((ts, row))
+
+        if new_rows:
+            logging.info(f"[CANDLE BUILDER] Added {len(new_rows)} new 3m candles for {symbol}")
+        else:
+            logging.debug(f"[CANDLE BUILDER] No new 3m candles for {symbol}")
 
         # Return candles for orchestration layer
+        ohlcv["trade_date"] = ohlcv.index.date.astype(str)
+        ohlcv["ist_slot"] = ohlcv.index.strftime("%H:%M:%S")
+        ohlcv["symbol"] = symbol
         return ohlcv
 
     except Exception as e:
         logging.error(f"[CANDLE BUILDER ERROR] {e}")
-        return pd.DataFrame()
-
-
+        return pd.DataFrame(columns=["trade_date","ist_slot","open","high","low","close","volume","symbol"])
+    
 # ===== Candle Builder (15m) =====
 def prepare_intraday(df_intraday, target_date=None):
     if not isinstance(df_intraday, pd.DataFrame):
@@ -120,40 +130,61 @@ def resample_15m(df):
     return df_15m
 
 
-def persist_15m_candle(ts, row):
+def persist_15m_candle(tick_db, symbol, ts, row):
     trade_date = ts.date().isoformat()
-    ist_slot = ts.strftime("%H:%M")
+    ist_slot = ts.strftime("%H:%M:%S")  # consistent format
     tick_db.insert_15m_candle(
-        trade_date, ist_slot,
-        row['open'], row['high'], row['low'], row['close'], row['volume']
+        trade_date, ist_slot, row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
     )
 
 
-def build_15m_candles(df_intraday, target_date=None):
+def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
+    """Incrementally build and persist 15m candles for a given symbol."""
     try:
         df = prepare_intraday(df_intraday, target_date)
-        df_15m = resample_15m(df)
-        if df_15m.empty:
+        if df.empty:
+            logging.warning(f"[CANDLE BUILDER] No intraday data for {symbol}")
             return pd.DataFrame()
 
-        logging.info(f"[CANDLE BUILDER] Built {len(df_15m)} 15m candles")
+        # Use .loc with a time mask instead of .last()
+        end_time = df.index.max()
+        start_time = end_time - pd.Timedelta(days=1)
+        window = df.loc[start_time:end_time]
 
-        # Persist all candles
+        df_15m = resample_15m(window)
+        if df_15m.empty:
+            logging.warning(f"[CANDLE BUILDER] No 15m candles built for {symbol}")
+            return pd.DataFrame()
+
+        # Fetch already persisted 15m candles to avoid duplicates
+        existing = tick_db.fetch_candles("15m", symbol=symbol)
+        existing_slots = set(existing['ist_slot']) if not existing.empty else set()
+
+        new_rows = []
         for ts, row in df_15m.iterrows():
-            persist_15m_candle(ts, row)
+            ist_slot = ts.strftime("%H:%M:%S")
+            if ist_slot in existing_slots:
+                continue
+
+            persist_15m_candle(tick_db, symbol, ts, row)
+            new_rows.append((ts, row))
+
+        if new_rows:
+            logging.info(f"[CANDLE BUILDER] Added {len(new_rows)} new 15m candles for {symbol}")
+        else:
+            logging.debug(f"[CANDLE BUILDER] No new 15m candles for {symbol}")
 
         # Return candles for orchestration layer
+        df_15m["trade_date"] = df_15m.index.date.astype(str)
+        df_15m["ist_slot"] = df_15m.index.strftime("%H:%M:%S")
+        df_15m["symbol"] = symbol
         return df_15m
 
     except Exception as e:
         logging.error(f"[CANDLE BUILDER ERROR] {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["trade_date","ist_slot","open","high","low","close","volume","symbol"])
 
 def get_today_15m_candles(hist_data):
-    """
-    Helper to extract today's 15m candles from historical intraday data.
-    Wraps candle_builder.prepare_intraday + resample_15m.
-    """
     if hist_data is None or hist_data.empty:
         logging.warning("[get_today_15m_candles] No historical data provided")
         return pd.DataFrame()

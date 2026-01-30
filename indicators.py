@@ -327,23 +327,3 @@ def oscillator_exit_trigger(side, candles_15m):
             return True, f"CCI={cci:.2f} <= -200 (bearish extreme)"
 
     return False, ""
-
-
-# ===== Optional: Print pivot/CPR levels at session start =====
-if __name__ == "__main__":
-    from setup import hist_data   # ✅ import your historical data source
-
-    prev_day = hist_data.iloc[-1]
-    prev_high, prev_low, prev_close = float(prev_day['high']), float(prev_day['low']), float(prev_day['close'])
-
-    cpr_levels_base = calculate_cpr(prev_high, prev_low, prev_close)
-    traditional_levels_base = calculate_traditional_pivots(prev_high, prev_low, prev_close)
-    camarilla_levels_base = calculate_camarilla_pivots(prev_high, prev_low, prev_close)
-
-    print(
-        f"CPR: Pivot={cpr_levels_base['pivot']}, TC={cpr_levels_base['tc']}, BC={cpr_levels_base['bc']}\n"
-        f"Traditional: Pivot={traditional_levels_base['pivot']}, R1={traditional_levels_base['r1']}, S1={traditional_levels_base['s1']}, "
-        f"R2={traditional_levels_base['r2']}, S2={traditional_levels_base['s2']}\n"
-        f"Camarilla: R3={camarilla_levels_base['r3']}, R4={camarilla_levels_base['r4']}, "
-        f"S3={camarilla_levels_base['s3']}, S4={camarilla_levels_base['s4']}"
-    )
