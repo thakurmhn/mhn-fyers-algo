@@ -1242,12 +1242,20 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
             # --- Extra bias logic on 15m close ---
             if now.minute % 15 == 0 and now.second == 0:
                 logging.info(f"[SYNC] 15m candle closed for {sym}, running ATR/CPR bias logic")
-                # Example: call ATR/pivot helpers here
-                hist_data = tick_db.fetch_candles("15m", symbol=sym)
-                if not hist_data.empty:
-                    atr_value, atr_source = resolve_atr(hist_data, daily_atr(hist_data))
-                    logging.info(f"[ATR] {sym} source={atr_source} value={atr_value:.2f}")
 
+                hist_data = tick_db.fetch_candles("15m", symbol=sym)
+
+                # --- Debug guard: log type and length ---
+                logging.debug(
+                    f"[BIAS GUARD @RUN] hist_data type={type(hist_data)} len={len(hist_data)}"
+                )
+                if not hist_data.empty:
+                    logging.debug(f"[BIAS PREVIEW @RUN]\n{hist_data.tail(3)}")
+
+                    daily_val = daily_atr(hist_data)  # float
+                    atr_value, atr_source = resolve_atr(hist_data, daily_val)
+                    atr_str = f"{atr_value:.2f}" if atr_value is not None else "NA"
+                    logging.info(f"[ATR] {sym} source={atr_source} value={atr_str}")
 
                     
 if __name__ == "__main__":

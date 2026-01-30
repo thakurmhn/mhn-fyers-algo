@@ -1,6 +1,7 @@
 # ===== signals.py =====
 
 import logging
+import pandas as pd
 from setup import spot_price
 from config import CANDLE_BODY_RANGE, ATR_VALUE
 from indicators import (
@@ -39,72 +40,86 @@ def atr_based_levels(entry_price, atr_val, side, sl_factor=1.0, pt_factor=2.0, t
     return sl, pt, tg
 
 
-def evaluate_candle(ts, row, candles, resolution="3m", spot=None, side="CALL"):
-    # ATR
-    atr_val = calculate_atr(candles)  # ✅ float
-    logging.info(
-        f"[SIGNAL EVAL][{resolution.upper()}] candle={ts} candles={len(candles)} "
-        f"atr={atr_val:.2f} source=ATR_{resolution.upper()}"
-    )
+def evaluate_candle(ts, row, candles, resolution, spot, side, candles_15m=None):
+    try:
+        # --- ATR from current resolution candles (e.g. 3m) ---
+        atr_val = calculate_atr(candles)
+        atr_str = f"{atr_val:.2f}" if atr_val is not None else "NA"
+        logging.info(f"[SIGNAL EVAL][{resolution}] candle={ts} candles={len(candles)} atr={atr_str} source=ATR_{resolution.upper()}")
 
-    # Bias check
-    bias = check_bias(candles, daily_atr=atr_val)
-    logging.info(f"[BIAS RESULT][{resolution.upper()}] {bias}")
+        # --- Bias check only if 15m candles provided ---
+        bias = None
+        if candles_15m is not None and isinstance(candles_15m, pd.DataFrame):
+            logging.debug(f"[BIAS PREVIEW @EVAL]\n{candles_15m.tail(3)}")
+            daily_val = daily_atr(candles_15m)  # ✅ correct float override
+            bias = check_bias(candles_15m, daily_atr=daily_val)
+            logging.debug(
+                f"[BIAS CALL GUARD @98] candles_15m type={type(candles_15m)} "
+                f"len={len(candles_15m) if isinstance(candles_15m, pd.DataFrame) else 'NA'} "
+                f"daily_atr type={type(daily_val)}"
+            )
 
-    # Momentum check
-    body_range = (row.close - row.open) / (row.high - row.low + 1e-9)
-    call_mom = body_range * atr_val
-    put_mom = body_range * atr_val
-    logging.info(
-        f"[SIGNAL CHECK] close={row.close:.2f} spot={spot:.2f if spot else 0} "
-        f"ATR={atr_val:.2f} body/range={body_range:.2f} "
-        f"CALL_mom={call_mom:.2f} PUT_mom={put_mom:.2f}"
-    )
+            logging.info(f"[BIAS RESULT @EVAL] {bias if bias else 'NA'}")
+        else:
+            logging.warning("[BIAS SKIPPED @EVAL] No valid 15m candles provided")
 
-    # ATR levels
-    sl, pt, tg = atr_based_levels(row.close, atr_val, side)
-    logging.info(
-        f"[ATR LEVELS] Entry={row.close:.2f} ATR={atr_val:.2f} "
-        f"SL={sl:.2f} PT={pt:.2f} TG={tg:.2f}"
-    )
+        # --- Candle strength + momentum ---
+        call_ok, call_momentum = candle_strength(candles, "CALL")
+        put_ok, put_momentum   = candle_strength(candles, "PUT")
 
-    # Oscillator entry filter (only for 3m candles)
-    if resolution == "3m":
-        allowed = oscillator_entry_filter(side, candles)
-        if not allowed:
-            logging.info(f"[ENTRY BLOCKED][{resolution.upper()}][OSC] side={side}")
+        # --- Oscillator filters ---
+        if call_ok and not apply_oscillator_filter("CALL", candles):
+            logging.info("[OSC FILTER] CALL rejected by oscillator")
+            call_ok = False
+        if put_ok and not apply_oscillator_filter("PUT", candles):
+            logging.info("[OSC FILTER] PUT rejected by oscillator")
+            put_ok = False
 
-    # Oscillator exit trigger (only for 15m candles)
-    if resolution == "15m":
-        exit_signal, reason = oscillator_exit_trigger(side, candles)
-        if exit_signal:
-            logging.info(f"[EXIT TRIGGERED][{resolution.upper()}][OSC] {reason}")
+        # --- Evaluate side ---
+        if side.upper() == "CALL" and call_ok:
+            logging.info(f"[CANDLE EVAL] CALL momentum={call_momentum} bias={bias}")
+        elif side.upper() == "PUT" and put_ok:
+            logging.info(f"[CANDLE EVAL] PUT momentum={put_momentum} bias={bias}")
+        else:
+            logging.debug("[CANDLE EVAL] No valid side conditions met")
 
-    return bias
-
-
-# ===== ATR Resolution =====
-def resolve_signal_atr(candles_3m, daily_atr=None):
-    atr, atr_source = resolve_atr(candles_3m, daily_atr)
-    if atr is None or len(candles_3m) < 2:
-        logging.info("[SIGNAL FILTERED] Not enough candles or ATR unavailable")
-        return None, None
-    if atr < ATR_VALUE:
-        logging.info(f"[SIGNAL FILTERED] ATR too low ({atr:.2f}), skipping trade")
-        return None, None
-    if atr > 120:
-        logging.info(f"[SIGNAL FILTERED] ATR too high ({atr:.2f}), skipping trade")
-        return None, None
-    return atr, atr_source
-
+    except Exception as e:
+        logging.error(f"[EVAL ERROR] {resolution} candle {ts}: {e}")
 
 # ===== Bias Resolution =====
 def resolve_bias(candles_15m, daily_atr=None):
-    bias = check_bias(candles_15m, daily_atr=daily_atr)
-    if bias == "NEUTRAL":
-        logging.info("[SIGNAL FILTERED] Bias neutral, skipping trade")
+    """
+    Resolve bias using 15m candles and optional daily ATR override.
+    - candles_15m must be a DataFrame
+    - daily_atr must be a float (optional override)
+    """
+
+    # --- Debug guard: log input types ---
+    logging.debug(
+        f"[RESOLVE BIAS INPUT] candles_15m type={type(candles_15m)} "
+        f"daily_atr type={type(daily_atr)}"
+    )
+
+    # --- Guard: must be a DataFrame ---
+    if candles_15m is None or not isinstance(candles_15m, pd.DataFrame):
+        logging.error("[RESOLVE BIAS] Invalid input: candles_15m is not a DataFrame")
         return None
-    return bias
+
+    # --- Call bias check safely ---
+    try:
+        bias = check_bias(candles_15m, daily_atr=daily_atr)
+        if bias == "NEUTRAL":
+            logging.debug(
+            f"[BIAS CALL GUARD @147] candles_15m type={type(candles_15m)} "
+            f"len={len(candles_15m) if isinstance(candles_15m, pd.DataFrame) else 'NA'} "
+            f"daily_atr type={type(daily_atr)}"
+            )
+            logging.info("[SIGNAL FILTERED] Bias neutral, skipping trade")
+            return None
+        return bias
+    except Exception as e:
+        logging.error(f"[RESOLVE BIAS ERROR] Failed bias resolution: {e}")
+        return None
 
 
 # ===== Candle Strength + Momentum =====
@@ -211,100 +226,83 @@ def detect_pivot_continuation(last, atr, traditional_levels, call_ok, put_ok):
         return "PUT", "CONTINUATION_PIVOT"
     return None
 
+def to_scalar(val):
+    """Convert Series/DataFrame cell to scalar float if possible."""
+    if val is None:
+        return None
+    if isinstance(val, pd.Series):
+        return float(val.iloc[-1])
+    if isinstance(val, pd.DataFrame):
+        return float(val.values[-1])
+    if isinstance(val, (list, tuple)):
+        return float(val[-1])
+    try:
+        return float(val)
+    except Exception:
+        return val
 
-# ===== Orchestration =====
-# ===== Orchestration =====
-# def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
-#                   candles_3m, candles_15m, spot_price=None, daily_atr=None):
-
-#     # Resolve ATR (float + source string)
-#     atr, atr_source = resolve_atr(candles_3m, daily_atr)
-#     if atr is None:
-#         return None
-
-#     # Bias check
-#     bias = check_bias(candles_15m, daily_atr=daily_atr)
-#     if bias is None or bias == "NEUTRAL":
-#         logging.info("[SIGNAL FILTERED] Bias neutral, skipping trade")
-#         return None
-
-#     # Candle references
-#     last = candles_3m.iloc[-1]
-#     prev = candles_3m.iloc[-2]
-#     rng  = last.high - last.low
-
-#     # Candle strength + momentum
-#     call_ok, call_momentum = candle_strength(candles_3m, "CALL")
-#     put_ok,  put_momentum  = candle_strength(candles_3m, "PUT")
-
-#     # Oscillator entry filters
-#     if call_ok and not apply_oscillator_filter("CALL", candles_3m):
-#         return None
-#     if put_ok and not apply_oscillator_filter("PUT", candles_3m):
-#         return None
-
-#     # Priority order
-#     signal = (
-#         detect_cpr(last, atr, cpr_levels, call_ok, put_ok) or
-#         detect_camarilla(last, rng, atr, camarilla_levels, call_ok, put_ok) or
-#         detect_traditional_acceptance(last, atr, traditional_levels, call_ok, put_ok) or
-#         detect_traditional_rejection(last, rng, traditional_levels, call_ok, put_ok) or
-#         detect_traditional_continuation(last, atr, traditional_levels, call_ok, put_ok) or
-#         detect_pivot_acceptance(last, prev, atr, traditional_levels, call_ok, put_ok) or
-#         detect_pivot_rejection(last, rng, traditional_levels, call_ok, put_ok) or
-#         detect_pivot_continuation(last, atr, traditional_levels, call_ok, put_ok)
-#     )
-
-#     if signal:
-#         side, reason = signal
-#         logging.info(
-#             f"[SIGNAL FOUND] side={side} reason={reason} "
-#             f"Bias={bias} ATR={atr:.2f} spot={spot_price if spot_price else 'NA'}"
-#         )
-#         return side, reason
-
-#     logging.info("[NO SIGNAL] No valid breakout/rejection detected")
-#     return None
 def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
                   candles_3m, candles_15m, spot_price=None, daily_atr=None):
 
-    # Guard clause
+    # --- Guard clauses ---
     if candles_3m is None or len(candles_3m) < 2:
         logging.warning("[SIGNAL] Not enough 3m candles to evaluate")
         return None
-    if candles_15m is None or candles_15m.empty:
+    if candles_15m is None or not isinstance(candles_15m, pd.DataFrame) or candles_15m.empty:
         logging.warning("[SIGNAL] No 15m candles available for bias check")
         return None
 
-    # Resolve ATR
+    # --- Resolve ATR ---
     atr, atr_source = resolve_atr(candles_3m, daily_atr)
+    atr = to_scalar(atr)
     if atr is None:
         logging.info("[SIGNAL FILTERED] ATR unavailable, skipping")
         return None
-    logging.info(f"[ATR] {atr:.2f} (source={atr_source})")
+    logging.debug(f"[DEBUG] ATR type={type(atr)} value={atr}")
+    atr_str = f"{atr:.2f}" if atr is not None else "NA"
+    logging.info(f"[ATR] {atr_str} (source={atr_source})")
 
-    # Bias check
-    bias = check_bias(candles_15m, daily_atr=daily_atr)
+    # --- Bias check (always use 15m candles) ---
+    bias = None
+    try:
+        logging.debug(f"[BIAS CALL GUARD] candles_15m type={type(candles_15m)} len={len(candles_15m)} daily_atr type={type(daily_atr)}")
+        logging.debug(f"[BIAS PREVIEW @SIGNAL]\n{candles_15m.tail(3)}")
+        bias = check_bias(candles_15m, daily_atr=daily_atr)
+        logging.debug(
+            f"[BIAS CALL GUARD @359] candles_15m type={type(candles_15m)} "
+            f"len={len(candles_15m) if isinstance(candles_15m, pd.DataFrame) else 'NA'} "
+            f"daily_atr type={type(daily_atr)}"
+        )
+        logging.info(f"[BIAS RESULT] {bias if bias else 'NA'}")
+    except Exception as e:
+        logging.error(f"[BIAS ERROR] Failed bias check: {e}")
+        return None
+
     if bias is None or bias == "NEUTRAL":
         logging.info("[SIGNAL FILTERED] Bias neutral, skipping trade")
         return None
 
-    # Candle references
+    # --- Candle references ---
     last = candles_3m.iloc[-1]
     prev = candles_3m.iloc[-2]
-    rng  = last.high - last.low
+    rng  = to_scalar(last.high) - to_scalar(last.low)
 
-    # Candle strength + momentum
+    # --- Preview last 3 rows of 3m candles ---
+    logging.debug(f"[SIGNAL PREVIEW @3M]\n{candles_3m.tail(3)}")
+
+    # --- Candle strength + momentum ---
     call_ok, call_momentum = candle_strength(candles_3m, "CALL")
     put_ok,  put_momentum  = candle_strength(candles_3m, "PUT")
 
-    # Oscillator entry filters
+    # --- Oscillator entry filters ---
     if call_ok and not apply_oscillator_filter("CALL", candles_3m):
-        return None
+        logging.info("[OSC FILTER] CALL rejected by oscillator")
+        call_ok = False
     if put_ok and not apply_oscillator_filter("PUT", candles_3m):
-        return None
+        logging.info("[OSC FILTER] PUT rejected by oscillator")
+        put_ok = False
 
-    # Priority order
+    # --- Priority order ---
     signal = (
         detect_cpr(last, atr, cpr_levels, call_ok, put_ok) or
         detect_camarilla(last, rng, atr, camarilla_levels, call_ok, put_ok) or
@@ -318,11 +316,15 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
 
     if signal:
         side, reason = signal
+        spot_price = to_scalar(spot_price)
+        logging.debug(f"[DEBUG] Spot type={type(spot_price)} value={spot_price}")
+        spot_str = f"{spot_price:.2f}" if spot_price is not None else "NA"
         logging.info(
             f"[SIGNAL FOUND] side={side} reason={reason} "
-            f"Bias={bias} ATR={atr:.2f} spot={spot_price if spot_price else 'NA'}"
+            f"Bias={bias} ATR={atr_str} spot={spot_str}"
         )
         return side, reason
 
     logging.info("[NO SIGNAL] No valid breakout/rejection detected")
     return None
+

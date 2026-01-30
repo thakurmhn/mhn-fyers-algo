@@ -1,16 +1,4 @@
 # ===== indicators.py part1 =====
-# import logging
-# import pandas as pd
-# import numpy as np
-# import pendulum as dt
-# import datetime
-
-# from config import time_zone, ATR_VALUE
-# from setup import spot_price
-# from tickdb import TickDatabase
-# tick_db = TickDatabase()
-# from tickdb import tick_db
-# from signals import detect_signal, evaluate_candle
 
 import logging
 import pandas as pd
@@ -65,35 +53,69 @@ def calculate_camarilla_pivots(high, low, close):
             "s3": round(s3, 2), "s4": round(s4, 2)}
 
 # ===== ATR =====
-def calculate_atr(df_, period=14):
-    if len(df_) < period + 1:
-        return None
-    hl = df_["high"] - df_["low"]
-    hc = (df_["high"] - df_["close"].shift()).abs()
-    lc = (df_["low"] - df_["close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return float(tr.rolling(period).mean().iloc[-1])
 
-def resolve_atr(candles_3m_, daily_atr_):
-    atr_3m = calculate_atr(candles_3m_)
-    if atr_3m is not None:
-        return atr_3m, "ATR_3M"
-    if daily_atr_ is not None:
-        return daily_atr_, "ATR_DAILY"
-    if len(candles_3m_) >= 2:
-        atr_boot = candles_3m_["high"].max() - candles_3m_["low"].min()
-        logging.warning(f"[BOOTSTRAP ATR] using range={atr_boot:.2f}")
-        return atr_boot, "ATR_BOOTSTRAP"
-    return None, None
-
-def daily_atr(df_daily, period=14):
-    if len(df_daily) < period + 1:
+def calculate_atr(df, period=14):
+    """
+    Calculate Average True Range (ATR) from a DataFrame with
+    'high', 'low', 'close' columns.
+    Returns a float ATR value or None if unavailable.
+    """
+    if df is None or df.empty:
         return None
+
+    high_low   = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close  = (df['low'] - df['close'].shift()).abs()
+
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr_series = tr.rolling(period).mean().dropna()
+
+    if atr_series.empty:
+        return None
+    val = atr_series.iloc[-1]
+    return None if pd.isna(val) else float(val)
+
+
+def resolve_atr(candles_3m, daily_atr=None, period=14):
+    """
+    Resolve ATR value for signal detection.
+    - If daily_atr is provided, use it (force float).
+    - Otherwise, calculate from candles_3m.
+    Always return (float atr, source string).
+    """
+    if daily_atr is not None:
+        try:
+            return float(daily_atr), "daily override"
+        except Exception:
+            return None, "daily override invalid"
+
+    if candles_3m is not None and isinstance(candles_3m, pd.DataFrame):
+        atr_val = calculate_atr(candles_3m, period=period)
+        if atr_val is not None:
+            return atr_val, "calculated"
+        else:
+            return None, "calculation failed"
+
+    return None, "unavailable"
+
+
+def daily_atr(df_daily, period=7):
+    """
+    Daily ATR calculation with NaN handling.
+    """
+    if df_daily is None or len(df_daily) < period + 1:
+        return None
+
     hl = df_daily["high"] - df_daily["low"]
     hc = (df_daily["high"] - df_daily["close"].shift()).abs()
     lc = (df_daily["low"] - df_daily["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return float(tr.rolling(period).mean().iloc[-1])
+
+    atr_series = tr.rolling(period).mean().dropna()
+    if atr_series.empty:
+        return None
+    val = atr_series.iloc[-1]
+    return None if pd.isna(val) else float(val)
 
 # ===== Momentum =====
 def momentum_ok(candles, side):
@@ -129,42 +151,118 @@ def calculate_cci(df, period=20):
     cci = (tp - ma) / (0.015 * md)
     return cci
 
+def ema_bias(df, period=20):
+    """EMA bias: compares last close vs EMA."""
+    if df is None or df.empty or "close" not in df.columns:
+        return "NEUTRAL"
+    ema = df["close"].ewm(span=period).mean()
+    if ema.empty or pd.isna(ema.iloc[-1]):
+        return "NEUTRAL"
+    last_close = df["close"].iloc[-1]
+    return "BULLISH" if last_close > ema.iloc[-1] else "BEARISH"
 
-def calculate_supertrend(df, period=8, multiplier=3):
-    """Supertrend indicator."""
-    if not {"high","low","close"}.issubset(df.columns):
-        logging.error("[SUPERTREND] Missing required columns")
-        return pd.Series(index=df.index, dtype="object")
 
-    hl2 = (df['high'] + df['low']) / 2
-    atr = calculate_atr(df, period)
-    if atr is None or len(atr) == 0:
-        logging.error("[SUPERTREND] ATR not available")
-        return pd.Series(index=df.index, dtype="object")
+def cci_bias(df, period=20, threshold=100):
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    ma = tp.rolling(period).mean()
+    md = (tp - ma).abs().rolling(period).mean()
+    cci = (tp - ma) / (0.015 * md)
+    last_cci = cci.iloc[-1]
+    if last_cci > threshold:
+        return "BULLISH"
+    elif last_cci < -threshold:
+        return "BEARISH"
+    else:
+        return "NEUTRAL"
 
-    upperband = hl2 + (multiplier * atr)
-    lowerband = hl2 - (multiplier * atr)
+def cci_bias(df, period=20, threshold=100):
+    """CCI bias: checks last CCI value against thresholds."""
+    if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
+        return "NEUTRAL"
 
-    supertrend = pd.Series(index=df.index, dtype="object")
-    trend = "NEUTRAL"  # ✅ explicit initialization
-    for i in range(period, len(df)):
-        if df['close'].iloc[i] > upperband.iloc[i]:
-            trend = "BULLISH"
-        elif df['close'].iloc[i] < lowerband.iloc[i]:
-            trend = "BEARISH"
-        supertrend.iloc[i] = trend
-    return supertrend
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    ma = tp.rolling(period).mean()
+    md = (tp - ma).abs().rolling(period).mean()
+    cci = (tp - ma) / (0.015 * md)
+
+    if cci.empty or pd.isna(cci.iloc[-1]):
+        return "NEUTRAL"
+
+    last_cci = cci.iloc[-1]
+    if last_cci > threshold:
+        return "BULLISH"
+    elif last_cci < -threshold:
+        return "BEARISH"
+    else:
+        return "NEUTRAL"
+
+
+def supertrend(df, atr_val=None, period=10, multiplier=3):
+    """
+    Compute Supertrend bias.
+    - df: DataFrame with 'high','low','close'
+    - atr_val: optional float ATR override
+    - period: ATR period if computing internally
+    - multiplier: Supertrend multiplier
+    Returns "BULLISH", "BEARISH", or "NEUTRAL"
+    """
+
+    if df is None or df.empty:
+        logging.warning("[SUPERTREND] No candles provided")
+        return "NEUTRAL"
+
+    # --- ATR resolution ---
+    if atr_val is None or pd.isna(atr_val):
+        high_low   = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close  = (df['low'] - df['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr_series = tr.rolling(period).mean().dropna()
+        if atr_series.empty:
+            logging.warning("[SUPERTREND] ATR unavailable")
+            return "NEUTRAL"
+        atr_val = float(atr_series.iloc[-1])
+        logging.debug(f"[SUPERTREND] ATR calculated={atr_val:.2f}")
+    else:
+        try:
+            atr_val = float(atr_val)
+            logging.debug(f"[SUPERTREND] ATR override={atr_val:.2f}")
+        except Exception:
+            logging.error("[SUPERTREND] Invalid ATR override")
+            return "NEUTRAL"
+
+    # --- Supertrend bands ---
+    last = df.iloc[-1]
+    hl2 = (last.high + last.low) / 2
+    upper_band = hl2 + (multiplier * atr_val)
+    lower_band = hl2 - (multiplier * atr_val)
+
+    logging.debug(
+        f"[SUPERTREND] hl2={hl2:.2f}, upper={upper_band:.2f}, "
+        f"lower={lower_band:.2f}, close={last.close:.2f}"
+    )
+
+    # --- Bias decision ---
+    if last.close > upper_band:
+        logging.info("[SUPERTREND] Bias=BULLISH")
+        return "BULLISH"
+    elif last.close < lower_band:
+        logging.info("[SUPERTREND] Bias=BEARISH")
+        return "BEARISH"
+    else:
+        logging.info("[SUPERTREND] Bias=NEUTRAL")
+        return "NEUTRAL"
+
 
 
 def calculate_adx(df, period=14):
-    """Average Directional Index (ADX)."""
+    """Average Directional Index (ADX) that always returns a Series."""
     if not {"high","low","close"}.issubset(df.columns):
         logging.error("[ADX] Missing required columns")
         return pd.Series(dtype=float)
 
     df = df.copy()
 
-    # ✅ vectorized TR calculation
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -186,79 +284,129 @@ def calculate_adx(df, period=14):
                 (df['+DI14'] + df['-DI14']).replace(0, np.nan)) * 100
 
     adx = df['DX'].rolling(window=period).mean()
+
+    # Ensure ADX is always a Series
+    if isinstance(adx, (float, int)):
+        adx = pd.Series([adx], index=df.index[-1:])
+    elif not isinstance(adx, pd.Series):
+        adx = pd.Series(dtype=float)
+
     return adx
 
-
-# =================== Bias Check ===================================================
-
-def check_bias(hist_data_15m, daily_atr=None, atr_threshold=15, adx_threshold=20, min_candles=20):
-    if len(hist_data_15m) < min_candles:
-        logging.warning("[BIAS CHECK] Not enough candles to determine bias")
+def adx_bias(df, period=14, threshold=20):
+    """ADX bias: compares +DI vs -DI with ADX strength check."""
+    if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
+        logging.warning("[ADX BIAS] No data")
         return "NEUTRAL"
 
-    if not {"high","low","close"}.issubset(hist_data_15m.columns):
-        logging.error("[BIAS CHECK] Missing required columns")
+    high, low, close = df["high"], df["low"], df["close"]
+
+    plus_dm = high.diff()
+    minus_dm = low.diff().abs()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(period).mean().dropna()
+    if atr.empty:
+        logging.warning("[ADX BIAS] ATR unavailable")
         return "NEUTRAL"
 
-    # ATR
-    try:
-        atr_val = calculate_atr(hist_data_15m).iloc[-1]
-    except Exception:
-        atr_val = None
-    atr_ok = atr_val is not None and atr_val > atr_threshold
-    if daily_atr is not None:  # ✅ optional daily ATR override
-        atr_ok = daily_atr > atr_threshold
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+    adx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)).rolling(period).mean()
 
-    # ADX
-    try:
-        adx_val = calculate_adx(hist_data_15m).iloc[-1]
-    except Exception:
-        adx_val = None
-    adx_ok = adx_val is not None and adx_val > adx_threshold
+    if adx.empty or pd.isna(adx.iloc[-1]):
+        logging.warning("[ADX BIAS] ADX unavailable")
+        return "NEUTRAL"
 
-    # Supertrend
-    supertrend_series = calculate_supertrend(hist_data_15m)
-    supertrend_bias = supertrend_series.iloc[-1] if len(supertrend_series) else "NEUTRAL"
+    adx_val = adx.iloc[-1]
+    logging.debug(f"[ADX BIAS] +DI={plus_di.iloc[-1]:.2f}, -DI={minus_di.iloc[-1]:.2f}, ADX={adx_val:.2f}")
 
-    # EMA
-    ema20 = calculate_ema(hist_data_15m['close'], period=20).iloc[-1]
-    ema_bias = "BULLISH" if hist_data_15m['close'].iloc[-1] > ema20 else "BEARISH"
+    if adx_val < threshold:
+        return "NEUTRAL"
+    return "BULLISH" if plus_di.iloc[-1] > minus_di.iloc[-1] else "BEARISH"
 
-    # CCI
-    try:
-        cci_val = calculate_cci(hist_data_15m).iloc[-1]
-    except Exception:
-        cci_val = 0
-    cci_bias = "BULLISH" if cci_val > 50 else "BEARISH" if cci_val < -50 else "NEUTRAL"
 
-    # Voting system
-    votes = [supertrend_bias, ema_bias, cci_bias]
-    bullish_votes = votes.count("BULLISH")
-    bearish_votes = votes.count("BEARISH")
+def check_bias(candles_15m, daily_atr=None):
+    """
+    Evaluate bias using multiple indicators (Supertrend, EMA, ADX, CCI).
+    Weighted scoring system:
+      - Supertrend: 2 points
+      - ADX: 2 points
+      - EMA: 1 point
+      - CCI: 1 point
+    Returns "BULLISH", "BEARISH", or "NEUTRAL".
+    """
 
-    if bullish_votes > bearish_votes and atr_ok and adx_ok:
-        bias = "BULLISH"
-    elif bearish_votes > bullish_votes and atr_ok and adx_ok:
-        bias = "BEARISH"
+    if candles_15m is None or candles_15m.empty:
+        logging.warning("[BIAS] No 15m candles available")
+        return None
+
+    # --- Resolve ATR value ---
+    if isinstance(daily_atr, (float, int)):
+        atr_val = float(daily_atr)
+    elif isinstance(daily_atr, pd.Series) and not daily_atr.empty:
+        atr_val = float(daily_atr.iloc[-1])
+    elif isinstance(daily_atr, pd.DataFrame) and not daily_atr.empty:
+        atr_val = float(daily_atr.values[-1])
     else:
-        bias = "NEUTRAL"
+        atr_val = None
+    if pd.isna(atr_val):
+        atr_val = None
 
-    # ✅ Fixed logging
-    atr_str = f"{atr_val:.2f}" if atr_val is not None else "NA"
-    adx_str = f"{adx_val:.2f}" if adx_val is not None else "NA"
-    logging.info(
-        f"[BIAS CHECK] ATR={atr_str} ADX={adx_str} "
-        f"Supertrend={supertrend_bias} EMA={ema_bias} CCI={cci_bias} => Bias={bias}"
-    )
-    return bias
+    # --- Compute indicators ---
+    try:
+        st_val = supertrend(candles_15m, atr_val)
+    except Exception as e:
+        logging.error(f"[BIAS DEBUG] Supertrend calc failed: {e}")
+        st_val = "NEUTRAL"
 
-bias_check = check_bias
+    try:
+        ema_val = ema_bias(candles_15m)
+    except Exception as e:
+        logging.error(f"[BIAS DEBUG] EMA calc failed: {e}")
+        ema_val = "NEUTRAL"
 
+    try:
+        adx_val = adx_bias(candles_15m)
+    except Exception as e:
+        logging.error(f"[BIAS DEBUG] ADX calc failed: {e}")
+        adx_val = "NEUTRAL"
 
-# ============= Ocillator Filters ===============
+    try:
+        cci_val = cci_bias(candles_15m)
+    except Exception as e:
+        logging.error(f"[BIAS DEBUG] CCI calc failed: {e}")
+        cci_val = "NEUTRAL"
+
+    # --- Weighted scoring ---
+    weights = {"Supertrend": 2, "ADX": 2, "EMA": 1, "CCI": 1}
+    scores = {"BULLISH": 0, "BEARISH": 0}
+
+    for name, val in [("Supertrend", st_val), ("EMA", ema_val), ("ADX", adx_val), ("CCI", cci_val)]:
+        if val in scores:
+            scores[val] += weights[name]
+
+    logging.info(f"[BIAS CHECK] ATR={atr_val} ADX={adx_val} Supertrend={st_val} EMA={ema_val} CCI={cci_val}")
+    logging.info(f"[BIAS SCORES] BULLISH={scores['BULLISH']} BEARISH={scores['BEARISH']}")
+
+    if scores["BULLISH"] > scores["BEARISH"]:
+        logging.info("[BIAS RESULT] BULLISH (weighted)")
+        return "BULLISH"
+    elif scores["BEARISH"] > scores["BULLISH"]:
+        logging.info("[BIAS RESULT] BEARISH (weighted)")
+        return "BEARISH"
+    else:
+        logging.info("[BIAS RESULT] NEUTRAL (weighted tie)")
+        return "NEUTRAL"
 
 def williams_r(candles, period=14):
-    """Calculate Williams %R."""
     if len(candles) < period:
         logging.warning("[W%R] Not enough candles")
         return np.nan
@@ -268,11 +416,12 @@ def williams_r(candles, period=14):
     if highest_high == lowest_low:
         logging.warning("[W%R] Invalid range (high == low)")
         return np.nan
-    return ((highest_high - last_close) / (highest_high - lowest_low)) * -100
+    wr = ((highest_high - last_close) / (highest_high - lowest_low)) * -100
+    logging.debug(f"[W%R] high={highest_high:.2f}, low={lowest_low:.2f}, close={last_close:.2f}, W%R={wr:.2f}")
+    return wr
 
 
 def cci_indicator(candles, period=20):
-    """Calculate Commodity Channel Index (CCI)."""
     if len(candles) < period:
         logging.warning("[CCI] Not enough candles")
         return np.nan
@@ -282,16 +431,20 @@ def cci_indicator(candles, period=20):
     if md == 0:
         logging.warning("[CCI] Mean deviation = 0")
         return np.nan
-    return (tp.iloc[-1] - ma) / (0.015 * md)
+    cci = (tp.iloc[-1] - ma) / (0.015 * md)
+    logging.debug(f"[CCI] tp={tp.iloc[-1]:.2f}, ma={ma:.2f}, md={md:.2f}, CCI={cci:.2f}")
+    return cci
 
 
 def oscillator_entry_filter(side, candles_3m):
-    """Block entries if oscillators show exhaustion on 3m timeframe."""
     if len(candles_3m) < 20:
         logging.warning("[ENTRY FILTER][OSC] Not enough candles, allowing entry")
         return True
     wr  = williams_r(candles_3m)
     cci = cci_indicator(candles_3m)
+    if np.isnan(wr) or np.isnan(cci):
+        logging.warning("[ENTRY FILTER][OSC] Oscillator NaN, allowing entry")
+        return True
     if side == "CALL" and (wr >= -10 or cci >= 200):
         logging.info(f"[ENTRY BLOCKED][OSC] CALL skipped (W%R={wr:.2f}, CCI={cci:.2f})")
         return False
@@ -302,14 +455,14 @@ def oscillator_entry_filter(side, candles_3m):
 
 
 def oscillator_exit_trigger(side, candles_15m):
-    """Trigger exits if oscillators hit extremes on 15m timeframe."""
     if len(candles_15m) < 20:
         logging.warning("[EXIT FILTER][OSC] Not enough candles")
         return False, ""
-
     wr  = williams_r(candles_15m)
     cci = cci_indicator(candles_15m)
-
+    if np.isnan(wr) or np.isnan(cci):
+        logging.warning("[EXIT FILTER][OSC] Oscillator NaN, no exit")
+        return False, ""
     if side == "CALL":
         if wr >= -5:
             logging.info(f"[EXIT SIGNAL][OSC] CALL exit W%R={wr:.2f}")
@@ -317,7 +470,6 @@ def oscillator_exit_trigger(side, candles_15m):
         if cci >= 200:
             logging.info(f"[EXIT SIGNAL][OSC] CALL exit CCI={cci:.2f}")
             return True, f"CCI={cci:.2f} >= 200 (bullish extreme)"
-
     elif side == "PUT":
         if wr <= -95:
             logging.info(f"[EXIT SIGNAL][OSC] PUT exit W%R={wr:.2f}")
@@ -325,5 +477,4 @@ def oscillator_exit_trigger(side, candles_15m):
         if cci <= -200:
             logging.info(f"[EXIT SIGNAL][OSC] PUT exit CCI={cci:.2f}")
             return True, f"CCI={cci:.2f} <= -200 (bearish extreme)"
-
     return False, ""
