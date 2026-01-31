@@ -2,6 +2,7 @@
 
 import logging
 import pandas as pd
+import numpy as np
 from setup import spot_price
 from config import CANDLE_BODY_RANGE, ATR_VALUE
 from indicators import (
@@ -11,7 +12,9 @@ from indicators import (
     check_bias,
     momentum_ok,
     oscillator_entry_filter,
-    oscillator_exit_trigger
+    oscillator_exit_trigger,
+    williams_r,
+    supertrend
 )
 
 
@@ -87,36 +90,39 @@ def evaluate_candle(ts, row, candles, resolution, spot, side, candles_15m=None):
         logging.error(f"[EVAL ERROR] {resolution} candle {ts}: {e}")
 
 # ===== Bias Resolution =====
-def resolve_bias(candles_15m, daily_atr=None):
+def resolve_bias(candles_15m, daily_atr=None, fallback_atr=None):
     """
     Resolve bias using 15m candles and optional daily ATR override.
     - candles_15m must be a DataFrame
-    - daily_atr must be a float (optional override)
+    - daily_atr: float (optional override, e.g. daily ATR)
+    - fallback_atr: float (optional intraday ATR to use if daily_atr is None)
     """
 
-    # --- Debug guard: log input types ---
     logging.debug(
         f"[RESOLVE BIAS INPUT] candles_15m type={type(candles_15m)} "
-        f"daily_atr type={type(daily_atr)}"
+        f"daily_atr type={type(daily_atr)} fallback_atr type={type(fallback_atr)}"
     )
 
-    # --- Guard: must be a DataFrame ---
     if candles_15m is None or not isinstance(candles_15m, pd.DataFrame):
         logging.error("[RESOLVE BIAS] Invalid input: candles_15m is not a DataFrame")
         return None
 
-    # --- Call bias check safely ---
     try:
-        bias = check_bias(candles_15m, daily_atr=daily_atr)
+        # use daily_atr if provided, otherwise fallback to calculated ATR
+        atr_val = daily_atr if daily_atr is not None else fallback_atr
+        bias = check_bias(candles_15m, daily_atr=atr_val)
+
         if bias == "NEUTRAL":
             logging.debug(
-            f"[BIAS CALL GUARD @147] candles_15m type={type(candles_15m)} "
-            f"len={len(candles_15m) if isinstance(candles_15m, pd.DataFrame) else 'NA'} "
-            f"daily_atr type={type(daily_atr)}"
+                f"[BIAS CALL GUARD] candles_15m len={len(candles_15m)} "
+                f"ATR used={atr_val}"
             )
             logging.info("[SIGNAL FILTERED] Bias neutral, skipping trade")
             return None
+
+        logging.info(f"[BIAS RESULT] {bias} (ATR={atr_val if atr_val else 'NA'})")
         return bias
+
     except Exception as e:
         logging.error(f"[RESOLVE BIAS ERROR] Failed bias resolution: {e}")
         return None
@@ -241,6 +247,7 @@ def to_scalar(val):
     except Exception:
         return val
 
+
 def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
                   candles_3m, candles_15m, spot_price=None, daily_atr=None):
 
@@ -258,21 +265,12 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
     if atr is None:
         logging.info("[SIGNAL FILTERED] ATR unavailable, skipping")
         return None
-    logging.debug(f"[DEBUG] ATR type={type(atr)} value={atr}")
     atr_str = f"{atr:.2f}" if atr is not None else "NA"
     logging.info(f"[ATR] {atr_str} (source={atr_source})")
 
     # --- Bias check (always use 15m candles) ---
-    bias = None
     try:
-        logging.debug(f"[BIAS CALL GUARD] candles_15m type={type(candles_15m)} len={len(candles_15m)} daily_atr type={type(daily_atr)}")
-        logging.debug(f"[BIAS PREVIEW @SIGNAL]\n{candles_15m.tail(3)}")
         bias = check_bias(candles_15m, daily_atr=daily_atr)
-        logging.debug(
-            f"[BIAS CALL GUARD @359] candles_15m type={type(candles_15m)} "
-            f"len={len(candles_15m) if isinstance(candles_15m, pd.DataFrame) else 'NA'} "
-            f"daily_atr type={type(daily_atr)}"
-        )
         logging.info(f"[BIAS RESULT] {bias if bias else 'NA'}")
     except Exception as e:
         logging.error(f"[BIAS ERROR] Failed bias check: {e}")
@@ -282,25 +280,35 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
         logging.info("[SIGNAL FILTERED] Bias neutral, skipping trade")
         return None
 
+    # --- Supertrend slope diagnostic ---
+    try:
+        st_result = supertrend(candles_15m, atr_val=daily_atr)
+        st_bias = st_result.get("bias", "NEUTRAL")
+        st_slope = st_result.get("slope", "FLAT")
+        logging.info(f"[SUPERTREND] Bias={st_bias} Slope={st_slope}")
+    except Exception as e:
+        logging.error(f"[SUPERTREND ERROR] {e}")
+
     # --- Candle references ---
     last = candles_3m.iloc[-1]
     prev = candles_3m.iloc[-2]
     rng  = to_scalar(last.high) - to_scalar(last.low)
 
-    # --- Preview last 3 rows of 3m candles ---
     logging.debug(f"[SIGNAL PREVIEW @3M]\n{candles_3m.tail(3)}")
 
-    # --- Candle strength + momentum ---
+    # --- Candle strength + momentum (no window restriction) ---
     call_ok, call_momentum = candle_strength(candles_3m, "CALL")
     put_ok,  put_momentum  = candle_strength(candles_3m, "PUT")
 
-    # --- Oscillator entry filters ---
-    if call_ok and not apply_oscillator_filter("CALL", candles_3m):
-        logging.info("[OSC FILTER] CALL rejected by oscillator")
-        call_ok = False
-    if put_ok and not apply_oscillator_filter("PUT", candles_3m):
-        logging.info("[OSC FILTER] PUT rejected by oscillator")
-        put_ok = False
+    # --- Williams %R entry blocking ---
+    wr = williams_r(candles_3m, period=14)
+    if not np.isnan(wr):
+        if bias == "BULLISH" and wr > -20:  # overbought
+            logging.info(f"[OSC FILTER] CALL blocked by W%R={wr:.2f} (overbought)")
+            call_ok = False
+        if bias == "BEARISH" and wr < -80:  # oversold
+            logging.info(f"[OSC FILTER] PUT blocked by W%R={wr:.2f} (oversold)")
+            put_ok = False
 
     # --- Priority order ---
     signal = (
@@ -317,14 +325,18 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
     if signal:
         side, reason = signal
         spot_price = to_scalar(spot_price)
-        logging.debug(f"[DEBUG] Spot type={type(spot_price)} value={spot_price}")
         spot_str = f"{spot_price:.2f}" if spot_price is not None else "NA"
         logging.info(
             f"[SIGNAL FOUND] side={side} reason={reason} "
-            f"Bias={bias} ATR={atr_str} spot={spot_str}"
+            f"Bias={bias} ATR={atr_str} W%R={wr:.2f if not np.isnan(wr) else 'NA'} "
+            f"SupertrendSlope={st_slope} spot={spot_str}"
         )
+        # --- Exit trigger diagnostic ---
+        if side == "CALL" and wr > -20:
+            logging.info(f"[EXIT TRIGGER] CALL exit due to W%R={wr:.2f} (overbought)")
+        if side == "PUT" and wr < -80:
+            logging.info(f"[EXIT TRIGGER] PUT exit due to W%R={wr:.2f} (oversold)")
         return side, reason
 
     logging.info("[NO SIGNAL] No valid breakout/rejection detected")
     return None
-

@@ -5,7 +5,6 @@ import pandas as pd
 import pendulum as dt
 from fyers_apiv3 import fyersModel
 import time
-
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
     CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point, ENTRY_OFFSET, ORDER_TYPE,
@@ -21,7 +20,8 @@ from indicators import (
     calculate_camarilla_pivots,
     resolve_atr,
     daily_atr,
-    oscillator_exit_trigger
+    oscillator_exit_trigger,
+    oscillator_entry_filter
 )
 from candle_builder import build_3min_candle, build_15m_candles, get_today_15m_candles
 from signals import detect_signal, evaluate_candle
@@ -66,16 +66,70 @@ def status_color(status):
 # ===== Shared state =====
 last_signal_candle_time = None
 
-# ===== Persistence =====
+# # ===== Persistence =====
+# def store(data, account_type_):
+#     try:
+#         pickle.dump(data, open(f'data-{dt.now(time_zone).date()}-{account_type_}.pickle', 'wb'))
+#     except Exception as e:
+#         logging.error(f"Failed to store state: {e}")
+
+# def load(account_type_):
+#     try:
+#         return pickle.load(open(f'data-{dt.now(time_zone).date()}-{account_type_}.pickle', 'rb'))
+#     except Exception as e:
+#         logging.warning(f"State load failed (fresh start): {e}")
+#         raise
+
+# ===== Persistence with Ledger =====
+
 def store(data, account_type_):
+    """
+    Append trading state to a ledger stored in a pickle file.
+    Each call adds a new snapshot to the list instead of overwriting.
+    Compatible with both legacy dict and new ledger format.
+    """
+    filename = f"data-{dt.now(time_zone).date()}-{account_type_}.pickle"
     try:
-        pickle.dump(data, open(f'data-{dt.now(time_zone).date()}-{account_type_}.pickle', 'wb'))
+        # Try to load existing ledger
+        try:
+            with open(filename, "rb") as f:
+                ledger = pickle.load(f)
+
+            # Normalize legacy formats
+            if isinstance(ledger, dict):
+                # Old format: single dict snapshot
+                ledger = [ledger]
+            elif not isinstance(ledger, list):
+                # Unexpected format: reset to empty list
+                ledger = []
+        except Exception:
+            ledger = []
+
+        # Append current snapshot with timestamp + state
+        snapshot = {
+            "timestamp": dt.now(time_zone),
+            "state": data
+        }
+        ledger.append(snapshot)
+
+        # Save back to pickle
+        with open(filename, "wb") as f:
+            pickle.dump(ledger, f, protocol=pickle.HIGHEST_PROTOCOL)
+
     except Exception as e:
         logging.error(f"Failed to store state: {e}")
 
+
 def load(account_type_):
+    """
+    Load the full ledger from pickle file.
+    Returns a list of snapshots (each with timestamp + state).
+    """
+    filename = f"data-{dt.now(time_zone).date()}-{account_type_}.pickle"
     try:
-        return pickle.load(open(f'data-{dt.now(time_zone).date()}-{account_type_}.pickle', 'rb'))
+        with open(filename, "rb") as f:
+            ledger = pickle.load(f)
+        return ledger
     except Exception as e:
         logging.warning(f"State load failed (fresh start): {e}")
         raise
@@ -197,26 +251,35 @@ from signals import detect_signal, evaluate_candle
 
 # Dynamic ATR based SL/PT/TG 
 
-def build_dynamic_levels(entry_price, side, atr, rr_ratio=2.0):
+def build_dynamic_levels(entry_price, atr, rr_ratio=2.0, profit_loss_point=5):
     """
     Build stop-loss, partial/full targets, and trailing parameters.
-    Long-only logic (same for CALL and PUT).
-    Three modes:
-      - Normal regime: ATR <= 30
-      - Volatile regime: 30 < ATR <= 160
-      - Extreme regime: ATR > 160 (skip trade)
+    Long-only logic (works for both CALL and PUT).
+    Adaptive ATR thresholds:
+      - Non-expiry days (Wed–Mon except Tuesday)
+      - Expiry regime (Tuesday)
     """
 
+    weekday = dt.now(time_zone).weekday()  # Monday=0 ... Sunday=6
+    is_expiry_day = (weekday == 1)  # Tuesday
+
     # ---- Decision: Normal / Volatile / Extreme ----
-    if atr <= 30:
-        mode = "normal"
-    elif atr <= 160:
-        mode = "volatile"
+    if is_expiry_day:
+        if atr <= 40:
+            mode = "normal"
+        elif atr <= 180:
+            mode = "volatile"
+        else:
+            mode = "extreme"
     else:
-        mode = "extreme"
+        if atr <= 25:
+            mode = "normal"
+        elif atr <= 120:
+            mode = "volatile"
+        else:
+            mode = "extreme"
 
     if mode == "normal":
-        # ✅ Normal regime: stable market
         risk_points   = max(profit_loss_point, atr * 0.25)
         reward_points = risk_points * rr_ratio
 
@@ -225,51 +288,71 @@ def build_dynamic_levels(entry_price, side, atr, rr_ratio=2.0):
         full_target    = entry_price + reward_points
 
         trail_start = reward_points / 2
-        trail_step  = atr * 0.1
+        trail_step  = max(atr * 0.1, 0.5)
 
-        logging.info(
-            f"{GREEN}[LEVELS][NORMAL] ATR={atr:.2f} "
-            f"Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
-        )
+        if is_expiry_day:
+            logging.info(
+                f"[LEVELS][EXPIRY-NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}"
+            )
+        else:
+            logging.info(
+                f"[LEVELS][NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}"
+            )
 
     elif mode == "volatile":
-        # ✅ Volatile regime: expiry-like, ATR between 30–160
-        risk_points   = atr * 0.5          # wider stop
-        reward_points = atr * 1.0          # quicker profit booking
+        risk_points   = atr * 0.5
+        reward_points = atr * 1.0
 
         stop  = entry_price - risk_points
         partial_target = entry_price + reward_points * 0.5
         full_target    = entry_price + reward_points
 
-        trail_start = reward_points * 0.25 # start trailing earlier
-        trail_step  = atr * 0.2            # bigger trail increments
+        trail_start = reward_points * 0.25
+        trail_step  = max(atr * 0.2, 1.0)
 
-        logging.info(
-            f"{YELLOW}[LEVELS][VOLATILE] ATR={atr:.2f} "
-            f"Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
-        )
+        if is_expiry_day:
+            logging.info(
+                f"[LEVELS][EXPIRY-VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}"
+            )
+        else:
+            logging.info(
+                f"[LEVELS][VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}"
+            )
 
     else:
-        # 🚫 Extreme regime: ATR > 160
-        logging.warning(
-            f"{RED}[LEVELS][EXTREME] ATR={atr:.2f} > 160 "
-            f"→ Trade skipped due to excessive volatility{RESET}"
-        )
+        if is_expiry_day:
+            logging.warning(
+                f"[LEVELS][EXPIRY-EXTREME] ATR={atr:.2f} → Trade skipped due to excessive expiry-day volatility"
+            )
+        else:
+            logging.warning(
+                f"[LEVELS][EXTREME] ATR={atr:.2f} → Trade skipped due to excessive volatility"
+            )
         return None, None, None, None, None
 
-    return stop, full_target, partial_target, trail_start, trail_step
+    return stop, partial_target, full_target, trail_start, trail_step
+
+
 
 def update_trailing_stop(current_price, entry_price, current_stop, trail_start_pnl, trail_step_points):
     """
     Update trailing stop once partial target booked.
-    Long-only logic (same for CALL and PUT):
-    - Move stop up as option price rises
+    Long-only logic (works for both CALL and PUT).
+    - Ratchets stop upward as option price rises.
     """
+
     pnl = current_price - entry_price
-    if pnl >= trail_start_pnl:
+    if pnl >= trail_start_pnl and trail_step_points > 0:
         candidate = current_price - trail_step_points
-        return max(current_stop, candidate)  # stop ratchets upward
+        new_stop = max(current_stop, candidate)
+        if new_stop != current_stop:
+            logging.info(
+                f"[TRAIL UPDATE] Stop moved from {current_stop:.2f} → {new_stop:.2f}"
+            )
+        return new_stop
+
     return current_stop
+
 
 # ===== PAPER/LIVE STATE INIT =====
 
@@ -594,22 +677,45 @@ def check_order_status(order_id, fyers):
 
 # =================== Dynamic Order Processing / ATR based SL/PT/TG ==========================
 
-def process_order(side, symbol, price, info, hist_data):
+def process_order(side, symbol, price, info, hist_data_3m, hist_data_15m, spot_price, account_type="paper"):
+    """
+    Manage exits and trailing logic for an active trade.
+    Args:
+        side        : "CALL" or "PUT"
+        symbol      : option symbol string
+        price       : current LTP
+        info        : trade info dict (paper_info or live_info)
+        hist_data_3m: 3m history DataFrame (for SL/targets/trailing confirmation)
+        hist_data_15m: 15m history DataFrame (for oscillator exits)
+        spot_price  : current spot price
+        account_type: "paper" or "live"
+    """
+
     trade = info["call_buy"] if side == "CALL" else info["put_buy"]
     entry = trade["buy_price"]
     qty   = trade["quantity"]
-    account_type = info.get("account_type", "paper")
 
-    # --- Stop-loss check ---
-    sl_hit = price <= trade.get("current_stop_price", 0)
+    # Detect expiry regime (Tuesday)
+    weekday = dt.now(time_zone).weekday()
+    expiry_flag = (weekday == 1)
+    regime_tag = "EXPIRY EXIT" if expiry_flag else "VOLATILITY EXIT"
+
+    # --- Stop-loss check (3m candle confirmation) ---
+    sl_hit = False
+    if hist_data_3m is not None and not hist_data_3m.empty:
+        last_candle = hist_data_3m.iloc[-1]
+        if last_candle["low"] <= trade.get("current_stop_price", 0):
+            sl_hit = True
+    else:
+        sl_hit = price <= trade.get("current_stop_price", 0)
+
     if sl_hit and qty > 0:
-        if account_type.lower() == "paper":
-            success, order_id = send_paper_exit_order(trade["option_name"], qty, "STOPLOSS")
-        else:
-            success, order_id = send_live_exit_order(trade["option_name"], qty, "STOPLOSS")
-
+        success, order_id = (
+            send_paper_exit_order(trade["option_name"], qty, "STOPLOSS")
+            if account_type.lower() == "paper"
+            else send_live_exit_order(trade["option_name"], qty, "STOPLOSS")
+        )
         if success:
-            trade["order_id"] = order_id
             pnl_points = price - entry
             pnl_value  = pnl_points * qty
             trade["pnl"] += pnl_value
@@ -621,29 +727,25 @@ def process_order(side, symbol, price, info, hist_data):
                 trade.get("full_target_price", 0), spot_price, qty
             ]
             logging.info(
-                f"{RED}[EXIT][{account_type.upper()} STOPLOSS] LONG {side} {symbol} "
+                f"[EXIT][{account_type.upper()} STOPLOSS][{regime_tag}] LONG {side} {symbol} "
                 f"Qty={qty} Entry={entry:.2f} Exit={price:.2f} "
-                f"PnL={pnl_value:.2f} (points={pnl_points:.2f}){RESET}"
+                f"PnL={pnl_value:.2f} (points={pnl_points:.2f})"
             )
-            logging.info(f"[SESSION PnL] Total={info['total_pnl']:.2f}")
             update_order_status(order_id, "PENDING", qty, price, symbol)
             return True
         return False
 
-    # --- Oscillator exit check (15m candles) ---
-    candles_15m = get_today_15m_candles(hist_data)
-    if not candles_15m.empty:
-        triggered, reason = oscillator_exit_trigger(side, candles_15m)
+    # --- Oscillator exit check (15m for peak detection) ---
+    if hist_data_15m is not None and not hist_data_15m.empty:
+        triggered, reason = oscillator_exit_trigger(side, hist_data_15m)
         if triggered:
             if OSCILLATOR_EXIT_MODE == "HARD":
-                # Immediate full exit
-                if account_type.lower() == "paper":
-                    success, order_id = send_paper_exit_order(trade["option_name"], qty, "OSCILLATOR")
-                else:
-                    success, order_id = send_live_exit_order(trade["option_name"], qty, "OSCILLATOR")
-
+                success, order_id = (
+                    send_paper_exit_order(trade["option_name"], qty, "OSCILLATOR")
+                    if account_type.lower() == "paper"
+                    else send_live_exit_order(trade["option_name"], qty, "OSCILLATOR")
+                )
                 if success:
-                    trade["order_id"] = order_id
                     pnl_points = price - entry
                     pnl_value  = pnl_points * qty
                     trade["pnl"] += pnl_value
@@ -655,36 +757,39 @@ def process_order(side, symbol, price, info, hist_data):
                         trade.get("full_target_price", 0), spot_price, qty
                     ]
                     logging.info(
-                        f"{MAGENTA}[EXIT][{account_type.upper()} OSCILLATOR-HARD] LONG {side} {symbol} "
+                        f"[EXIT][{account_type.upper()} OSCILLATOR-HARD][{regime_tag}] LONG {side} {symbol} "
                         f"Qty={qty} Entry={entry:.2f} Exit={price:.2f} "
-                        f"PnL={pnl_value:.2f} (points={pnl_points:.2f}) Reason={reason}{RESET}"
+                        f"PnL={pnl_value:.2f} (points={pnl_points:.2f}) Reason={reason}"
                     )
-                    logging.info(f"[SESSION PnL] Total={info['total_pnl']:.2f}")
                     update_order_status(order_id, "PENDING", qty, price, symbol)
                     return True
                 return False
 
             elif OSCILLATOR_EXIT_MODE == "TRAIL":
-                # Tighten SL to entry, continue trailing for TG
                 trade["current_stop_price"] = max(trade.get("current_stop_price", entry), entry)
                 logging.info(
-                    f"{MAGENTA}[OSCILLATOR TRAIL] {symbol} SL tightened to {trade['current_stop_price']:.2f} "
-                    f"Reason={reason}{RESET}"
+                    f"[OSCILLATOR TRAIL][{regime_tag}] {symbol} SL tightened to {trade['current_stop_price']:.2f} "
+                    f"Reason={reason}"
                 )
-                # continue normal flow (partial/TG/trailing)
 
-    # --- Partial Profit Booking ---
-    partial_hit = price >= trade.get("partial_target_price", float("inf"))
+    # --- Partial Profit Booking (3m candle confirmation) ---
+    partial_hit = False
+    if hist_data_3m is not None and not hist_data_3m.empty:
+        last_candle = hist_data_3m.iloc[-1]
+        if last_candle["high"] >= trade.get("partial_target_price", float("inf")):
+            partial_hit = True
+    else:
+        partial_hit = price >= trade.get("partial_target_price", float("inf"))
+
     if not trade.get("partial_booked", False) and partial_hit and qty > 0:
         half_qty = qty // 2
         if half_qty > 0:
-            if account_type.lower() == "paper":
-                success, order_id = send_paper_exit_order(trade["option_name"], half_qty, "PARTIAL")
-            else:
-                success, order_id = send_live_exit_order(trade["option_name"], half_qty, "PARTIAL")
-
+            success, order_id = (
+                send_paper_exit_order(trade["option_name"], half_qty, "PARTIAL")
+                if account_type.lower() == "paper"
+                else send_live_exit_order(trade["option_name"], half_qty, "PARTIAL")
+            )
             if success:
-                trade["order_id"] = order_id
                 pnl_points = price - entry
                 pnl_value  = pnl_points * half_qty
                 trade["pnl"] += pnl_value
@@ -697,23 +802,29 @@ def process_order(side, symbol, price, info, hist_data):
                     trade.get("full_target_price", 0), spot_price, half_qty
                 ]
                 logging.info(
-                    f"{CYAN}[EXIT][{account_type.upper()} PARTIAL] LONG {side} {symbol} "
+                    f"[EXIT][{account_type.upper()} PARTIAL][{regime_tag}] LONG {side} {symbol} "
                     f"HalfQty={half_qty} Entry={entry:.2f} Exit={price:.2f} "
-                    f"PnL={pnl_value:.2f} (points={pnl_points:.2f}){RESET}"
+                    f"PnL={pnl_value:.2f} (points={pnl_points:.2f})"
                 )
-                logging.info(f"[SESSION PnL] Total={info['total_pnl']:.2f}")
                 update_order_status(order_id, "PENDING", half_qty, price, symbol)
 
-    # --- Full Target Check ---
-    full_hit = price >= trade.get("full_target_price", float("inf"))
-    if full_hit and qty > 0:
-        if account_type.lower() == "paper":
-            success, order_id = send_paper_exit_order(trade["option_name"], qty, "TARGET")
-        else:
-            success, order_id = send_live_exit_order(trade["option_name"], qty, "TARGET")
+   
+        # --- Full Target Check (3m candle confirmation) ---
+    full_hit = False
+    if hist_data_3m is not None and not hist_data_3m.empty:
+        last_candle = hist_data_3m.iloc[-1]
+        if last_candle["high"] >= trade.get("full_target_price", float("inf")):
+            full_hit = True
+    else:
+        full_hit = price >= trade.get("full_target_price", float("inf"))
 
+    if full_hit and qty > 0:
+        success, order_id = (
+            send_paper_exit_order(trade["option_name"], qty, "TARGET")
+            if account_type.lower() == "paper"
+            else send_live_exit_order(trade["option_name"], qty, "TARGET")
+        )
         if success:
-            trade["order_id"] = order_id
             pnl_points = price - entry
             pnl_value  = pnl_points * qty
             trade["pnl"] += pnl_value
@@ -725,16 +836,15 @@ def process_order(side, symbol, price, info, hist_data):
                 trade.get("full_target_price", 0), spot_price, qty
             ]
             logging.info(
-                f"{GREEN}[EXIT][{account_type.upper()} TARGET] LONG {side} {symbol} "
+                f"[EXIT][{account_type.upper()} TARGET][{regime_tag}] LONG {side} {symbol} "
                 f"Qty={qty} Entry={entry:.2f} Exit={price:.2f} "
-                f"PnL={pnl_value:.2f} (points={pnl_points:.2f}){RESET}"
+                f"PnL={pnl_value:.2f} (points={pnl_points:.2f})"
             )
-            logging.info(f"[SESSION PnL] Total={info['total_pnl']:.2f}")
             update_order_status(order_id, "PENDING", qty, price, symbol)
             return True
         return False
 
-    # --- Trailing Stop Update ---
+    # --- Trailing Stop Update (3m) ---
     if trade.get("partial_booked", False) and qty > 0:
         new_stop = update_trailing_stop(
             price, entry,
@@ -744,18 +854,18 @@ def process_order(side, symbol, price, info, hist_data):
         )
         if new_stop != trade.get("current_stop_price", entry):
             trade["current_stop_price"] = new_stop
-            logging.info(f"{MAGENTA}[TRAIL STOP UPDATE] {symbol} new SL={new_stop:.2f}{RESET}")
+            logging.info(f"[TRAIL STOP UPDATE][{regime_tag}] {symbol} new SL={new_stop:.2f}")
 
     # --- MTM Logging ---
     mtm_points = price - entry
     mtm_value  = mtm_points * trade["quantity"]
     logging.info(
-        f"{'Paper' if account_type.lower() == 'paper' else 'Live'} MTM LONG {side} {symbol} "
+        f"{account_type.capitalize()} MTM LONG {side} {symbol} "
         f"LTP={price:.2f} Entry={entry:.2f} Qty={trade['quantity']} "
         f"MTM={mtm_value:.2f} (points={mtm_points:.2f})"
     )
 
-    return False    
+    return False
 
 def cleanup_trade_exit(info, leg, side, name, qty, exit_price, mode, reason):
     """
@@ -818,13 +928,12 @@ def update_risk(trade_info, risk_info):
         )
 
 # ===== paper_order =====
-# ===== paper_order =====
 def paper_order(candles_3m, hist_yesterday_15m=None):
     global quantity, paper_info, df, spot_price, last_signal_candle_time, risk_info
 
     COOLDOWN_SECONDS = 180  # 3 minutes
 
-    # --- Safety reset: ensure no lingering trade_flag=2 ---
+    # --- Safety reset ---
     for leg in ["call_buy", "put_buy"]:
         if paper_info[leg].get("trade_flag", 0) == 2:
             logging.warning(f"[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0")
@@ -836,7 +945,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
     try:
         quote = fyers.quotes(data={"symbols": ticker})
         spot_price = quote["d"][0]["v"]["lp"]
-        logging.info(f"Spot={spot_price}")
+        logging.info(f"[PAPER] Spot={spot_price}")
     except Exception as e:
         logging.warning(f"[PAPER] Spot fetch failed: {e}")
 
@@ -844,64 +953,53 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
     if ct > end_time:
         logging.info("[PAPER] End time reached, closing open positions")
         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
-            if paper_info[leg]["trade_flag"] == 1:  # still active
+            if paper_info[leg]["trade_flag"] == 1:
                 name = paper_info[leg]["option_name"]
                 qty  = paper_info[leg]["quantity"]
-
                 success, order_id = send_paper_exit_order(name, qty, "EOD")
                 if success:
                     exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
-                    cleanup_trade_exit(
-                        paper_info, leg, side, name, qty, exit_price, "PAPER", "EOD"
-                    )
+                    cleanup_trade_exit(paper_info, leg, side, name, qty, exit_price, "PAPER", "EOD")
                     update_order_status(order_id, "PENDING", qty, exit_price, name)
         return
 
     # 3. SIGNAL EVALUATION
     signal = None
-    if not candles_3m.empty:
+    if not candles_3m.empty and hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
         last_candle_time = candles_3m.iloc[-1]["time"]
         if last_signal_candle_time != last_candle_time:
             last_signal_candle_time = last_candle_time
-            atr, atr_source = resolve_atr(candles_3m, daily_atr)
-            logging.info(
-                f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} "
-                f"candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}"
-            )
-            prev_day = hist_data.iloc[-1]
+            daily_val = daily_atr(hist_yesterday_15m)
+            atr, atr_source = resolve_atr(candles_3m, daily_val)
+            logging.info(f"[SIGNAL EVAL][PAPER] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}")
+            prev_day = hist_yesterday_15m.iloc[-1]
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
             trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
             cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
+            signal = detect_signal(cpr, trad, cam, candles_3m, hist_yesterday_15m, spot_price=spot_price, daily_atr=daily_val)
 
-            # ✅ Corrected detect_signal call
-            signal = detect_signal(
-                cpr, trad, cam,
-                candles_3m,
-                hist_yesterday_15m,   # 15m candle history for bias validation
-                spot_price=spot_price,
-                daily_atr=daily_atr
-            )
+    
+    # 4. PAPER ENTRY LOGIC (with oscillator filter + expiry logging)
 
-    # 4. PAPER ENTRY LOGIC
     if signal:
         side, reason = signal
-        logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}{RESET}")
+        logging.info(f"[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}")
 
-        # ✅ Risk management check
         if risk_info.get("halt_trading", False):
-            logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
+            logging.info("[ENTRY BLOCKED][RISK] Trading halted due to risk limits")
             return
 
-        # ✅ Cool-down check
         if paper_info.get("last_exit_time"):
             elapsed = (dt.now(time_zone) - paper_info["last_exit_time"]).total_seconds()
             if elapsed < COOLDOWN_SECONDS:
-                logging.info(f"{MAGENTA}[ENTRY BLOCKED][PAPER] Cool-down active ({elapsed:.0f}s < {COOLDOWN_SECONDS}s){RESET}")
+                logging.info(f"[ENTRY BLOCKED][PAPER] Cool-down active ({elapsed:.0f}s < {COOLDOWN_SECONDS}s)")
                 return
 
-        leg = "call_buy" if side == "CALL" else "put_buy"
-        logging.info(f"[DEBUG ENTRY] side={side}, leg={leg}, trade_flag={paper_info[leg]['trade_flag']}")
+        if not oscillator_entry_filter(side, candles_3m):
+            logging.info(f"[ENTRY BLOCKED][OSC] {side} skipped due to oscillator filter")
+            return
 
+        leg = "call_buy" if side == "CALL" else "put_buy"
         try:
             if paper_info[leg]["trade_flag"] == 0:
                 opt_type = "CE" if side == "CALL" else "PE"
@@ -910,17 +1008,18 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
                     moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
                 )
 
-                logging.info(f"[DEBUG ENTRY] opt_type={opt_type}, opt_name={opt_name}, strike={strike}")
-
                 if opt_name and opt_name in df.index:
                     entry_price = df.loc[opt_name, "ltp"] or spot_price
-                    logging.info(f"[DEBUG ENTRY] Using entry_price={entry_price}")
-
-                    levels = build_dynamic_levels(entry_price, side, atr)
+                    levels = build_dynamic_levels(entry_price, atr)
                     if any(v is None for v in levels):
                         logging.info(f"[ENTRY SKIPPED][PAPER] {side} ATR regime extreme, no levels built")
                         return
-                    stop, full_target, partial_target, trail_start, trail_step = levels
+                    stop, partial_target, full_target, trail_start, trail_step = levels
+
+                    # Detect expiry regime (Tuesday)
+                    weekday = dt.now(time_zone).weekday()
+                    expiry_flag = (weekday == 1)  # Tuesday
+                    regime_tag = "EXPIRY ENTRY" if expiry_flag else "VOLATILITY ENTRY"
 
                     paper_info[leg].update({
                         "option_name": opt_name,
@@ -946,17 +1045,17 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
                     paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
 
                     logging.info(
-                        f"{GREEN}[ENTRY][PAPER] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
+                        f"[ENTRY][PAPER][{regime_tag}] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
+                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}"
                     )
                 else:
                     logging.warning(f"[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}")
-            else:
-                logging.info(f"[ENTRY SKIPPED] {side} because trade_flag={paper_info[leg]['trade_flag']}")
         except Exception as e:
             logging.error(f"[ENTRY ERROR][PAPER] {e}", exc_info=True)
 
-    # 5. TRAILING STOP + EXIT MANAGEMENT
+
+
+    # 5. EXIT MANAGEMENT
     for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
         if paper_info[leg]["trade_flag"] != 1:
             continue
@@ -964,11 +1063,10 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
         price = df.loc[name, "ltp"] if name in df.index else None
         if price is None or pd.isna(price):
             continue
-        exit_triggered = process_order(side, name, price, paper_info, hist_data)
+        exit_triggered = process_order(side, name, price, paper_info, hist_yesterday_15m, spot_price, account_type="paper")
         if exit_triggered:
             paper_info["last_exit_time"] = dt.now(time_zone)
-            logging.info(f"{MAGENTA}[EXIT RECORDED][PAPER] {side} {name} at {paper_info['last_exit_time']}{RESET}")
-            # ✅ Update risk after exit
+            logging.info(f"[EXIT RECORDED][PAPER] {side} {name} at {paper_info['last_exit_time']}")
             update_risk(paper_info, risk_info)
 
     # 6. SAVE TRADES
@@ -979,6 +1077,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
         combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv")
     store(paper_info, account_type)
 
+
 # =============================== Live Trading =======================================
 
 # ===== real_order =====
@@ -987,7 +1086,7 @@ def live_order(candles_3m, hist_yesterday_15m=None):
 
     COOLDOWN_SECONDS = 180  # 3 minutes
 
-    # --- Safety reset: ensure no lingering trade_flag=2 ---
+    # --- Safety reset ---
     for leg in ["call_buy", "put_buy"]:
         if live_info[leg].get("trade_flag", 0) == 2:
             logging.warning(f"[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0")
@@ -1007,61 +1106,52 @@ def live_order(candles_3m, hist_yesterday_15m=None):
     if ct > end_time:
         logging.info("[LIVE] End time reached, closing open positions")
         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
-            if live_info[leg]["trade_flag"] == 1:  # still active
+            if live_info[leg]["trade_flag"] == 1:
                 name = live_info[leg]["option_name"]
                 qty  = live_info[leg]["quantity"]
-
                 success, order_id = send_live_exit_order(name, qty, "EOD")
                 if success:
                     exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
-                    cleanup_trade_exit(
-                        live_info, leg, side, name, qty, exit_price, "LIVE", "EOD"
-                    )
+                    cleanup_trade_exit(live_info, leg, side, name, qty, exit_price, "LIVE", "EOD")
                     update_order_status(order_id, "PENDING", qty, exit_price, name)
         return
 
     # 3. SIGNAL EVALUATION
     signal = None
-    if not candles_3m.empty:
+    if not candles_3m.empty and hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
         last_candle_time = candles_3m.iloc[-1]["time"]
         if last_signal_candle_time != last_candle_time:
             last_signal_candle_time = last_candle_time
-            atr, atr_source = resolve_atr(candles_3m, daily_atr)
-            logging.info(
-                f"{YELLOW}[SIGNAL EVAL][LIVE] candle={last_candle_time} "
-                f"candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}"
-            )
-            prev_day = hist_data.iloc[-1]
+            daily_val = daily_atr(hist_yesterday_15m)
+            atr, atr_source = resolve_atr(candles_3m, daily_val)
+            logging.info(f"[SIGNAL EVAL][LIVE] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}")
+            prev_day = hist_yesterday_15m.iloc[-1]
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
             trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
             cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
+            signal = detect_signal(cpr, trad, cam, candles_3m, hist_yesterday_15m, spot_price=spot_price, daily_atr=daily_val)
 
-            signal = detect_signal(
-                cpr, trad, cam,
-                candles_3m,
-                hist_yesterday_15m,
-                spot_price=spot_price,
-                daily_atr=daily_atr
-            )
-
-    # 4. LIVE ENTRY LOGIC
+    
+    # 4. LIVE ENTRY LOGIC (with oscillator filter + expiry logging)
     if signal:
         side, reason = signal
-        logging.info(f"{YELLOW}[SIGNAL][LIVE] {side} ({reason}) at spot={spot_price}{RESET}")
+        logging.info(f"[SIGNAL][LIVE] {side} ({reason}) at spot={spot_price}")
 
         if risk_info.get("halt_trading", False):
-            logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
+            logging.info("[ENTRY BLOCKED][RISK] Trading halted due to risk limits")
             return
 
         if live_info.get("last_exit_time"):
             elapsed = (dt.now(time_zone) - live_info["last_exit_time"]).total_seconds()
             if elapsed < COOLDOWN_SECONDS:
-                logging.info(f"{MAGENTA}[ENTRY BLOCKED][LIVE] Cool-down active ({elapsed:.0f}s < {COOLDOWN_SECONDS}s){RESET}")
+                logging.info(f"[ENTRY BLOCKED][LIVE] Cool-down active ({elapsed:.0f}s < {COOLDOWN_SECONDS}s)")
                 return
 
-        leg = "call_buy" if side == "CALL" else "put_buy"
-        logging.info(f"[DEBUG ENTRY][LIVE] side={side}, leg={leg}, trade_flag={live_info[leg]['trade_flag']}")
+        if not oscillator_entry_filter(side, candles_3m):
+            logging.info(f"[ENTRY BLOCKED][OSC] {side} skipped due to oscillator filter")
+            return
 
+        leg = "call_buy" if side == "CALL" else "put_buy"
         try:
             if live_info[leg]["trade_flag"] == 0:
                 opt_type = "CE" if side == "CALL" else "PE"
@@ -1072,11 +1162,16 @@ def live_order(candles_3m, hist_yesterday_15m=None):
 
                 if opt_name and opt_name in df.index:
                     entry_price = df.loc[opt_name, "ltp"] or spot_price
-                    levels = build_dynamic_levels(entry_price, side, atr)
+                    levels = build_dynamic_levels(entry_price, atr)
                     if any(v is None for v in levels):
                         logging.info(f"[ENTRY SKIPPED][LIVE] {side} ATR regime extreme, no levels built")
                         return
-                    stop, full_target, partial_target, trail_start, trail_step = levels
+                    stop, partial_target, full_target, trail_start, trail_step = levels
+
+                    # Detect expiry regime (Tuesday)
+                    weekday = dt.now(time_zone).weekday()
+                    expiry_flag = (weekday == 1)  # Tuesday
+                    regime_tag = "EXPIRY ENTRY" if expiry_flag else "VOLATILITY ENTRY"
 
                     success, order_id = send_live_entry_order(opt_name, quantity, 1)  # BUY side=1
                     if not success:
@@ -1107,17 +1202,15 @@ def live_order(candles_3m, hist_yesterday_15m=None):
                     live_info["trade_count"] = live_info.get("trade_count", 0) + 1
 
                     logging.info(
-                        f"{GREEN}[ENTRY][LIVE] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
+                        f"[ENTRY][LIVE][{regime_tag}] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
+                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}"
                     )
                 else:
-                    logging.warning(f"[ENTRY SKIPPED][LIVE] {side} no valid option found in df for strike={strike}")
-            else:
-                logging.info(f"[ENTRY SKIPPED][LIVE] {side} because trade_flag={live_info[leg]['trade_flag']}")
+                    logging.warning(f"[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}")
         except Exception as e:
             logging.error(f"[ENTRY ERROR][LIVE] {e}", exc_info=True)
 
-    # 5. TRAILING STOP + EXIT MANAGEMENT
+    # 5. EXIT MANAGEMENT
     for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
         if live_info[leg]["trade_flag"] != 1:
             continue
@@ -1125,10 +1218,10 @@ def live_order(candles_3m, hist_yesterday_15m=None):
         price = df.loc[name, "ltp"] if name in df.index else None
         if price is None or pd.isna(price):
             continue
-        exit_triggered = process_order(side, name, price, live_info, hist_data)
+        exit_triggered = process_order(side, name, price, live_info, hist_yesterday_15m, spot_price, account_type="live")
         if exit_triggered:
             live_info["last_exit_time"] = dt.now(time_zone)
-            logging.info(f"{MAGENTA}[EXIT RECORDED][LIVE] {side} {name} at {live_info['last_exit_time']}{RESET}")
+            logging.info(f"[EXIT RECORDED][LIVE] {side} {name} at {live_info['last_exit_time']}")
             update_risk(live_info, risk_info)
 
     # 6. SAVE TRADES
@@ -1140,54 +1233,8 @@ def live_order(candles_3m, hist_yesterday_15m=None):
     store(live_info, account_type)
 
 
-# def run_strategy(df_intraday, hist_yesterday_15m):
-#     """
-#     Main strategy runner:
-#     - Refreshes spot price
-#     - Builds 3m and 15m candles
-#     - Routes to paper/live order management
-#     """
 
-#     global spot_price
-
-#     # --- Refresh spot price ---
-#     try:
-#         quote = fyers.quotes(data={"symbols": ticker})
-#         spot_price = quote["d"][0]["v"]["lp"]
-#         logging.info(f"[SPOT REFRESH] Spot={spot_price}")
-#     except Exception as e:
-#         logging.warning(f"[SPOT REFRESH FAILED] {e}")
-#         return
-
-#     # --- Build 3m candles ---
-#     candles_3m = build_3min_candle(spot_price)
-#     if candles_3m.empty:
-#         logging.info("[RUN STRATEGY] No 3m candles available yet")
-#         return
-
-#     # --- Build 15m candles ---
-#     candles_15m = build_15m_candles(df_intraday)
-#     if candles_15m.empty:
-#         logging.info("[RUN STRATEGY] No 15m candles available yet")
-#         return
-
-#     # --- Route to paper/live order with candles passed in ---
-#     if account_type.upper() == "PAPER":
-#         paper_order(hist_yesterday_15m, candles_3m)
-#     else:
-#         live_order(hist_yesterday_15m, candles_3m)
-
-# if __name__ == "__main__":
-#     # Example: run once
-#     run_strategy(df, hist_data)
-
-#     # Or: run continuously every 3 minutes until end_time
-#     import time
-#     while dt.now(time_zone) < end_time:
-#         run_strategy(df, hist_data)
-#         time.sleep(180)  # sleep for 3 minutes
-
-
+# ============================================== RUN Strategy ==============================================
 
 # --- Helper: sleep until next boundary ---
 def sleep_until_next_boundary(interval=180, tz="Asia/Kolkata"):
@@ -1224,7 +1271,7 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
                 continue
 
             # --- Delegate candles + signal detection ---
-            signal = update_candles_and_signals(
+            signal, candles_3m = update_candles_and_signals(
                 symbol=sym,
                 hist_yesterday_15m=hist_yesterday_15m.get(sym),
                 spot_price=spot_price   # ✅ pass spot price down
@@ -1235,9 +1282,9 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
                 side, reason = signal
                 logging.info(f"[SIGNAL FIRED] {sym} side={side} reason={reason}")
                 if account_type.upper() == "PAPER":
-                    paper_order(hist_yesterday_15m[sym], signal)
+                    paper_order(candles_3m, hist_yesterday_15m[sym])
                 else:
-                    live_order(hist_yesterday_15m[sym], signal)
+                    live_order(candles_3m, hist_yesterday_15m[sym])
 
             # --- Extra bias logic on 15m close ---
             if now.minute % 15 == 0 and now.second == 0:
@@ -1257,6 +1304,7 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
                     atr_str = f"{atr_value:.2f}" if atr_value is not None else "NA"
                     logging.info(f"[ATR] {sym} source={atr_source} value={atr_str}")
 
+
                     
 if __name__ == "__main__":
     symbols = ["NSE:NIFTY50-INDEX"]  # restrict to indices only
@@ -1270,5 +1318,9 @@ if __name__ == "__main__":
         sym: tick_db.fetch_candles("15m", use_yesterday=True, symbol=sym)
         for sym in symbols
     }
+
+    # ✅ Visibility: log how many 15m candles were bootstrapped per symbol
+    for sym, df in hist_yesterday_15m.items():
+        logging.info(f"[BOOTSTRAP] {sym} yesterday 15m candles={len(df)}")
 
     run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=end_time)

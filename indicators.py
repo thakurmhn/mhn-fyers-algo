@@ -197,19 +197,20 @@ def cci_bias(df, period=20, threshold=100):
         return "NEUTRAL"
 
 
-def supertrend(df, atr_val=None, period=10, multiplier=3):
+def supertrend(df, atr_val=None, period=10, multiplier=3, slope_lookback=5):
     """
-    Compute Supertrend bias.
+    Compute Supertrend bias and slope.
     - df: DataFrame with 'high','low','close'
     - atr_val: optional float ATR override
     - period: ATR period if computing internally
     - multiplier: Supertrend multiplier
-    Returns "BULLISH", "BEARISH", or "NEUTRAL"
+    - slope_lookback: number of candles to measure slope
+    Returns dict: {"bias": "BULLISH/BEARISH/NEUTRAL", "slope": "UP/DOWN/FLAT"}
     """
 
     if df is None or df.empty:
         logging.warning("[SUPERTREND] No candles provided")
-        return "NEUTRAL"
+        return {"bias": "NEUTRAL", "slope": "FLAT"}
 
     # --- ATR resolution ---
     if atr_val is None or pd.isna(atr_val):
@@ -220,7 +221,7 @@ def supertrend(df, atr_val=None, period=10, multiplier=3):
         atr_series = tr.rolling(period).mean().dropna()
         if atr_series.empty:
             logging.warning("[SUPERTREND] ATR unavailable")
-            return "NEUTRAL"
+            return {"bias": "NEUTRAL", "slope": "FLAT"}
         atr_val = float(atr_series.iloc[-1])
         logging.debug(f"[SUPERTREND] ATR calculated={atr_val:.2f}")
     else:
@@ -229,30 +230,37 @@ def supertrend(df, atr_val=None, period=10, multiplier=3):
             logging.debug(f"[SUPERTREND] ATR override={atr_val:.2f}")
         except Exception:
             logging.error("[SUPERTREND] Invalid ATR override")
-            return "NEUTRAL"
+            return {"bias": "NEUTRAL", "slope": "FLAT"}
 
     # --- Supertrend bands ---
-    last = df.iloc[-1]
-    hl2 = (last.high + last.low) / 2
-    upper_band = hl2 + (multiplier * atr_val)
-    lower_band = hl2 - (multiplier * atr_val)
-
-    logging.debug(
-        f"[SUPERTREND] hl2={hl2:.2f}, upper={upper_band:.2f}, "
-        f"lower={lower_band:.2f}, close={last.close:.2f}"
-    )
+    hl2 = (df['high'] + df['low']) / 2
+    upperband = hl2 + (multiplier * atr_val)
+    lowerband = hl2 - (multiplier * atr_val)
 
     # --- Bias decision ---
-    if last.close > upper_band:
-        logging.info("[SUPERTREND] Bias=BULLISH")
-        return "BULLISH"
-    elif last.close < lower_band:
-        logging.info("[SUPERTREND] Bias=BEARISH")
-        return "BEARISH"
+    last = df.iloc[-1]
+    if last.close > upperband.iloc[-1]:
+        bias = "BULLISH"
+    elif last.close < lowerband.iloc[-1]:
+        bias = "BEARISH"
     else:
-        logging.info("[SUPERTREND] Bias=NEUTRAL")
-        return "NEUTRAL"
+        bias = "NEUTRAL"
 
+    # --- Slope detection ---
+    if len(hl2) >= slope_lookback:
+        slope_val = hl2.iloc[-1] - hl2.iloc[-slope_lookback]
+        threshold = 0.2 * atr_val  # avoid noise
+        if abs(slope_val) <= threshold:
+            slope = "FLAT"
+        elif slope_val > 0:
+            slope = "UP"
+        else:
+            slope = "DOWN"
+    else:
+        slope = "FLAT"
+
+    logging.info(f"[SUPERTREND] Bias={bias} Slope={slope}")
+    return {"bias": bias, "slope": slope}
 
 
 def calculate_adx(df, period=14):
@@ -362,10 +370,12 @@ def check_bias(candles_15m, daily_atr=None):
 
     # --- Compute indicators ---
     try:
-        st_val = supertrend(candles_15m, atr_val)
+        st_result = supertrend(candles_15m, atr_val)  # dict: {"bias":..., "slope":...}
+        st_val = st_result.get("bias", "NEUTRAL")
+        st_slope = st_result.get("slope", "FLAT")
     except Exception as e:
         logging.error(f"[BIAS DEBUG] Supertrend calc failed: {e}")
-        st_val = "NEUTRAL"
+        st_val, st_slope = "NEUTRAL", "FLAT"
 
     try:
         ema_val = ema_bias(candles_15m)
@@ -393,7 +403,10 @@ def check_bias(candles_15m, daily_atr=None):
         if val in scores:
             scores[val] += weights[name]
 
-    logging.info(f"[BIAS CHECK] ATR={atr_val} ADX={adx_val} Supertrend={st_val} EMA={ema_val} CCI={cci_val}")
+    logging.info(
+        f"[BIAS CHECK] ATR={atr_val} ADX={adx_val} "
+        f"Supertrend={st_val} (Slope={st_slope}) EMA={ema_val} CCI={cci_val}"
+    )
     logging.info(f"[BIAS SCORES] BULLISH={scores['BULLISH']} BEARISH={scores['BEARISH']}")
 
     if scores["BULLISH"] > scores["BEARISH"]:
@@ -405,20 +418,6 @@ def check_bias(candles_15m, daily_atr=None):
     else:
         logging.info("[BIAS RESULT] NEUTRAL (weighted tie)")
         return "NEUTRAL"
-
-def williams_r(candles, period=14):
-    if len(candles) < period:
-        logging.warning("[W%R] Not enough candles")
-        return np.nan
-    highest_high = candles['high'].tail(period).max()
-    lowest_low   = candles['low'].tail(period).min()
-    last_close   = candles['close'].iloc[-1]
-    if highest_high == lowest_low:
-        logging.warning("[W%R] Invalid range (high == low)")
-        return np.nan
-    wr = ((highest_high - last_close) / (highest_high - lowest_low)) * -100
-    logging.debug(f"[W%R] high={highest_high:.2f}, low={lowest_low:.2f}, close={last_close:.2f}, W%R={wr:.2f}")
-    return wr
 
 
 def cci_indicator(candles, period=20):
@@ -435,6 +434,35 @@ def cci_indicator(candles, period=20):
     logging.debug(f"[CCI] tp={tp.iloc[-1]:.2f}, ma={ma:.2f}, md={md:.2f}, CCI={cci:.2f}")
     return cci
 
+def williams_r(candles, period=14):
+    """
+    Compute Williams %R oscillator.
+    - candles: DataFrame with 'high','low','close'
+    - period: lookback period (default=14)
+    Returns float W%R value in range [-100, 0].
+    """
+
+    if candles is None or candles.empty or len(candles) < period:
+        logging.warning("[W%R] Not enough candles")
+        return np.nan
+
+    # --- Highest high and lowest low over lookback ---
+    highest_high = candles['high'].tail(period).max()
+    lowest_low   = candles['low'].tail(period).min()
+    last_close   = candles['close'].iloc[-1]
+
+    if highest_high == lowest_low:
+        logging.warning("[W%R] Invalid range (high == low)")
+        return np.nan
+
+    # --- Williams %R formula ---
+    wr = ((highest_high - last_close) / (highest_high - lowest_low)) * -100
+
+    logging.debug(
+        f"[W%R] high={highest_high:.2f}, low={lowest_low:.2f}, "
+        f"close={last_close:.2f}, W%R={wr:.2f}"
+    )
+    return wr
 
 def oscillator_entry_filter(side, candles_3m):
     if len(candles_3m) < 20:
