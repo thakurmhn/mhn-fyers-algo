@@ -25,6 +25,7 @@ YELLOW  = "\033[93m"
 RED     = "\033[91m"
 MAGENTA = "\033[95m"
 GRAY    = "\033[90m"
+CYAN    = "\033[96m"
 # ===========================================================
 
 # ===== Pivot Calculations =====
@@ -130,7 +131,7 @@ def momentum_ok(candles, side):
 def calculate_ema(series, period=20):
     """Exponential Moving Average (EMA)."""
     if series is None or len(series) == 0:
-        logging.error("[EMA] Empty or invalid series")
+        logging.error(f"{CYAN}[EMA] Empty or invalid series{RESET}")
         return pd.Series(dtype=float)
     if not isinstance(series, pd.Series):
         series = pd.Series(series)
@@ -141,7 +142,7 @@ def calculate_ema(series, period=20):
 def calculate_cci(df, period=20):
     """Commodity Channel Index (CCI)."""
     if not {"high","low","close"}.issubset(df.columns):
-        logging.error("[CCI] Missing required columns")
+        logging.error(f"{CYAN}[CCI] Missing required columns{RESET}")
         return pd.Series(dtype=float)
     tp = (df["high"] + df["low"] + df["close"]) / 3
     ma = tp.rolling(period).mean()
@@ -404,19 +405,19 @@ def check_bias(candles_15m, daily_atr=None):
             scores[val] += weights[name]
 
     logging.info(
-        f"[BIAS CHECK] ATR={atr_val} ADX={adx_val} "
-        f"Supertrend={st_val} (Slope={st_slope}) EMA={ema_val} CCI={cci_val}"
+        f"{YELLOW}[BIAS CHECK] ATR={atr_val} ADX={adx_val}{RESET} "
+        f"{YELLOW}Supertrend={st_val} (Slope={st_slope}) EMA={ema_val} CCI={cci_val}{RESET}"
     )
-    logging.info(f"[BIAS SCORES] BULLISH={scores['BULLISH']} BEARISH={scores['BEARISH']}")
+    logging.info(f"{YELLOW}[BIAS SCORES] BULLISH={scores['BULLISH']} BEARISH={scores['BEARISH']}{RESET}")
 
     if scores["BULLISH"] > scores["BEARISH"]:
-        logging.info("[BIAS RESULT] BULLISH (weighted)")
+        logging.info(f"{YELLOW}[BIAS RESULT] BULLISH (weighted){RESET}")
         return "BULLISH"
     elif scores["BEARISH"] > scores["BULLISH"]:
-        logging.info("[BIAS RESULT] BEARISH (weighted)")
+        logging.info(f"{YELLOW}[BIAS RESULT] BEARISH (weighted){RESET}")
         return "BEARISH"
     else:
-        logging.info("[BIAS RESULT] NEUTRAL (weighted tie)")
+        logging.info(f"{CYAN}[BIAS RESULT] NEUTRAL (weighted tie){RESET}")
         return "NEUTRAL"
 
 
@@ -466,18 +467,18 @@ def williams_r(candles, period=14):
 
 def oscillator_entry_filter(side, candles_3m):
     if len(candles_3m) < 20:
-        logging.warning("[ENTRY FILTER][OSC] Not enough candles, allowing entry")
+        logging.warning(f"{CYAN}[ENTRY FILTER][OSC] Not enough candles, allowing entry{RESET}")
         return True
     wr  = williams_r(candles_3m)
     cci = cci_indicator(candles_3m)
     if np.isnan(wr) or np.isnan(cci):
-        logging.warning("[ENTRY FILTER][OSC] Oscillator NaN, allowing entry")
+        logging.warning(f"{CYAN}[ENTRY FILTER][OSC] Oscillator NaN, allowing entry{RESET}")
         return True
     if side == "CALL" and (wr >= -10 or cci >= 200):
-        logging.info(f"[ENTRY BLOCKED][OSC] CALL skipped (W%R={wr:.2f}, CCI={cci:.2f})")
+        logging.info(f"{CYAN}[ENTRY BLOCKED][OSC] CALL skipped (W%R={wr:.2f}, CCI={cci:.2f}){RESET}")
         return False
     if side == "PUT" and (wr <= -90 or cci <= -200):
-        logging.info(f"[ENTRY BLOCKED][OSC] PUT skipped (W%R={wr:.2f}, CCI={cci:.2f})")
+        logging.info(f"{CYAN}[ENTRY BLOCKED][OSC] PUT skipped (W%R={wr:.2f}, CCI={cci:.2f}){RESET}")
         return False
     return True
 
@@ -493,16 +494,16 @@ def oscillator_exit_trigger(side, candles_15m):
         return False, ""
     if side == "CALL":
         if wr >= -5:
-            logging.info(f"[EXIT SIGNAL][OSC] CALL exit W%R={wr:.2f}")
+            logging.info(f"{YELLOW}[EXIT SIGNAL][OSC] CALL exit W%R={wr:.2f}{RESET}")
             return True, "W%R near 0 (overbought extreme)"
         if cci >= 200:
-            logging.info(f"[EXIT SIGNAL][OSC] CALL exit CCI={cci:.2f}")
+            logging.info(f"{YELLOW}[EXIT SIGNAL][OSC] CALL exit CCI={cci:.2f}{RESET}")
             return True, f"CCI={cci:.2f} >= 200 (bullish extreme)"
     elif side == "PUT":
         if wr <= -95:
-            logging.info(f"[EXIT SIGNAL][OSC] PUT exit W%R={wr:.2f}")
+            logging.info(f"{YELLOW}[EXIT SIGNAL][OSC] PUT exit W%R={wr:.2f}{RESET}")
             return True, "W%R near -100 (oversold extreme)"
         if cci <= -200:
-            logging.info(f"[EXIT SIGNAL][OSC] PUT exit CCI={cci:.2f}")
+            logging.info(f"{YELLOW}[EXIT SIGNAL][OSC] PUT exit CCI={cci:.2f}{RESET}")
             return True, f"CCI={cci:.2f} <= -200 (bearish extreme)"
     return False, ""

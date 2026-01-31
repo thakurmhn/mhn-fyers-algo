@@ -3,6 +3,16 @@ import pandas as pd
 import pendulum as dt
 from config import time_zone
 
+# ANSI COLORS
+RESET   = "\033[0m"
+GREEN   = "\033[92m"
+YELLOW  = "\033[93m"
+RED     = "\033[91m"
+MAGENTA = "\033[95m"
+GRAY    = "\033[90m"
+CYAN    = "\033[96m"
+
+
 # ===== Candle Builder (3m) =====
 def build_3min_candle(df_ticks, tick_db, symbol):
     """Incrementally build and persist 3m candles for a given symbol."""
@@ -20,7 +30,7 @@ def build_3min_candle(df_ticks, tick_db, symbol):
         df_ticks['timestamp'] = pd.to_datetime(df_ticks['timestamp'], errors='coerce')
         df_ticks = df_ticks.dropna(subset=['timestamp'])
         if df_ticks.empty:
-            logging.debug(f"[CANDLE BUILDER] No valid rows after cleaning for {symbol}, skipping")
+            logging.debug(f"{CYAN}[CANDLE BUILDER] No valid rows after cleaning for {symbol}, skipping{RESET}")
             return pd.DataFrame()
 
         df_ticks.set_index('timestamp', inplace=True)
@@ -170,7 +180,7 @@ def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
             new_rows.append((ts, row))
 
         if new_rows:
-            logging.info(f"[CANDLE BUILDER] Added {len(new_rows)} new 15m candles for {symbol}")
+            logging.info(f"{CYAN}[CANDLE BUILDER] Added {len(new_rows)} new 15m candles for {symbol}{RESET}")
         else:
             logging.debug(f"[CANDLE BUILDER] No new 15m candles for {symbol}")
 
@@ -194,5 +204,5 @@ def get_today_15m_candles(hist_data):
         df = prepare_intraday(hist_data, target_date=today)
         return resample_15m(df)
     except Exception as e:
-        logging.error(f"[get_today_15m_candles ERROR] {e}")
+        logging.error(f"{RED}[get_today_15m_candles ERROR] {e}{RESET}")
         return pd.DataFrame()

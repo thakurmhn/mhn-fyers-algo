@@ -19,17 +19,14 @@ from indicators import (
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
 # ANSI COLORS
 RESET   = "\033[0m"
+GREEN   = "\033[92m"
+YELLOW  = "\033[93m"
+RED     = "\033[91m"
+MAGENTA = "\033[95m"
 GRAY    = "\033[90m"
 CYAN    = "\033[96m"
-
 
 
 # symbols = [
@@ -64,11 +61,11 @@ def print_daily_levels():
         atr_regime = "HIGH" if atr_value and atr_value > 120 else "LOW"
 
         logging.info(
-            f"[{sym}] CPR: Pivot={cpr_levels_base['pivot']}, TC={cpr_levels_base['tc']}, BC={cpr_levels_base['bc']} | "
+            f"{GREEN}[{sym}] CPR: Pivot={cpr_levels_base['pivot']}, TC={cpr_levels_base['tc']}, BC={cpr_levels_base['bc']} | "
             f"Traditional: Pivot={traditional_levels_base['pivot']}, R1={traditional_levels_base['r1']}, S1={traditional_levels_base['s1']} | "
             f"Camarilla: R3={camarilla_levels_base['r3']}, R4={camarilla_levels_base['r4']}, "
             f"S3={camarilla_levels_base['s3']}, S4={camarilla_levels_base['s4']} | "
-            f"ATR={atr_display} ({atr_source}, {atr_regime})"
+            f"ATR={atr_display} ({atr_source}, {atr_regime}){RESET}"
         )
 
 async def main_strategy_code():

@@ -12,6 +12,10 @@ from tickdb import TickDatabase   # dedicated DB helper
 
 # ANSI COLORS
 RESET   = "\033[0m"
+GREEN   = "\033[92m"
+YELLOW  = "\033[93m"
+RED     = "\033[91m"
+MAGENTA = "\033[95m"
 GRAY    = "\033[90m"
 CYAN    = "\033[96m"
 
@@ -51,14 +55,14 @@ def onmessage(ticks):
             tick_db.insert_tick(symbol, bid, ask, ltp, vol)
             logging.info(f"{GRAY}[TICK SAVED] {symbol} LTP={ltp} VOL={vol}{RESET}")
         except Exception as e:
-            logging.error(f"[DB ERROR] Failed to insert tick: {e}")
+            logging.error(f"{RED}[DB ERROR] Failed to insert tick: {e}{RESET}")
 
         spot_price = ltp
         try:
             df_ticks = tick_db.fetch_ticks(symbol)
             build_3min_candle(df_ticks, tick_db, symbol)
         except Exception as e:
-            logging.error(f"[CANDLE ERROR] Failed to build candle for {symbol}: {e}")
+            logging.error(f"{RED}[CANDLE ERROR] Failed to build candle for {symbol}: {e}{RESET}")
 
 def onerror(message): logging.error(f"[SOCKET ERROR] {message}")
 def onclose(message): logging.info(f"[SOCKET CLOSED] {message}")

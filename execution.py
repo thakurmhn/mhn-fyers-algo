@@ -23,6 +23,9 @@ from indicators import (
     oscillator_exit_trigger,
     oscillator_entry_filter
 )
+
+from signals import detect_signal, evaluate_candle
+
 from candle_builder import build_3min_candle, build_15m_candles, get_today_15m_candles
 from signals import detect_signal, evaluate_candle
 from tickdb import tick_db
@@ -189,66 +192,6 @@ def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
 
     return sel.squeeze(), strike
 
-import logging
-from candle_builder import build_3min_candle, build_15m_candles
-from indicators import (
-    calculate_cpr,
-    calculate_traditional_pivots,
-    calculate_camarilla_pivots,
-    daily_atr
-)
-from signals import detect_signal, evaluate_candle
-
-# def run_strategy(spot_price, hist_yesterday_15m, df_intraday):
-#     # --- 3m candles ---
-#     candles_3m = build_3min_candle(spot_price)
-#     if not candles_3m.empty:
-#         last_row = candles_3m.iloc[-1]
-#         cpr  = calculate_cpr(last_row["high"], last_row["low"], last_row["close"])
-#         trad = calculate_traditional_pivots(last_row["high"], last_row["low"], last_row["close"])
-#         cam  = calculate_camarilla_pivots(last_row["high"], last_row["low"], last_row["close"])
-
-#         signal = detect_signal(
-#             cpr, trad, cam,
-#             candles_3m,
-#             hist_yesterday_15m,
-#             spot_price=spot_price,
-#             daily_atr=daily_atr
-#         )
-#         if signal:
-#             side, reason = signal
-#             logging.info(f"[SIGNAL][3M] {side} ({reason}) at spot={spot_price}")
-
-#     # --- 15m candles ---
-#     candles_15m = build_15m_candles(df_intraday)
-#     if not candles_15m.empty:
-#         last_ts, last_row = candles_15m.index[-1], candles_15m.iloc[-1]
-#         evaluate_candle(last_ts, last_row, candles_15m, resolution="15m", spot=spot_price, side="CALL")
-
-# Original function commented, based on fix profit_loss_points 
-
-
-# ===== Dynamic levels =====
-# def build_dynamic_levels(entry_price, side, atr, rr_ratio=2.0):
-#     """
-#     Build stop-loss, partial/full targets, and trailing parameters.
-#     Long-only logic (same for CALL and PUT):
-#     - Stop below entry
-#     - Targets above entry
-#     """
-#     risk_points   = max(profit_loss_point, atr * 0.25)
-#     reward_points = risk_points * rr_ratio
-
-#     stop  = entry_price - risk_points
-#     partial_target = entry_price + reward_points / 2
-#     full_target    = entry_price + reward_points
-
-#     trail_start = reward_points / 2
-#     trail_step  = atr * 0.1
-
-#     return stop, full_target, partial_target, trail_start, trail_step
-
-
 # Dynamic ATR based SL/PT/TG 
 
 def build_dynamic_levels(entry_price, atr, rr_ratio=2.0, profit_loss_point=5):
@@ -292,11 +235,11 @@ def build_dynamic_levels(entry_price, atr, rr_ratio=2.0, profit_loss_point=5):
 
         if is_expiry_day:
             logging.info(
-                f"[LEVELS][EXPIRY-NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}"
+                f"{CYAN}[LEVELS][EXPIRY-NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
             )
         else:
             logging.info(
-                f"[LEVELS][NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}"
+                f"{CYAN}[LEVELS][NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
             )
 
     elif mode == "volatile":
@@ -312,21 +255,21 @@ def build_dynamic_levels(entry_price, atr, rr_ratio=2.0, profit_loss_point=5):
 
         if is_expiry_day:
             logging.info(
-                f"[LEVELS][EXPIRY-VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}"
+                f"{CYAN}[LEVELS][EXPIRY-VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
             )
         else:
             logging.info(
-                f"[LEVELS][VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}"
+                f"{CYAN}[LEVELS][VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
             )
 
     else:
         if is_expiry_day:
             logging.warning(
-                f"[LEVELS][EXPIRY-EXTREME] ATR={atr:.2f} → Trade skipped due to excessive expiry-day volatility"
+                f"{CYAN}[LEVELS][EXPIRY-EXTREME] ATR={atr:.2f} → Trade skipped due to excessive expiry-day volatility{RESET}"
             )
         else:
             logging.warning(
-                f"[LEVELS][EXTREME] ATR={atr:.2f} → Trade skipped due to excessive volatility"
+                f"{CYAN}[LEVELS][EXTREME] ATR={atr:.2f} → Trade skipped due to excessive volatility{RESET}"
             )
         return None, None, None, None, None
 
@@ -347,7 +290,7 @@ def update_trailing_stop(current_price, entry_price, current_stop, trail_start_p
         new_stop = max(current_stop, candidate)
         if new_stop != current_stop:
             logging.info(
-                f"[TRAIL UPDATE] Stop moved from {current_stop:.2f} → {new_stop:.2f}"
+                f"{YELLOW}[TRAIL UPDATE] Stop moved from {current_stop:.2f} → {new_stop:.2f}{RESET}"
             )
         return new_stop
 
@@ -551,13 +494,15 @@ def send_live_entry_order(symbol, qty, side, buffer=ENTRY_OFFSET):
         response = fyers.place_order(data=order_data)
 
         if response.get("s") == "ok":
+            logging.info(f"{YELLOW}[LIVE ENTRY] {symbol} Qty={qty}{RESET}")
             return True, response.get("id")
+
         else:
-            logging.error(f"[LIVE ENTRY FAILED] {symbol} {response}")
+            logging.error(f"{CYAN}[LIVE ENTRY FAILED] {symbol} {response}{RESET}")
             return False, None
 
     except Exception as e:
-        logging.error(f"[LIVE ENTRY ERROR] {symbol} {e}")
+        logging.error(f"{CYAN}[LIVE ENTRY ERROR] {symbol} {e}{RESET}")
         return False, None
 
 
@@ -591,16 +536,16 @@ def send_live_exit_order(symbol, qty, reason):
 
         if response.get("s") == "ok":
             logging.info(
-                f"{MAGENTA}[LIVE EXIT][{reason}] {symbol} Qty={qty} "
+                f"{YELLOW}[LIVE EXIT][{reason}] {symbol} Qty={qty}{RESET}"
                 f"OrderID={response.get('id')}{RESET}"
             )
             return True, response.get("id")
         else:
-            logging.error(f"[LIVE EXIT FAILED] {symbol} {response}")
+            logging.error(f"{RED}[LIVE EXIT FAILED] {symbol} {response}{RESET}")
             return False, None
 
     except Exception as e:
-        logging.error(f"{RED}[LIVE EXIT ERROR] {symbol} {e}{RESET}")
+        logging.error(f"{RED}{RED}[LIVE EXIT ERROR] {symbol} {e}{RESET}{RESET}")
         return False, None
     
 def send_paper_exit_order(symbol, qty, reason):
@@ -610,7 +555,7 @@ def send_paper_exit_order(symbol, qty, reason):
     - Always log the exit with reason and quantity
     - Return success flag and synthetic order_id
     """
-    logging.info(f"{MAGENTA}[PAPER EXIT][{reason}] {symbol} Qty={qty}{RESET}")
+    logging.info(f"{CYAN}[PAPER EXIT][{reason}] {symbol} Qty={qty}{RESET}")
     return True, f"paper_exit_{symbol}_{reason}"
 
 def update_order_status(order_id, status, filled_qty, avg_price, symbol):
@@ -727,9 +672,9 @@ def process_order(side, symbol, price, info, hist_data_3m, hist_data_15m, spot_p
                 trade.get("full_target_price", 0), spot_price, qty
             ]
             logging.info(
-                f"[EXIT][{account_type.upper()} STOPLOSS][{regime_tag}] LONG {side} {symbol} "
+                f"{YELLOW}[EXIT][{account_type.upper()} STOPLOSS][{regime_tag}] LONG {side} {symbol} "
                 f"Qty={qty} Entry={entry:.2f} Exit={price:.2f} "
-                f"PnL={pnl_value:.2f} (points={pnl_points:.2f})"
+                f"PnL={pnl_value:.2f} (points={pnl_points:.2f}){RESET}"
             )
             update_order_status(order_id, "PENDING", qty, price, symbol)
             return True
@@ -757,9 +702,9 @@ def process_order(side, symbol, price, info, hist_data_3m, hist_data_15m, spot_p
                         trade.get("full_target_price", 0), spot_price, qty
                     ]
                     logging.info(
-                        f"[EXIT][{account_type.upper()} OSCILLATOR-HARD][{regime_tag}] LONG {side} {symbol} "
+                        f"{YELLOW}[EXIT][{account_type.upper()} OSCILLATOR-HARD][{regime_tag}] LONG {side} {symbol} "
                         f"Qty={qty} Entry={entry:.2f} Exit={price:.2f} "
-                        f"PnL={pnl_value:.2f} (points={pnl_points:.2f}) Reason={reason}"
+                        f"PnL={pnl_value:.2f} (points={pnl_points:.2f}) Reason={reason}{RESET}"
                     )
                     update_order_status(order_id, "PENDING", qty, price, symbol)
                     return True
@@ -802,9 +747,9 @@ def process_order(side, symbol, price, info, hist_data_3m, hist_data_15m, spot_p
                     trade.get("full_target_price", 0), spot_price, half_qty
                 ]
                 logging.info(
-                    f"[EXIT][{account_type.upper()} PARTIAL][{regime_tag}] LONG {side} {symbol} "
+                    f"{YELLOW}[EXIT][{account_type.upper()} PARTIAL][{regime_tag}] LONG {side} {symbol} "
                     f"HalfQty={half_qty} Entry={entry:.2f} Exit={price:.2f} "
-                    f"PnL={pnl_value:.2f} (points={pnl_points:.2f})"
+                    f"PnL={pnl_value:.2f} (points={pnl_points:.2f}){RESET}"
                 )
                 update_order_status(order_id, "PENDING", half_qty, price, symbol)
 
@@ -836,9 +781,9 @@ def process_order(side, symbol, price, info, hist_data_3m, hist_data_15m, spot_p
                 trade.get("full_target_price", 0), spot_price, qty
             ]
             logging.info(
-                f"[EXIT][{account_type.upper()} TARGET][{regime_tag}] LONG {side} {symbol} "
+                f"{YELLOW}[EXIT][{account_type.upper()} TARGET][{regime_tag}] LONG {side} {symbol} "
                 f"Qty={qty} Entry={entry:.2f} Exit={price:.2f} "
-                f"PnL={pnl_value:.2f} (points={pnl_points:.2f})"
+                f"PnL={pnl_value:.2f} (points={pnl_points:.2f}){RESET}"
             )
             update_order_status(order_id, "PENDING", qty, price, symbol)
             return True
@@ -854,15 +799,15 @@ def process_order(side, symbol, price, info, hist_data_3m, hist_data_15m, spot_p
         )
         if new_stop != trade.get("current_stop_price", entry):
             trade["current_stop_price"] = new_stop
-            logging.info(f"[TRAIL STOP UPDATE][{regime_tag}] {symbol} new SL={new_stop:.2f}")
+            logging.info(f"{YELLOW}[TRAIL STOP UPDATE][{regime_tag}] {symbol} new SL={new_stop:.2f}{RESET}")
 
     # --- MTM Logging ---
     mtm_points = price - entry
     mtm_value  = mtm_points * trade["quantity"]
     logging.info(
-        f"{account_type.capitalize()} MTM LONG {side} {symbol} "
+        f"{CYAN}{account_type.capitalize()} MTM LONG {side} {symbol} "
         f"LTP={price:.2f} Entry={entry:.2f} Qty={trade['quantity']} "
-        f"MTM={mtm_value:.2f} (points={mtm_points:.2f})"
+        f"MTM={mtm_value:.2f} (points={mtm_points:.2f}){RESET}"
     )
 
     return False
@@ -936,7 +881,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
     # --- Safety reset ---
     for leg in ["call_buy", "put_buy"]:
         if paper_info[leg].get("trade_flag", 0) == 2:
-            logging.warning(f"[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0")
+            logging.warning(f"{CYAN}[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0{RESET}")
             paper_info[leg]["trade_flag"] = 0
     
     ct = dt.now(time_zone)
@@ -971,7 +916,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
             last_signal_candle_time = last_candle_time
             daily_val = daily_atr(hist_yesterday_15m)
             atr, atr_source = resolve_atr(candles_3m, daily_val)
-            logging.info(f"[SIGNAL EVAL][PAPER] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}")
+            logging.info(f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}")
             prev_day = hist_yesterday_15m.iloc[-1]
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
             trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
@@ -983,20 +928,20 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
 
     if signal:
         side, reason = signal
-        logging.info(f"[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}")
+        logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}{RESET}")
 
         if risk_info.get("halt_trading", False):
-            logging.info("[ENTRY BLOCKED][RISK] Trading halted due to risk limits")
+            logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
             return
 
         if paper_info.get("last_exit_time"):
             elapsed = (dt.now(time_zone) - paper_info["last_exit_time"]).total_seconds()
             if elapsed < COOLDOWN_SECONDS:
-                logging.info(f"[ENTRY BLOCKED][PAPER] Cool-down active ({elapsed:.0f}s < {COOLDOWN_SECONDS}s)")
+                logging.info(f"{MAGENTA}[ENTRY BLOCKED][PAPER] Cool-down active ({elapsed:.0f}s < {COOLDOWN_SECONDS}s){RESET}")
                 return
 
         if not oscillator_entry_filter(side, candles_3m):
-            logging.info(f"[ENTRY BLOCKED][OSC] {side} skipped due to oscillator filter")
+            logging.info(f"{MAGENTA}[ENTRY BLOCKED][OSC] {side} skipped due to oscillator filter{RESET}")
             return
 
         leg = "call_buy" if side == "CALL" else "put_buy"
@@ -1012,7 +957,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
                     entry_price = df.loc[opt_name, "ltp"] or spot_price
                     levels = build_dynamic_levels(entry_price, atr)
                     if any(v is None for v in levels):
-                        logging.info(f"[ENTRY SKIPPED][PAPER] {side} ATR regime extreme, no levels built")
+                        logging.info(f"{CYAN}[ENTRY SKIPPED][PAPER] {side} ATR regime extreme, no levels built{RESET}")
                         return
                     stop, partial_target, full_target, trail_start, trail_step = levels
 
@@ -1045,11 +990,11 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
                     paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
 
                     logging.info(
-                        f"[ENTRY][PAPER][{regime_tag}] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}"
+                        f"{GREEN}[ENTRY][PAPER][{regime_tag}] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
+                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
                     )
                 else:
-                    logging.warning(f"[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}")
+                    logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}{CYAN}")
         except Exception as e:
             logging.error(f"[ENTRY ERROR][PAPER] {e}", exc_info=True)
 
@@ -1066,7 +1011,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
         exit_triggered = process_order(side, name, price, paper_info, hist_yesterday_15m, spot_price, account_type="paper")
         if exit_triggered:
             paper_info["last_exit_time"] = dt.now(time_zone)
-            logging.info(f"[EXIT RECORDED][PAPER] {side} {name} at {paper_info['last_exit_time']}")
+            logging.info(f"{YELLOW}[EXIT RECORDED][PAPER] {side} {name} at {paper_info['last_exit_time']}{RESET}")
             update_risk(paper_info, risk_info)
 
     # 6. SAVE TRADES
@@ -1089,7 +1034,7 @@ def live_order(candles_3m, hist_yesterday_15m=None):
     # --- Safety reset ---
     for leg in ["call_buy", "put_buy"]:
         if live_info[leg].get("trade_flag", 0) == 2:
-            logging.warning(f"[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0")
+            logging.warning(f"{CYAN}[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0{RESET}")
             live_info[leg]["trade_flag"] = 0
 
     ct = dt.now(time_zone)
@@ -1124,7 +1069,7 @@ def live_order(candles_3m, hist_yesterday_15m=None):
             last_signal_candle_time = last_candle_time
             daily_val = daily_atr(hist_yesterday_15m)
             atr, atr_source = resolve_atr(candles_3m, daily_val)
-            logging.info(f"[SIGNAL EVAL][LIVE] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}")
+            logging.info(f"{YELLOW}[SIGNAL EVAL][LIVE] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}")
             prev_day = hist_yesterday_15m.iloc[-1]
             cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
             trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
@@ -1138,17 +1083,17 @@ def live_order(candles_3m, hist_yesterday_15m=None):
         logging.info(f"[SIGNAL][LIVE] {side} ({reason}) at spot={spot_price}")
 
         if risk_info.get("halt_trading", False):
-            logging.info("[ENTRY BLOCKED][RISK] Trading halted due to risk limits")
+            logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
             return
 
         if live_info.get("last_exit_time"):
             elapsed = (dt.now(time_zone) - live_info["last_exit_time"]).total_seconds()
             if elapsed < COOLDOWN_SECONDS:
-                logging.info(f"[ENTRY BLOCKED][LIVE] Cool-down active ({elapsed:.0f}s < {COOLDOWN_SECONDS}s)")
+                logging.info(f"{MAGENTA}[ENTRY BLOCKED][LIVE] Cool-down active ({elapsed:.0f}s < {COOLDOWN_SECONDS}s){RESET}")
                 return
 
         if not oscillator_entry_filter(side, candles_3m):
-            logging.info(f"[ENTRY BLOCKED][OSC] {side} skipped due to oscillator filter")
+            logging.info(f"{MAGENTA}[ENTRY BLOCKED][OSC] {side} skipped due to oscillator filter{RESET}")
             return
 
         leg = "call_buy" if side == "CALL" else "put_buy"
@@ -1164,7 +1109,7 @@ def live_order(candles_3m, hist_yesterday_15m=None):
                     entry_price = df.loc[opt_name, "ltp"] or spot_price
                     levels = build_dynamic_levels(entry_price, atr)
                     if any(v is None for v in levels):
-                        logging.info(f"[ENTRY SKIPPED][LIVE] {side} ATR regime extreme, no levels built")
+                        logging.info(f"{MAGENTA}[ENTRY SKIPPED][LIVE] {side} ATR regime extreme, no levels built{RESET}")
                         return
                     stop, partial_target, full_target, trail_start, trail_step = levels
 
@@ -1175,7 +1120,7 @@ def live_order(candles_3m, hist_yesterday_15m=None):
 
                     success, order_id = send_live_entry_order(opt_name, quantity, 1)  # BUY side=1
                     if not success:
-                        logging.warning(f"[ENTRY FAILED][LIVE] {side} {opt_name}")
+                        logging.warning(f"{MAGENTA}[ENTRY FAILED][LIVE] {side} {opt_name}{RESET}")
                         return
 
                     live_info[leg].update({
@@ -1202,13 +1147,13 @@ def live_order(candles_3m, hist_yesterday_15m=None):
                     live_info["trade_count"] = live_info.get("trade_count", 0) + 1
 
                     logging.info(
-                        f"[ENTRY][LIVE][{regime_tag}] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}"
+                        f"{GREEN}[ENTRY][LIVE][{regime_tag}] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
+                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
                     )
                 else:
-                    logging.warning(f"[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}")
+                    logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}{RESET}")
         except Exception as e:
-            logging.error(f"[ENTRY ERROR][LIVE] {e}", exc_info=True)
+            logging.error(f"{RED}[ENTRY ERROR][LIVE] {e}{RESET}", exc_info=True)
 
     # 5. EXIT MANAGEMENT
     for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
@@ -1221,7 +1166,7 @@ def live_order(candles_3m, hist_yesterday_15m=None):
         exit_triggered = process_order(side, name, price, live_info, hist_yesterday_15m, spot_price, account_type="live")
         if exit_triggered:
             live_info["last_exit_time"] = dt.now(time_zone)
-            logging.info(f"[EXIT RECORDED][LIVE] {side} {name} at {live_info['last_exit_time']}")
+            logging.info(f"{YELLOW}[EXIT RECORDED][LIVE] {side} {name} at {live_info['last_exit_time']}{RESET}")
             update_risk(live_info, risk_info)
 
     # 6. SAVE TRADES
@@ -1267,7 +1212,7 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
                 spot_price = quote["d"][0]["v"]["lp"]
                 logging.info(f"{GRAY}[SPOT REFRESH] {sym} Spot={spot_price}{RESET}")
             except Exception as e:
-                logging.warning(f"[SPOT REFRESH FAILED] {sym}: {e}")
+                logging.warning(f"{GRAY}[SPOT REFRESH FAILED] {sym}: {e}{RESET}")
                 continue
 
             # --- Delegate candles + signal detection ---
@@ -1288,16 +1233,16 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
 
             # --- Extra bias logic on 15m close ---
             if now.minute % 15 == 0 and now.second == 0:
-                logging.info(f"[SYNC] 15m candle closed for {sym}, running ATR/CPR bias logic")
+                logging.info(f"{CYAN}[SYNC] 15m candle closed for {sym}, running ATR/CPR bias logic{RESET}")
 
                 hist_data = tick_db.fetch_candles("15m", symbol=sym)
 
                 # --- Debug guard: log type and length ---
                 logging.debug(
-                    f"[BIAS GUARD @RUN] hist_data type={type(hist_data)} len={len(hist_data)}"
+                    f"{CYAN}[BIAS GUARD @RUN] hist_data type={type(hist_data)} len={len(hist_data)}{RESET}"
                 )
                 if not hist_data.empty:
-                    logging.debug(f"[BIAS PREVIEW @RUN]\n{hist_data.tail(3)}")
+                    logging.debug(f"{CYAN}[BIAS PREVIEW @RUN]\n{hist_data.tail(3)}{RESET}")
 
                     daily_val = daily_atr(hist_data)  # float
                     atr_value, atr_source = resolve_atr(hist_data, daily_val)
@@ -1321,6 +1266,6 @@ if __name__ == "__main__":
 
     # ✅ Visibility: log how many 15m candles were bootstrapped per symbol
     for sym, df in hist_yesterday_15m.items():
-        logging.info(f"[BOOTSTRAP] {sym} yesterday 15m candles={len(df)}")
+        logging.info(f"{CYAN}[BOOTSTRAP] {sym} yesterday 15m candles={len(df)}{RESET}")
 
     run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=end_time)

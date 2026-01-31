@@ -13,6 +13,15 @@ from indicators import (
     )
 from signals import detect_signal, evaluate_candle
 
+# ANSI COLORS
+RESET   = "\033[0m"
+GREEN   = "\033[92m"
+YELLOW  = "\033[93m"
+RED     = "\033[91m"
+MAGENTA = "\033[95m"
+GRAY    = "\033[90m"
+CYAN    = "\033[96m"
+
 
 def update_candles_and_signals(symbol, hist_yesterday_15m=None, spot_price=None):
     try:
@@ -86,7 +95,7 @@ def update_candles_and_signals(symbol, hist_yesterday_15m=None, spot_price=None)
         )
         if signal:
             side, reason = signal
-            logging.info(f"[SIGNAL FIRED] {symbol} side={side} reason={reason}")
+            logging.info(f"{GREEN}[SIGNAL FIRED] {symbol} side={side} reason={reason}{RESET}")
             return signal, df_3m
         else:
             logging.debug(f"[SIGNAL CHECK] No signal for {symbol}")
