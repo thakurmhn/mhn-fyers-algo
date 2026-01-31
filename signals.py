@@ -303,10 +303,10 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
     # --- Williams %R entry blocking ---
     wr = williams_r(candles_3m, period=14)
     if not np.isnan(wr):
-        if bias == "BULLISH" and wr > -20:  # overbought
+        if bias == "BULLISH" and wr > -50:  # overbought
             logging.info(f"{CYAN}[OSC FILTER] CALL blocked by W%R={wr:.2f} (overbought){RESET}")
             call_ok = False
-        if bias == "BEARISH" and wr < -80:  # oversold
+        if bias == "BEARISH" and wr < -50:  # oversold
             logging.info(f"{CYAN}[OSC FILTER] PUT blocked by W%R={wr:.2f} (oversold){RESET}")
             put_ok = False
 
@@ -332,9 +332,9 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
             f"{YELLOW}SupertrendSlope={st_slope} spot={spot_str}{RESET}"
         )
         # --- Exit trigger diagnostic ---
-        if side == "CALL" and wr > -20:
+        if side == "CALL" and wr > -10:
             logging.info(f"{CYAN}[EXIT TRIGGER] CALL exit due to W%R={wr:.2f} (overbought){RESET}")
-        if side == "PUT" and wr < -80:
+        if side == "PUT" and wr < -90:
             logging.info(f"{CYAN}[EXIT TRIGGER] PUT exit due to W%R={wr:.2f} (oversold){RESET}")
         return side, reason
 

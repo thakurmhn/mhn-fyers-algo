@@ -139,18 +139,18 @@ def calculate_ema(series, period=20):
     return series.ewm(span=period, adjust=False).mean()
 
 
-def calculate_cci(df, period=20):
-    """Commodity Channel Index (CCI)."""
-    if not {"high","low","close"}.issubset(df.columns):
-        logging.error(f"{CYAN}[CCI] Missing required columns{RESET}")
-        return pd.Series(dtype=float)
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    ma = tp.rolling(period).mean()
-    # ✅ vectorized mean deviation instead of lambda
-    md = (tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True))
-    md = md.replace(0, np.nan)
-    cci = (tp - ma) / (0.015 * md)
-    return cci
+# def calculate_cci(df, period=20):
+#     """Commodity Channel Index (CCI)."""
+#     if not {"high","low","close"}.issubset(df.columns):
+#         logging.error(f"{CYAN}[CCI] Missing required columns{RESET}")
+#         return pd.Series(dtype=float)
+#     tp = (df["high"] + df["low"] + df["close"]) / 3
+#     ma = tp.rolling(period).mean()
+#     # ✅ vectorized mean deviation instead of lambda
+#     md = (tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True))
+#     md = md.replace(0, np.nan)
+#     cci = (tp - ma) / (0.015 * md)
+#     return cci
 
 def ema_bias(df, period=20):
     """EMA bias: compares last close vs EMA."""
@@ -163,20 +163,20 @@ def ema_bias(df, period=20):
     return "BULLISH" if last_close > ema.iloc[-1] else "BEARISH"
 
 
-def cci_bias(df, period=20, threshold=100):
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    ma = tp.rolling(period).mean()
-    md = (tp - ma).abs().rolling(period).mean()
-    cci = (tp - ma) / (0.015 * md)
-    last_cci = cci.iloc[-1]
-    if last_cci > threshold:
-        return "BULLISH"
-    elif last_cci < -threshold:
-        return "BEARISH"
-    else:
-        return "NEUTRAL"
+# def cci_bias(df, period=20, threshold=100):
+#     tp = (df['high'] + df['low'] + df['close']) / 3
+#     ma = tp.rolling(period).mean()
+#     md = (tp - ma).abs().rolling(period).mean()
+#     cci = (tp - ma) / (0.015 * md)
+#     last_cci = cci.iloc[-1]
+#     if last_cci > threshold:
+#         return "BULLISH"
+#     elif last_cci < -threshold:
+#         return "BEARISH"
+#     else:
+#         return "NEUTRAL"
 
-def cci_bias(df, period=20, threshold=100):
+def cci_bias(df, period=20, threshold=60):
     """CCI bias: checks last CCI value against thresholds."""
     if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
         return "NEUTRAL"
@@ -198,7 +198,7 @@ def cci_bias(df, period=20, threshold=100):
         return "NEUTRAL"
 
 
-def supertrend(df, atr_val=None, period=10, multiplier=3, slope_lookback=5):
+def supertrend(df, atr_val=None, period=7, multiplier=3, slope_lookback=5):
     """
     Compute Supertrend bias and slope.
     - df: DataFrame with 'high','low','close'
