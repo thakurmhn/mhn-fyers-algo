@@ -491,11 +491,46 @@ def to_scalar(val):
 #     logging.info(f"{CYAN}[NO SIGNAL] No valid breakout/rejection detected{RESET}")
 #     return None
 
+def classify_volatility(atr_val, thresholds=(15, 30)):
+    """
+    Classify volatility regime based on ATR.
+    thresholds = (low, high)
+    """
+    if atr_val < thresholds[0]:
+        return "LOW"
+    elif atr_val < thresholds[1]:
+        return "MEDIUM"
+    else:
+        return "HIGH"
+
+
+def dynamic_targets(atr_val, side):
+    """
+    Generate dynamic SL/PT/TG based on ATR.
+    """
+    sl = 1.5 * atr_val
+    pt = 2.0 * atr_val
+    tg = atr_val  # expected move per candle
+    return {"side": side, "SL": sl, "PT": pt, "TG": tg}
+
+
+def signal_confidence(vol_regime, reason):
+    """
+    Assign confidence score based on volatility regime and signal type.
+    """
+    if vol_regime == "HIGH" and "BREAKOUT" in reason:
+        return "STRONG"
+    elif vol_regime == "LOW" and "CONTINUATION" in reason:
+        return "WEAK"
+    return "MEDIUM"
+
+
 def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
                   candles_3m, candles_15m, spot_price=None, daily_atr=None):
     """
     Orchestrates breakout/rejection detection using helpers in signals.py,
-    with pivot-level debugging, dynamic ATR, and bias-aware gating.
+    with pivot-level debugging, dynamic ATR, bias-aware gating,
+    and volatility-based SL/PT/TG + confidence scoring.
     """
 
     # --- Guard clauses ---
@@ -580,12 +615,19 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
         # ✅ Fix: build W%R string safely
         wr_str = f"{wr:.2f}" if not np.isnan(wr) else "NA"
 
+        # --- Volatility module integration ---
+        vol_regime = classify_volatility(atr)
+        targets = dynamic_targets(atr, side)
+        confidence = signal_confidence(vol_regime, reason)
+
         logging.info(
             f"[SIGNAL FOUND] side={side} reason={reason} "
-            f"Bias={bias} ATR={atr:.2f} W%R={wr_str} "
+            f"Bias={bias} ATR={atr:.2f} VolRegime={vol_regime} "
+            f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
+            f"Confidence={confidence} W%R={wr_str} "
             f"SupertrendSlope={st_slope} spot={spot_str}"
         )
-        return side, reason
+        return side, reason, targets, confidence
 
     logging.info("[NO SIGNAL] No valid breakout/rejection detected")
     return None

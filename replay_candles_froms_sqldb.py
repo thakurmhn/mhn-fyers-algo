@@ -84,9 +84,13 @@ def replay_signals(symbol, date):
                 daily_atr=atr_val  # <-- evolving ATR per slice
             )
             if signal:
-                side, reason = signal
+                side, reason, targets, confidence = signal
                 ts = df_slice.iloc[-1]["ist_slot"]
-                logging.info(f"[REPLAY SIGNAL] {ts} side={side} reason={reason} ATR={atr_val:.2f}")
+                logging.info(
+                    f"[REPLAY SIGNAL] {ts} side={side} reason={reason} "
+                    f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
+                    f"Confidence={confidence} ATR={atr_val:.2f}"
+                )
         except Exception as e:
             logging.error(f"[REPLAY ERROR] Candle {i}: {e}")
 
