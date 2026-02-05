@@ -3,12 +3,12 @@ import logging
 import pandas as pd
 
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
-from setup import client_id, access_token, fyers, fyers_asysc, ticker, symbols, df
+from setup import client_id, access_token, fyers, fyers_async, ticker, symbols, df
 from setup import spot_price as _spot_price
 from candle_builder import build_3min_candle
-from execution import update_order_status, map_status_code
+from order_utils import update_order_status, map_status_code
 from tickdb import TickDatabase   # dedicated DB helper
-
+from order_utils import update_order_status, map_status_code
 
 # ANSI COLORS
 RESET   = "\033[0m"
@@ -26,6 +26,19 @@ spot_price = _spot_price
 tick_db = TickDatabase()
 
 # ===== Market data callbacks =====
+import pytz
+from datetime import datetime
+
+# Track last finalized slots per symbol
+last_slot_3m = {}
+last_slot_15m = {}
+
+def get_slot(ts, interval_minutes=3):
+    """Round timestamp down to nearest slot boundary."""
+    ts = ts.replace(second=0, microsecond=0)
+    slot_minute = (ts.minute // interval_minutes) * interval_minutes
+    return ts.replace(minute=slot_minute)
+
 def onmessage(ticks):
     global df, spot_price
 
@@ -35,8 +48,7 @@ def onmessage(ticks):
     symbol = ticks["symbol"]
 
     # ===== Option contracts → update df only =====
-    if symbol not in ["NSE:NIFTY50-INDEX"]:            # ["NSE:NIFTY50-INDEX", "NSE:BANKNIFTY-INDEX", "NSE:FINNIFTY-INDEX"]
-        # keep option LTPs in df for chasing orders
+    if symbol not in ["NSE:NIFTY50-INDEX", "NSE:BANKNIFTY-INDEX", "NSE:FINNIFTY-INDEX"]:
         if symbol not in df.index:
             df.loc[symbol] = [None] * len(df.columns)
         for key, value in ticks.items():
@@ -58,11 +70,31 @@ def onmessage(ticks):
             logging.error(f"{RED}[DB ERROR] Failed to insert tick: {e}{RESET}")
 
         spot_price = ltp
-        try:
-            df_ticks = tick_db.fetch_ticks(symbol)
-            build_3min_candle(df_ticks, tick_db, symbol)
-        except Exception as e:
-            logging.error(f"{RED}[CANDLE ERROR] Failed to build candle for {symbol}: {e}{RESET}")
+
+        # Current IST timestamp
+        ts = datetime.now(pytz.timezone("Asia/Kolkata"))
+
+        # --- 3m slot check ---
+        current_slot_3m = get_slot(ts, 3)
+        if last_slot_3m.get(symbol) != current_slot_3m:
+            try:
+                tick_db.build_candles_from_ticks(symbol, interval="3m")
+                last_slot_3m[symbol] = current_slot_3m
+                logging.info(f"[CANDLE] Finalized 3m candle for {symbol} at {current_slot_3m}")
+            except Exception as e:
+                logging.error(f"{RED}[CANDLE ERROR] Failed 3m candle for {symbol}: {e}{RESET}")
+
+        # --- 15m slot check ---
+        current_slot_15m = get_slot(ts, 15)
+        if last_slot_15m.get(symbol) != current_slot_15m:
+            try:
+                tick_db.build_candles_from_ticks(symbol, interval="15m")
+                last_slot_15m[symbol] = current_slot_15m
+                logging.info(f"[CANDLE] Finalized 15m candle for {symbol} at {current_slot_15m}")
+            except Exception as e:
+                logging.error(f"{RED}[CANDLE ERROR] Failed 15m candle for {symbol}: {e}{RESET}")
+
+                
 
 def onerror(message): logging.error(f"[SOCKET ERROR] {message}")
 def onclose(message): logging.info(f"[SOCKET CLOSED] {message}")

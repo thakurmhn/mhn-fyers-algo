@@ -6,9 +6,9 @@ import pandas as pd
 import pendulum as dt
 import warnings
 
-from config import time_zone
+from config import time_zone, MODE
 from execution import run_strategy
-from data_feed import fyers_socket, fyers_order_socket, chase_order, fyers_asysc, tick_db, symbols
+from data_feed import fyers_socket, fyers_order_socket, chase_order, fyers_async, tick_db, symbols
 from indicators import (
     calculate_cpr,
     calculate_traditional_pivots,
@@ -68,8 +68,9 @@ def print_daily_levels():
             f"ATR={atr_display} ({atr_source}, {atr_regime}){RESET}"
         )
 
+
+
 async def main_strategy_code():
-    """Async loop to run strategy and chase orders until market close."""
     today = dt.now(time_zone).date()
     end_time = dt.datetime(today.year, today.month, today.day, 15, 30, tz=time_zone)
 
@@ -81,31 +82,32 @@ async def main_strategy_code():
     while True:
         ct = dt.now(time_zone)
 
-        # Graceful shutdown after market close + 2 minutes
         if ct > end_time.add(minutes=2):
             logging.info("Closing program after session end.")
             return
 
-        # Every 5 seconds: chase orders and broker PnL
         if ct.second % 5 == 0:
             try:
-                order_response = await fyers_asysc.orderbook()
+                order_response = await fyers_async.orderbook()
                 order_df = pd.DataFrame(order_response["orderBook"]) if order_response.get("orderBook") else pd.DataFrame()
                 logging.info(f"{CYAN}[CHASE] Checking pending orders...{RESET}")
                 chase_order(order_df)
 
-                pos1 = await fyers_asysc.positions()
+                pos1 = await fyers_async.positions()
                 pnl = int(pos1.get("overall", {}).get("pl_total", 0))
                 logging.info(f"{GRAY}Live PnL from broker: {pnl}{RESET}")
 
             except Exception as e:
                 logging.error(f"Unable to fetch PnL or chase order: {e}")
 
-        # Run unified strategy loop
-        try:
-            run_strategy(symbols, hist_yesterday_15m, tz=time_zone, end_time=end_time)
-        except Exception as e:
-            logging.error(f"[STRATEGY ERROR] {e}", exc_info=True)
+        # --- Mode control ---
+        if MODE == "STRATEGY":
+            try:
+                run_strategy(symbols, hist_yesterday_15m, tz=time_zone, end_time=end_time)
+            except Exception as e:
+                logging.error(f"[STRATEGY ERROR] {e}", exc_info=True)
+        else:
+            logging.debug("[MODE] Collect-only: skipping run_strategy()")
 
         await asyncio.sleep(1)
 

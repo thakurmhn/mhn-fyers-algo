@@ -22,6 +22,8 @@ redirect_uri = os.getenv("FYERS_REDIRECT_URI")
 
 strategy_name = 'option_buying_pivot'
 index_name = 'NIFTY50'
+symbols = ["NSE:NIFTY50-INDEX",  "NSE:FINNIFTY-INDEX"]
+# # ["NSE:NIFTY50-INDEX", "NSE:BANKNIFTY-INDEX", "NSE:FINNIFTY-INDEX"]
 exchange = 'NSE'
 ticker = f"{exchange}:{index_name}-INDEX"
 
@@ -84,6 +86,12 @@ MAX_DRAWDOWN   = -3000      # stop trading if drawdown exceeds 3000
 OSCILLATOR_EXIT_MODE = "HARD"   # or "TRAIL"
 
 # ===================================================================
+
+# ========================= MODE ====================
+
+MODE = "COLLECT"   # or "STRATEGY"      # Collet and build db with tick data #Strategy - run the whole bot strategy 
+
+
 
 
 # ===== Logging =====

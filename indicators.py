@@ -28,61 +28,99 @@ GRAY    = "\033[90m"
 CYAN    = "\033[96m"
 # ===========================================================
 
+
 # ===== Pivot Calculations =====
-def calculate_cpr(high, low, close):
-    pivot = (high + low + close) / 3
-    bc = (high + low) / 2
+
+def calculate_cpr(prev_high, prev_low, prev_close):
+    pivot = (prev_high + prev_low + prev_close) / 3
+    bc = (prev_high + prev_low) / 2
     tc = (pivot - bc) + pivot
+    if round(tc, 2) == round(bc, 2):
+        tc = pivot + 0.0005 * pivot
+        bc = pivot - 0.0005 * pivot
     return {"pivot": round(pivot, 2), "bc": round(bc, 2), "tc": round(tc, 2)}
 
-def calculate_traditional_pivots(high, low, close):
-    pivot = (high + low + close) / 3
-    r1 = (2 * pivot) - low
-    s1 = (2 * pivot) - high
-    r2 = pivot + (high - low)
-    s2 = pivot - (high - low)
+def calculate_traditional_pivots(prev_high, prev_low, prev_close):
+    pivot = (prev_high + prev_low + prev_close) / 3
+    r1 = (2 * pivot) - prev_low
+    s1 = (2 * pivot) - prev_high
+    r2 = pivot + (prev_high - prev_low)
+    s2 = pivot - (prev_high - prev_low)
+    if prev_high == prev_low:
+        r1 = pivot + 0.0005 * pivot
+        s1 = pivot - 0.0005 * pivot
+        r2 = pivot + 0.001 * pivot
+        s2 = pivot - 0.001 * pivot
     return {"pivot": round(pivot, 2), "r1": round(r1, 2), "s1": round(s1, 2),
             "r2": round(r2, 2), "s2": round(s2, 2)}
 
-def calculate_camarilla_pivots(high, low, close):
-    range_val = high - low
-    r3 = close + (range_val * 1.1 / 4)
-    r4 = close + (range_val * 1.1 / 2)
-    s3 = close - (range_val * 1.1 / 4)
-    s4 = close - (range_val * 1.1 / 2)
+def calculate_camarilla_pivots(prev_high, prev_low, prev_close):
+    range_val = prev_high - prev_low
+    if range_val == 0:
+        range_val = 0.001 * prev_close
+    r3 = prev_close + (range_val * 1.1 / 4)
+    r4 = prev_close + (range_val * 1.1 / 2)
+    s3 = prev_close - (range_val * 1.1 / 4)
+    s4 = prev_close - (range_val * 1.1 / 2)
     return {"r3": round(r3, 2), "r4": round(r4, 2),
             "s3": round(s3, 2), "s4": round(s4, 2)}
 
-# ===== ATR =====
 
-def calculate_atr(df, period=14):
+# # ===== Pivot Calculations =====
+# def calculate_cpr(high, low, close):
+#     pivot = (high + low + close) / 3
+#     bc = (high + low) / 2
+#     tc = (pivot - bc) + pivot
+#     return {"pivot": round(pivot, 2), "bc": round(bc, 2), "tc": round(tc, 2)}
+
+# def calculate_traditional_pivots(high, low, close):
+#     pivot = (high + low + close) / 3
+#     r1 = (2 * pivot) - low
+#     s1 = (2 * pivot) - high
+#     r2 = pivot + (high - low)
+#     s2 = pivot - (high - low)
+#     return {"pivot": round(pivot, 2), "r1": round(r1, 2), "s1": round(s1, 2),
+#             "r2": round(r2, 2), "s2": round(s2, 2)}
+
+# def calculate_camarilla_pivots(high, low, close):
+#     range_val = high - low
+#     r3 = close + (range_val * 1.1 / 4)
+#     r4 = close + (range_val * 1.1 / 2)
+#     s3 = close - (range_val * 1.1 / 4)
+#     s4 = close - (range_val * 1.1 / 2)
+#     return {"r3": round(r3, 2), "r4": round(r4, 2),
+#             "s3": round(s3, 2), "s4": round(s4, 2)}
+
+# # ===== ATR =====
+
+def calculate_atr(candles: pd.DataFrame, period: int = 14):
     """
-    Calculate Average True Range (ATR) from a DataFrame with
-    'high', 'low', 'close' columns.
-    Returns a float ATR value or None if unavailable.
+    Calculate ATR using a rolling window of `period` candles.
+    Returns the latest ATR value.
     """
-    if df is None or df.empty:
-        return None
+    highs = candles['high'].astype(float)
+    lows = candles['low'].astype(float)
+    closes = candles['close'].astype(float)
 
-    high_low   = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close  = (df['low'] - df['close'].shift()).abs()
+    # True Range (TR)
+    prev_close = closes.shift(1)
+    tr = pd.concat([
+        highs - lows,
+        (highs - prev_close).abs(),
+        (lows - prev_close).abs()
+    ], axis=1).max(axis=1)
 
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr_series = tr.rolling(period).mean().dropna()
+    # Average True Range (ATR)
+    atr = tr.rolling(period).mean()
 
-    if atr_series.empty:
-        return None
-    val = atr_series.iloc[-1]
-    return None if pd.isna(val) else float(val)
+    return atr.iloc[-1] if not atr.empty else None
 
 
 def resolve_atr(candles_3m, daily_atr=None, period=14):
     """
     Resolve ATR value for signal detection.
-    - If daily_atr is provided, use it (force float).
-    - Otherwise, calculate from candles_3m.
-    Always return (float atr, source string).
+    - If daily_atr is provided, use it.
+    - Otherwise, calculate rolling ATR from candles_3m up to latest candle.
     """
     if daily_atr is not None:
         try:
@@ -93,12 +131,12 @@ def resolve_atr(candles_3m, daily_atr=None, period=14):
     if candles_3m is not None and isinstance(candles_3m, pd.DataFrame):
         atr_val = calculate_atr(candles_3m, period=period)
         if atr_val is not None:
+            logging.debug(f"[ATR CALC] period={period} value={atr_val:.2f}")
             return atr_val, "calculated"
         else:
             return None, "calculation failed"
 
     return None, "unavailable"
-
 
 def daily_atr(df_daily, period=7):
     """
@@ -128,29 +166,65 @@ def momentum_ok(candles, side):
     return ok, momentum
 
 # ===== Indicators =====
-def calculate_ema(series, period=20):
-    """Exponential Moving Average (EMA)."""
-    if series is None or len(series) == 0:
-        logging.error(f"{CYAN}[EMA] Empty or invalid series{RESET}")
-        return pd.Series(dtype=float)
-    if not isinstance(series, pd.Series):
-        series = pd.Series(series)
-    series = series.dropna()  # ✅ drop NaNs for cleaner EMA
+def calculate_ema(df, period=20, column="close"):
+    """Exponential Moving Average (EMA) from a DataFrame column."""
+    if df is None or df.empty or column not in df.columns:
+        logging.error("[EMA] Empty or invalid DataFrame")
+        return pd.Series(dtype=float, index=df.index if df is not None else None)
+
+    series = df[column].dropna()
     return series.ewm(span=period, adjust=False).mean()
 
+def calculate_adx(df, period=14):
+    """Calculate ADX (Average Directional Index) from a DataFrame."""
+    if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
+        logging.warning("[ADX] No data")
+        return pd.Series(dtype=float, index=df.index if df is not None else None)
 
-# def calculate_cci(df, period=20):
-#     """Commodity Channel Index (CCI)."""
-#     if not {"high","low","close"}.issubset(df.columns):
-#         logging.error(f"{CYAN}[CCI] Missing required columns{RESET}")
-#         return pd.Series(dtype=float)
-#     tp = (df["high"] + df["low"] + df["close"]) / 3
-#     ma = tp.rolling(period).mean()
-#     # ✅ vectorized mean deviation instead of lambda
-#     md = (tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True))
-#     md = md.replace(0, np.nan)
-#     cci = (tp - ma) / (0.015 * md)
-#     return cci
+    high, low, close = df["high"], df["low"], df["close"]
+
+    plus_dm = high.diff()
+    minus_dm = low.diff().abs()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(period).mean()
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+    adx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)).rolling(period).mean()
+
+    return adx
+
+def calculate_cci(df, period=20):
+    """Commodity Channel Index (CCI) as a Series."""
+    if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
+        logging.warning("[CCI] No data")
+        return pd.Series(dtype=float, index=df.index if df is not None else None)
+
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    ma = tp.rolling(period).mean()
+    md = (tp - ma).abs().rolling(period).mean()
+
+    cci = (tp - ma) / (0.015 * md)
+    return cci
+
+
+def cci_indicator(df, period=20):
+    """Return the latest CCI value for bias checks."""
+    cci_series = calculate_cci(df, period=period)
+    if cci_series is None or cci_series.empty:
+        logging.warning("[CCI INDICATOR] No CCI available")
+        return np.nan
+
+    latest_val = cci_series.iloc[-1]
+    logging.debug(f"[CCI INDICATOR] Latest CCI={latest_val:.2f}")
+    return latest_val
 
 def ema_bias(df, period=20):
     """EMA bias: compares last close vs EMA."""
@@ -341,99 +415,91 @@ def adx_bias(df, period=14, threshold=20):
         return "NEUTRAL"
     return "BULLISH" if plus_di.iloc[-1] > minus_di.iloc[-1] else "BEARISH"
 
-
-def check_bias(candles_15m, daily_atr=None):
-    """
-    Evaluate bias using multiple indicators (Supertrend, EMA, ADX, CCI).
-    Weighted scoring system:
-      - Supertrend: 2 points
-      - ADX: 2 points
-      - EMA: 1 point
-      - CCI: 1 point
-    Returns "BULLISH", "BEARISH", or "NEUTRAL".
-    """
-
-    if candles_15m is None or candles_15m.empty:
+def check_bias(df_15m, daily_atr=None):
+    if df_15m is None or df_15m.empty:
         logging.warning("[BIAS] No 15m candles available")
         return None
 
-    # --- Resolve ATR value ---
-    if isinstance(daily_atr, (float, int)):
-        atr_val = float(daily_atr)
-    elif isinstance(daily_atr, pd.Series) and not daily_atr.empty:
-        atr_val = float(daily_atr.iloc[-1])
-    elif isinstance(daily_atr, pd.DataFrame) and not daily_atr.empty:
-        atr_val = float(daily_atr.values[-1])
+    row = df_15m.iloc[-1]
+
+    # Supertrend normalization
+    st_val = row.get("supertrend", "NEUTRAL")
+    if isinstance(st_val, (int, float)):
+        st_val = "BULLISH" if st_val > 0 else "BEARISH"
+    elif str(st_val).lower() == "up":
+        st_val = "BULLISH"
+    elif str(st_val).lower() == "down":
+        st_val = "BEARISH"
     else:
-        atr_val = None
-    if pd.isna(atr_val):
-        atr_val = None
+        st_val = "NEUTRAL"
 
-    # --- Compute indicators ---
-    try:
-        st_result = supertrend(candles_15m, atr_val)  # dict: {"bias":..., "slope":...}
-        st_val = st_result.get("bias", "NEUTRAL")
-        st_slope = st_result.get("slope", "FLAT")
-    except Exception as e:
-        logging.error(f"[BIAS DEBUG] Supertrend calc failed: {e}")
-        st_val, st_slope = "NEUTRAL", "FLAT"
+    ema_val = "BULLISH" if row["ema20"] > row["ema50"] else "BEARISH"
 
-    try:
-        ema_val = ema_bias(candles_15m)
-    except Exception as e:
-        logging.error(f"[BIAS DEBUG] EMA calc failed: {e}")
-        ema_val = "NEUTRAL"
+    adx_val = row.get("adx14", None)
+    if adx_val is None or pd.isna(adx_val):
+        adx_bias = "NEUTRAL"
+    elif adx_val > 25:
+        adx_bias = ema_val
+    elif adx_val < 15:
+        adx_bias = "BEARISH" if ema_val == "BEARISH" else "NEUTRAL"
+    else:
+        adx_bias = "NEUTRAL"
 
-    try:
-        adx_val = adx_bias(candles_15m)
-    except Exception as e:
-        logging.error(f"[BIAS DEBUG] ADX calc failed: {e}")
-        adx_val = "NEUTRAL"
+    cci_val = row.get("cci20", None)
+    if cci_val is None or pd.isna(cci_val):
+        cci_bias = "NEUTRAL"
+    elif cci_val > 50:
+        cci_bias = "BULLISH"
+    elif cci_val < -50:
+        cci_bias = "BEARISH"
+    else:
+        cci_bias = "NEUTRAL"
 
-    try:
-        cci_val = cci_bias(candles_15m)
-    except Exception as e:
-        logging.error(f"[BIAS DEBUG] CCI calc failed: {e}")
-        cci_val = "NEUTRAL"
-
-    # --- Weighted scoring ---
-    weights = {"Supertrend": 2, "ADX": 2, "EMA": 1, "CCI": 1}
     scores = {"BULLISH": 0, "BEARISH": 0}
+    scores[ema_val] += 2
+    if adx_bias in scores:
+        scores[adx_bias] += 2 if adx_val and adx_val > 25 else 1
+    if cci_bias in scores:
+        scores[cci_bias] += 1
+    if st_val in ("BULLISH", "BEARISH"):
+        scores[st_val] += 2
 
-    for name, val in [("Supertrend", st_val), ("EMA", ema_val), ("ADX", adx_val), ("CCI", cci_val)]:
-        if val in scores:
-            scores[val] += weights[name]
+    # ATR contribution
+    if daily_atr is not None and row["close"]:
+        atr_ratio = daily_atr / row["close"]
+        if atr_ratio > 0.005:  # >0.5% volatility
+            scores[ema_val] += 1
 
     logging.info(
-        f"{YELLOW}[BIAS CHECK] ATR={atr_val} ADX={adx_val}{RESET} "
-        f"{YELLOW}Supertrend={st_val} (Slope={st_slope}) EMA={ema_val} CCI={cci_val}{RESET}"
+        f"[BIAS CHECK] ATR={daily_atr if daily_atr else 'NA'} "
+        f"Supertrend={st_val} EMA={ema_val} ADX={adx_bias}({adx_val}) CCI={cci_bias}({cci_val})"
     )
-    logging.info(f"{YELLOW}[BIAS SCORES] BULLISH={scores['BULLISH']} BEARISH={scores['BEARISH']}{RESET}")
+    logging.info(f"[BIAS SCORES] BULLISH={scores['BULLISH']} BEARISH={scores['BEARISH']}")
 
     if scores["BULLISH"] > scores["BEARISH"]:
-        logging.info(f"{YELLOW}[BIAS RESULT] BULLISH (weighted){RESET}")
+        logging.info("[BIAS RESULT] BULLISH (weighted)")
         return "BULLISH"
     elif scores["BEARISH"] > scores["BULLISH"]:
-        logging.info(f"{YELLOW}[BIAS RESULT] BEARISH (weighted){RESET}")
+        logging.info("[BIAS RESULT] BEARISH (weighted)")
         return "BEARISH"
     else:
-        logging.info(f"{CYAN}[BIAS RESULT] NEUTRAL (weighted tie){RESET}")
+        logging.info("[BIAS RESULT] NEUTRAL (tie)")
         return "NEUTRAL"
+    
 
-
-def cci_indicator(candles, period=20):
-    if len(candles) < period:
-        logging.warning("[CCI] Not enough candles")
-        return np.nan
-    tp = (candles['high'] + candles['low'] + candles['close']) / 3
-    ma = tp.tail(period).mean()
-    md = (tp.tail(period) - ma).abs().mean()
-    if md == 0:
-        logging.warning("[CCI] Mean deviation = 0")
-        return np.nan
-    cci = (tp.iloc[-1] - ma) / (0.015 * md)
-    logging.debug(f"[CCI] tp={tp.iloc[-1]:.2f}, ma={ma:.2f}, md={md:.2f}, CCI={cci:.2f}")
-    return cci
+# def cci_indicator(candles, period=20):
+#     if len(candles) < period:
+#         logging.warning("[CCI] Not enough candles")
+#         return np.nan
+#     tp = (candles['high'] + candles['low'] + candles['close']) / 3
+#     ma = tp.tail(period).mean()
+#     md = (tp.tail(period) - ma).abs().mean()
+#     if md == 0:
+#         logging.warning("[CCI] Mean deviation = 0")
+#         return np.nan
+#     cci = (tp.iloc[-1] - ma) / (0.015 * md)
+#     logging.debug(f"[CCI] tp={tp.iloc[-1]:.2f}, ma={ma:.2f}, md={md:.2f}, CCI={cci:.2f}")
+#     return cci
 
 def williams_r(candles, period=14):
     """

@@ -37,6 +37,10 @@ df_15m_clean = df_15m.dropna(subset=["open", "high", "low", "close"])
 
 # --- Multi-timeframe analysis ---
 logging.info("Last 5 valid 3m candles:\n%s", df_3m_clean.tail())
-logging.info("Last 5 valid 15m candles:\n%s", df_15m_clean.tail())
+# logging.info("Last 5 valid 15m candles:\n%s", df_15m_clean.tail())
+logging.info("All valid 15m candles:\n%s", df_15m_clean)
+
+
+
 
 conn.close()

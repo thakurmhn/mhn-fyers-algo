@@ -4,7 +4,10 @@ import logging
 import os, glob
 from datetime import datetime, timedelta
 import pendulum as dt
-
+from datetime import datetime, timedelta
+import pytz
+time_zone = pytz.timezone("Asia/Kolkata")
+today = datetime.now(time_zone).date()
 
 class TickDatabase:
     def __init__(self, base_path=r"C:\SQLite\ticks"):
@@ -151,6 +154,113 @@ class TickDatabase:
             logging.error(f"[DB ERROR] Failed to replay ticks: {e}")
             return pd.DataFrame()
 
+    def build_candles_from_ticks(self, symbol, interval="3m"):
+        # Fetch raw ticks for the symbol
+        df = self.fetch_ticks(symbol)
+        if df.empty:
+            logging.warning(f"[CANDLES] No ticks available for {symbol}, skipping candle build")
+            return
+
+        # Convert timestamp to IST
+        df['ts'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        df = df.dropna(subset=['ts'])  # drop rows with invalid timestamps
+        df['ts'] = df['ts'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+
+        # Determine resample rule (use 'min' instead of deprecated 'T')
+        if interval == "3m":
+            rule = "3min"
+        elif interval == "15m":
+            rule = "15min"
+        else:
+            logging.error(f"[CANDLES] Unsupported interval={interval}, must be '3m' or '15m'")
+            return
+
+        # Resample ticks into OHLCV
+        ohlc = (
+            df.resample(rule, on='ts')
+            .agg({
+                'last_price': ['first', 'max', 'min', 'last'],
+                'volume': 'sum'
+            })
+            .dropna()
+        )
+
+        # Flatten multi-index columns
+        ohlc.columns = ['open', 'high', 'low', 'close', 'volume']
+        ohlc.reset_index(inplace=True)
+
+        # Persist each candle into DB
+        for _, row in ohlc.iterrows():
+            trade_date = row['ts'].date().isoformat()
+            ist_slot = row['ts'].strftime('%H:%M:%S')
+
+            if interval == "3m":
+                self.insert_3m_candle(
+                    trade_date, ist_slot,
+                    row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
+                )
+            else:  # 15m
+                self.insert_15m_candle(
+                    trade_date, ist_slot,
+                    row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
+                )
+
+        logging.info(f"[CANDLES] Built {interval} candles for {symbol} ({len(ohlc)} rows)")
+
+
+    def rebuild_candles_from_db(self, symbol, interval="3m"):
+        """Rebuild candles from raw ticks in DB for a given symbol and interval."""
+        df = self.fetch_ticks(symbol)
+        if df.empty:
+            logging.warning(f"[REBUILD] No ticks found for {symbol}")
+            return
+
+        # Convert timestamp to IST safely
+        df['ts'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        df = df.dropna(subset=['ts'])
+        df['ts'] = df['ts'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+
+        # Choose resample rule (use 'min' instead of deprecated 'T')
+        if interval == "3m":
+            rule = "3min"
+        elif interval == "15m":
+            rule = "15min"
+        else:
+            logging.error(f"[REBUILD] Unsupported interval={interval}, must be '3m' or '15m'")
+            return
+
+        # Aggregate ticks into OHLCV
+        ohlc = (
+            df.resample(rule, on='ts')
+            .agg({
+                'last_price': ['first', 'max', 'min', 'last'],
+                'volume': 'sum'
+            })
+            .dropna()
+        )
+
+        # Flatten multi-index columns
+        ohlc.columns = ['open', 'high', 'low', 'close', 'volume']
+        ohlc.reset_index(inplace=True)
+
+        # Persist each candle
+        for _, row in ohlc.iterrows():
+            trade_date = row['ts'].date().isoformat()
+            ist_slot = row['ts'].strftime('%H:%M:%S')
+
+            if interval == "3m":
+                self.insert_3m_candle(
+                    trade_date, ist_slot,
+                    row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
+                )
+            else:  # 15m
+                self.insert_15m_candle(
+                    trade_date, ist_slot,
+                    row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
+                )
+
+        logging.info(f"[REBUILD] Rebuilt {interval} candles for {symbol} ({len(ohlc)} rows)")
+
     def fetch_candles(self, resolution="3m", start_time=None, end_time=None,
                   use_yesterday=False, symbol=None):
         """Fetch candles for the current trading day or last available trading day.
@@ -164,14 +274,15 @@ class TickDatabase:
             logging.error(f"[DB ERROR] Unsupported resolution: {resolution}")
             return pd.DataFrame()
 
-        time_zone = "Asia/Kolkata"
-        today = dt.now(time_zone).date()
+        from datetime import datetime, timedelta
+        import pytz
+        time_zone = pytz.timezone("Asia/Kolkata")
+        today = datetime.now(time_zone).date()
 
         # --- Pick trade_date ---
         if use_yesterday:
-            # step back until a DB file has data
             offset = 1
-            while offset <= 5:  # safety cap: look back max 5 days
+            while offset <= 5:  # safety cap
                 candidate = today - timedelta(days=offset)
                 trade_date = candidate.isoformat()
                 query = f"SELECT * FROM {table} WHERE trade_date = ?"
@@ -187,7 +298,6 @@ class TickDatabase:
                     logging.error(f"[DB ERROR] Failed to fetch {resolution} candles: {e}")
                 offset += 1
             else:
-                # fallback: no data found
                 return pd.DataFrame(columns=["trade_date","ist_slot","open","high","low","close","volume","symbol"])
         else:
             trade_date = today.isoformat()
@@ -196,15 +306,16 @@ class TickDatabase:
             if symbol:
                 query += " AND symbol = ?"
                 params.append(symbol)
-            df = pd.read_sql_query(query, self.conn, params=params)
 
-        # --- Apply time filters ---
-        if start_time:
-            query += " AND ist_slot >= ?"
-            params.append(start_time)
-        if end_time:
-            query += " AND ist_slot <= ?"
-            params.append(end_time)
+            # --- Apply time filters before executing ---
+            if start_time:
+                query += " AND ist_slot >= ?"
+                params.append(start_time)
+            if end_time:
+                query += " AND ist_slot <= ?"
+                params.append(end_time)
+
+            df = pd.read_sql_query(query, self.conn, params=params)
 
         # --- Final cleanup ---
         if df.empty:
@@ -227,18 +338,16 @@ class TickDatabase:
 
         for db_file in db_files:
             try:
-                conn = sqlite3.connect(db_file)
-                df = pd.read_sql_query("SELECT * FROM ticks", conn)
-                conn.close()
+                with sqlite3.connect(db_file) as conn:
+                    df = pd.read_sql_query("SELECT * FROM ticks", conn)
 
                 if df.empty:
                     continue
 
                 # Normalize numeric columns
-                if "last_price" in df.columns:
-                    df["last_price"] = pd.to_numeric(df["last_price"], errors="coerce")
-                if "volume" in df.columns:
-                    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+                for col in ["last_price", "volume", "bid", "ask"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
 
                 dfs.append(df)
                 logging.info(f"[LOAD] Loaded {len(df)} ticks from {db_file}")
@@ -251,6 +360,8 @@ class TickDatabase:
         else:
             logging.warning("[LOAD] No tick data found in sessions")
             return pd.DataFrame(columns=["timestamp","trade_date","symbol","bid","ask","last_price","volume"])
- 
-        
+
+
+# Instantiate global tick_db
 tick_db = TickDatabase()
+

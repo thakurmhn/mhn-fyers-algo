@@ -8,10 +8,10 @@ import time
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
     CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point, ENTRY_OFFSET, ORDER_TYPE,
-    MAX_DAILY_LOSS, MAX_DRAWDOWN, OSCILLATOR_EXIT_MODE
+    MAX_DAILY_LOSS, MAX_DRAWDOWN, OSCILLATOR_EXIT_MODE, symbols
 )
 from setup import (
-    df, fyers, fyers_asysc, ticker, option_chain, spot_price,
+    df, fyers, ticker, option_chain, spot_price,
     start_time, end_time, hist_data
 )
 from indicators import (
@@ -30,6 +30,7 @@ from candle_builder import build_3min_candle, build_15m_candles, get_today_15m_c
 from signals import detect_signal, evaluate_candle
 from tickdb import tick_db
 from orchestration import update_candles_and_signals
+
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -877,6 +878,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
     global quantity, paper_info, df, spot_price, last_signal_candle_time, risk_info
 
     COOLDOWN_SECONDS = 180  # 3 minutes
+    CONFIDENCE_THRESHOLD = 80  # configurable, move to config.py if preferred
 
     # --- Safety reset ---
     for leg in ["call_buy", "put_buy"]:
@@ -923,12 +925,14 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
             cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
             signal = detect_signal(cpr, trad, cam, candles_3m, hist_yesterday_15m, spot_price=spot_price, daily_atr=daily_val)
 
-    
-    # 4. PAPER ENTRY LOGIC (with oscillator filter + expiry logging)
-
+    # 4. PAPER ENTRY LOGIC (with confidence filter)
     if signal:
-        side, reason = signal
-        logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) at spot={spot_price}{RESET}")
+        side, reason, confidence = signal
+        logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) confidence={confidence} spot={spot_price}{RESET}")
+
+        if confidence < CONFIDENCE_THRESHOLD:
+            logging.info(f"{MAGENTA}[ENTRY BLOCKED][CONFIDENCE] {side} skipped (score={confidence} < {CONFIDENCE_THRESHOLD}){RESET}")
+            return
 
         if risk_info.get("halt_trading", False):
             logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
@@ -980,6 +984,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
                         "partial_booked": False,
                         "pnl": 0,
                         "reason": reason,
+                        "confidence": confidence,   # <-- NEW
                         "order_id": f"paper_{opt_name}_{ct}",
                         "entry_time": ct,
                     })
@@ -991,16 +996,14 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
 
                     logging.info(
                         f"{GREEN}[ENTRY][PAPER][{regime_tag}] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
+                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f} CONF={confidence}{RESET}"
                     )
                 else:
                     logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}{CYAN}")
         except Exception as e:
             logging.error(f"[ENTRY ERROR][PAPER] {e}", exc_info=True)
 
-
-
-    # 5. EXIT MANAGEMENT
+    # 5. EXIT MANAGEMENT (unchanged)
     for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
         if paper_info[leg]["trade_flag"] != 1:
             continue
@@ -1014,7 +1017,7 @@ def paper_order(candles_3m, hist_yesterday_15m=None):
             logging.info(f"{YELLOW}[EXIT RECORDED][PAPER] {side} {name} at {paper_info['last_exit_time']}{RESET}")
             update_risk(paper_info, risk_info)
 
-    # 6. SAVE TRADES
+    # 6. SAVE TRADES (unchanged)
     frames = [paper_info["call_buy"]["filled_df"], paper_info["put_buy"]["filled_df"]]
     frames = [f for f in frames if not f.empty]
     if frames:
@@ -1030,6 +1033,7 @@ def live_order(candles_3m, hist_yesterday_15m=None):
     global quantity, live_info, df, spot_price, last_signal_candle_time, risk_info
 
     COOLDOWN_SECONDS = 180  # 3 minutes
+    CONFIDENCE_THRESHOLD = 80  # configurable, move to config.py if preferred
 
     # --- Safety reset ---
     for leg in ["call_buy", "put_buy"]:
@@ -1076,11 +1080,14 @@ def live_order(candles_3m, hist_yesterday_15m=None):
             cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
             signal = detect_signal(cpr, trad, cam, candles_3m, hist_yesterday_15m, spot_price=spot_price, daily_atr=daily_val)
 
-    
-    # 4. LIVE ENTRY LOGIC (with oscillator filter + expiry logging)
+    # 4. LIVE ENTRY LOGIC (with confidence filter)
     if signal:
-        side, reason = signal
-        logging.info(f"[SIGNAL][LIVE] {side} ({reason}) at spot={spot_price}")
+        side, reason, confidence = signal
+        logging.info(f"[SIGNAL][LIVE] {side} ({reason}) confidence={confidence} spot={spot_price}")
+
+        if confidence < CONFIDENCE_THRESHOLD:
+            logging.info(f"{MAGENTA}[ENTRY BLOCKED][CONFIDENCE] {side} skipped (score={confidence} < {CONFIDENCE_THRESHOLD}){RESET}")
+            return
 
         if risk_info.get("halt_trading", False):
             logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
@@ -1137,6 +1144,7 @@ def live_order(candles_3m, hist_yesterday_15m=None):
                         "partial_booked": False,
                         "pnl": 0,
                         "reason": reason,
+                        "confidence": confidence,   # <-- NEW
                         "order_id": order_id,
                         "entry_time": ct,
                     })
@@ -1148,14 +1156,14 @@ def live_order(candles_3m, hist_yesterday_15m=None):
 
                     logging.info(
                         f"{GREEN}[ENTRY][LIVE][{regime_tag}] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f}{RESET}"
+                        f"SL={stop:.2f} PT={partial_target:.2f} TG={full_target:.2f} CONF={confidence}{RESET}"
                     )
                 else:
                     logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}{RESET}")
         except Exception as e:
             logging.error(f"{RED}[ENTRY ERROR][LIVE] {e}{RESET}", exc_info=True)
 
-    # 5. EXIT MANAGEMENT
+    # 5. EXIT MANAGEMENT (unchanged)
     for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
         if live_info[leg]["trade_flag"] != 1:
             continue
@@ -1169,14 +1177,13 @@ def live_order(candles_3m, hist_yesterday_15m=None):
             logging.info(f"{YELLOW}[EXIT RECORDED][LIVE] {side} {name} at {live_info['last_exit_time']}{RESET}")
             update_risk(live_info, risk_info)
 
-    # 6. SAVE TRADES
+    # 6. SAVE TRADES (unchanged)
     frames = [live_info["call_buy"]["filled_df"], live_info["put_buy"]["filled_df"]]
     frames = [f for f in frames if not f.empty]
     if frames:
         combined = pd.concat(frames)
         combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}_LIVE.csv")
     store(live_info, account_type)
-
 
 
 # ============================================== RUN Strategy ==============================================
@@ -1225,7 +1232,7 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
             # --- Route orders if signal fired ---
             if signal:
                 side, reason = signal
-                logging.info(f"[SIGNAL FIRED] {sym} side={side} reason={reason}")
+                logging.info(f"{YELLOW}[SIGNAL FIRED] {sym} side={side} reason={reason}{RESET}")
                 if account_type.upper() == "PAPER":
                     paper_order(candles_3m, hist_yesterday_15m[sym])
                 else:
@@ -1252,7 +1259,7 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
 
                     
 if __name__ == "__main__":
-    symbols = ["NSE:NIFTY50-INDEX"]  # restrict to indices only
+    symbols = symbols  # restrict to indices only
 
     today = dt.now("Asia/Kolkata").date()
     end_time = dt.datetime(today.year, today.month, today.day, 15, 30, tz="Asia/Kolkata")

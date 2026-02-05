@@ -1,15 +1,18 @@
 # ===== setup.py =====
-
-import os, sys, webbrowser, certifi, pandas as pd, pytz
+import os, sys, webbrowser, certifi, pandas as pd, pytz, logging
 import pendulum as dt
 from fyers_apiv3 import fyersModel
-from config import client_id, secret_key, redirect_uri, ticker, strike_count, start_hour, start_min, end_hour, end_min, time_zone
+from config import (
+    client_id, secret_key, redirect_uri, ticker, strike_count,
+    start_hour, start_min, end_hour, end_min, time_zone, symbols
+)
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 
 # ===== Access token =====
 access_token = None
 access_file = f'access-{dt.now(time_zone).date()}.txt'
+
 if os.path.exists(access_file):
     with open(access_file, 'r') as f:
         access_token = f.read()
@@ -42,32 +45,47 @@ else:
 
 # ===== Trading clock =====
 start_time = dt.now(time_zone).replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
-end_time   = dt.now(time_zone).replace(hour=end_hour, minute=end_min,   second=0, microsecond=0)
+end_time   = dt.now(time_zone).replace(hour=end_hour, minute=end_min, second=0, microsecond=0)
 
 # ===== Fyers clients =====
 fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path=None)
-fyers_asysc = fyersModel.FyersModel(client_id=client_id, is_async=True, token=access_token, log_path=None)
+fyers_async = fyersModel.FyersModel(client_id=client_id, is_async=True, token=access_token, log_path=None)
 
-# ===== Option chain =====
-data = {"symbol": ticker, "strikecount": strike_count, "timestamp": ""}
-response = fyers.optionchain(data=data)['data']
-expiry_e = response['expiryData'][0]['expiry']
-data = {"symbol": ticker, "strikecount": strike_count, "timestamp": expiry_e}
-response = fyers.optionchain(data=data)['data']
-option_chain = pd.DataFrame(response['optionsChain'])
+# ===== Option chains for all symbols =====
+all_symbols = symbols[:]  # start with underlying indices
 
-symbols_from_chain = option_chain['symbol'].to_list()
-
-spot_price = response.get('underlyingValue')
-if spot_price is None:
+for sym in symbols:
     try:
-        quote = fyers.quotes(data={"symbols": ticker})
-        spot_price = quote["d"][0]["v"]["lp"]
-    except Exception:
-        spot_price = option_chain['ltp'].iloc[0] if 'ltp' in option_chain.columns else None
+        # First call to get expiry list
+        data = {"symbol": sym, "strikecount": strike_count, "timestamp": ""}
+        response = fyers.optionchain(data=data)['data']
+        expiry_e = response['expiryData'][0]['expiry']
 
-# ✅ Merge underlying + option contracts
-symbols = ["NSE:NIFTY50-INDEX"] + symbols_from_chain
+        # Second call with expiry
+        data = {"symbol": sym, "strikecount": strike_count, "timestamp": expiry_e}
+        response = fyers.optionchain(data=data)['data']
+        option_chain = pd.DataFrame(response['optionsChain'])
+
+        symbols_from_chain = option_chain['symbol'].to_list()
+        all_symbols.extend(symbols_from_chain)
+
+        logging.info(f"[OPTIONCHAIN] {sym} contracts fetched: {len(symbols_from_chain)}")
+
+        # Spot price validation
+        spot_price = response.get('underlyingValue')
+        if spot_price is None:
+            try:
+                quote = fyers.quotes(data={"symbols": sym})
+                spot_price = quote["d"][0]["v"]["lp"]
+            except Exception:
+                spot_price = option_chain['ltp'].iloc[0] if 'ltp' in option_chain.columns else None
+        logging.info(f"[SPOT] {sym} underlying spot={spot_price}")
+
+    except Exception as e:
+        logging.error(f"[OPTIONCHAIN ERROR] Failed to fetch for {sym}: {e}")
+
+# Replace symbols with merged list
+symbols = all_symbols
 
 # ===== df init =====
 df = pd.DataFrame(
