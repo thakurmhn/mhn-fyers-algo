@@ -536,43 +536,207 @@ def signal_confidence(vol_regime, reason):
     return "MEDIUM"
 
 
+def flip_signal(candles_3m, candles_15m, spot_price, atr, pivots,
+                prev_day_high=None, prev_day_low=None):
+
+    last3 = candles_3m.iloc[-1]
+    last15 = candles_15m.iloc[-1]
+    side = "NO_SIGNAL"
+    score = 0
+
+    # --- Stage 1: Trend foundation ---
+    ema_bull = last3["ema20"] > last3["ema50"] and last15["ema20"] > last15["ema50"]
+    ema_bear = last3["ema20"] < last3["ema50"] and last15["ema20"] < last15["ema50"]
+
+    st_bull = (
+        last3["supertrend_bias"] == "BULLISH" and
+        last3["supertrend_slope"] == "UP" and
+        last15["supertrend_bias"] == "BULLISH" and
+        last15["supertrend_slope"] == "UP"
+    )
+
+    st_bear = (
+        last3["supertrend_bias"] == "BEARISH" and
+        last3["supertrend_slope"] == "DOWN" and
+        last15["supertrend_bias"] == "BEARISH" and
+        last15["supertrend_slope"] == "DOWN"
+    )
+
+    if ema_bull and st_bull:
+        score += 4
+        trend_bias = "BULLISH"
+    elif ema_bear and st_bear:
+        score += 4
+        trend_bias = "BEARISH"
+    else:
+        trend_bias = "NEUTRAL"
+
+    # --- Stage 2: Spot confirmation (pivot-based) ---
+    pivot = pivots.get("pivot")
+    if pivot is not None:
+        if spot_price > pivot:
+            score += 1
+            spot_bias = "BULLISH"
+        elif spot_price < pivot:
+            score += 1
+            spot_bias = "BEARISH"
+        else:
+            spot_bias = "NEUTRAL"
+    else:
+        spot_bias = "NEUTRAL"
+
+    # --- Stage 3: Oscillator confirmation ---
+    wr = williams_r(candles_3m, period=14)
+
+    if atr < 20:
+        cci_bull = last3["cci20"] > 70
+        cci_bear = last3["cci20"] < -70
+        wr_bull = wr < -60
+        wr_bear = wr > -40
+    else:
+        cci_bull = last3["cci20"] > 30
+        cci_bear = last3["cci20"] < -30
+        wr_bull = wr < -40
+        wr_bear = wr > -60
+
+    if cci_bull and wr_bull:
+        score += 2
+        osc_bias = "BULLISH"
+    elif cci_bear and wr_bear:
+        score += 2
+        osc_bias = "BEARISH"
+    else:
+        osc_bias = "NEUTRAL"
+
+    # --- Stage 4: Volatility filter ---
+    if atr > 15:
+        score += 1
+
+    # --- Stage 5: ADX filter ---
+    adx_val = last3["adx14"]
+    if not pd.isna(adx_val):
+        if adx_val > 25:
+            score += 2
+        elif adx_val > 20 and (last3["adx14"] - candles_3m.iloc[-2]["adx14"]) > 0:
+            score += 2
+
+    # --- Structural zone gate ---
+    key_levels = [
+        pivots.get("bc"), pivots.get("tc"),
+        pivots.get("r1"), pivots.get("s1"),
+        pivots.get("r2"), pivots.get("s2"),
+        pivots.get("r3"), pivots.get("s3"),
+        prev_day_high, prev_day_low
+    ]
+    key_levels = [lvl for lvl in key_levels if lvl is not None]
+
+    if key_levels:
+        dist = min(abs(spot_price - lvl) for lvl in key_levels)
+        if dist > 0.3 * atr:
+            return "NO_SIGNAL", "NONE", score
+
+    # --- Final decision ---
+    if trend_bias == "BULLISH" and spot_bias == "BULLISH" and osc_bias == "BULLISH":
+        side = "CALL"
+    elif trend_bias == "BEARISH" and spot_bias == "BEARISH" and osc_bias == "BEARISH":
+        side = "PUT"
+
+    # --- Confidence bucket ---
+    if score >= 10:
+        confidence = "HIGH"
+    elif score >= 6:
+        confidence = "MEDIUM"
+    elif score >= 3:
+        confidence = "LOW"
+    else:
+        confidence = "NONE"
+
+    if confidence in ("LOW", "NONE"):
+        side = "NO_SIGNAL"
+
+    return side, confidence, score
+
+
+
+last_signal = "NONE"          # persistent state
+last_eval_candle_time = None  # candle close tracking
+
+def is_new_3m_candle_close(candles_3m):
+    global last_eval_candle_time
+    # ✅ use index (DatetimeIndex) instead of ["time"]
+    current_time = candles_3m.index[-1]
+
+    if last_eval_candle_time is None:
+        last_eval_candle_time = current_time
+        return True
+
+    if current_time != last_eval_candle_time:
+        last_eval_candle_time = current_time
+        return True
+
+    return False
+
+
 def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
-                  candles_3m, candles_15m, spot_price=None, daily_atr=None):
+                  candles_3m, candles_15m, spot_price=None, daily_atr=None,
+                  prev_day_high=None, prev_day_low=None):
     """
-    Orchestrates breakout/rejection detection using helpers in signals.py,
-    with pivot-level debugging, dynamic ATR, bias-aware gating,
-    and volatility-based SL/PT/TG + confidence scoring.
+    Structure-first signal engine with:
+    - Candle-close gating
+    - Bias validity override
+    - Structural zone gating
+    - Oscillator exhaustion filter
+    - Flip logic as fallback only
+    - Signal state machine
     """
+
+    global last_signal
 
     # --- Guard clauses ---
     if candles_3m is None or len(candles_3m) < 5:
         logging.warning("[SIGNAL] Not enough 3m candles to evaluate")
         return None
+
     if candles_15m is None or candles_15m.empty:
-        logging.warning("[SIGNAL] No 15m candles available for bias check")
+        logging.warning("[SIGNAL] No 15m candles available")
+        return None
+   
+    # --- Candle close gate ---
+    if not is_new_3m_candle_close(candles_3m):
         return None
 
-    # --- Resolve ATR dynamically (prefer 3m candles, fallback daily_atr) ---
-    atr, atr_source = resolve_atr(candles_3m, None)  # force dynamic ATR
+    # --- Resolve ATR ---
+    atr, atr_source = resolve_atr(candles_3m, None)
     atr = to_scalar(atr)
+
     if atr is None:
-        logging.info("[SIGNAL FILTERED] ATR unavailable, skipping")
+        logging.info("[SIGNAL FILTERED] ATR unavailable")
         return None
+
     logging.info(f"[ATR] {atr:.2f} (source={atr_source})")
 
-    # --- Bias check ---
+    # --- Bias pipeline ---
     try:
-        bias = check_bias(candles_15m, daily_atr=atr)
-        logging.info(f"[BIAS RESULT] {bias if bias else 'NA'}")
+        raw_bias = check_bias(candles_15m, daily_atr=atr)
+
+        if (
+            pd.isna(candles_15m.iloc[-1]["adx14"]) or
+            pd.isna(candles_15m.iloc[-1]["cci20"])
+        ):
+            final_bias = "NEUTRAL"
+            logging.info(f"[BIAS RAW] {raw_bias} → [BIAS FINAL] NEUTRAL (HTF invalid)")
+        else:
+            final_bias = raw_bias
+            logging.info(f"[BIAS FINAL] {final_bias}")
+
     except Exception as e:
         logging.error(f"[BIAS ERROR] {e}")
-        bias = "NEUTRAL"
+        final_bias = "NEUTRAL"
 
-    # --- Supertrend slope diagnostic (patched: unpack tuple) ---
+    # --- Supertrend diagnostic ---
     try:
         st_bias, st_slope = supertrend(candles_15m, atr_val=daily_atr)
-    except Exception as e:
-        logging.error(f"[SUPERTREND ERROR] {e}")
+    except Exception:
         st_bias, st_slope = "NEUTRAL", "FLAT"
 
     logging.info(f"[SUPERTREND] Bias={st_bias} Slope={st_slope}")
@@ -582,88 +746,101 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
     prev = candles_3m.iloc[-2]
     rng = to_scalar(last.high) - to_scalar(last.low)
 
-    # --- Pivot level debugging ---
+    # --- Pivot debug ---
     logging.info(
         f"[PIVOT DEBUG] close={last.close:.2f} "
         f"CPR={cpr_levels} TRAD={traditional_levels} CAM={camarilla_levels}"
     )
 
-    # --- Candle strength + momentum ---
+    # --- Candle strength ---
     call_ok, call_momentum = candle_strength(candles_3m, "CALL")
     put_ok,  put_momentum  = candle_strength(candles_3m, "PUT")
 
     # --- Bias gating ---
-    if bias == "BULLISH":
+    if final_bias == "BULLISH":
         put_ok = False
-    elif bias == "BEARISH":
+    elif final_bias == "BEARISH":
         call_ok = False
 
-    # --- Oscillator filter (soft) ---
+    # --- Oscillator exhaustion filter ---
     wr = williams_r(candles_3m, period=14)
     if not np.isnan(wr):
-        if bias == "BULLISH" and wr > -20:  # extreme overbought
-            logging.info(f"[OSC FILTER] CALL confidence reduced W%R={wr:.2f}")
-            call_momentum *= 0.5
-        if bias == "BEARISH" and wr < -80:  # extreme oversold
-            logging.info(f"[OSC FILTER] PUT confidence reduced W%R={wr:.2f}")
-            put_momentum *= 0.5
-
-    # --- Priority order using helpers (bias passed through) ---
-    signal = (
-        detect_cpr(last, atr, cpr_levels, call_ok, put_ok, bias) or
-        detect_camarilla(last, rng, atr, camarilla_levels, call_ok, put_ok, bias) or
-        detect_traditional_acceptance(last, atr, traditional_levels, call_ok, put_ok) or
-        detect_traditional_rejection(last, rng, traditional_levels, call_ok, put_ok) or
-        detect_traditional_continuation(last, atr, traditional_levels, call_ok, put_ok, bias) or
-        detect_pivot_acceptance(last, prev, atr, traditional_levels, call_ok, put_ok) or
-        detect_pivot_rejection(last, rng, traditional_levels, call_ok, put_ok) or
-        detect_pivot_continuation(last, atr, traditional_levels, call_ok, put_ok, bias)
-    )
-
-    # --- Decision ---
-    if signal:
-        try:
-            # ✅ Safe unpacking: handle both 2‑tuple and 4‑tuple returns
-            if isinstance(signal, (list, tuple)):
-                if len(signal) == 4:
-                    side, reason, targets, confidence = signal
-                elif len(signal) == 2:
-                    side, reason = signal
-                    # Build default targets/confidence if not provided
-                    vol_regime = classify_volatility(atr)
-                    targets = dynamic_targets(atr, side)
-                    confidence = signal_confidence(vol_regime, reason)
-                else:
-                    logging.error(f"[SIGNAL ERROR] Unexpected signal format: {signal}")
-                    return None
-            else:
-                logging.error(f"[SIGNAL ERROR] Signal not tuple/list: {signal}")
-                return None
-
-            # --- Spot price formatting ---
-            spot_price = to_scalar(spot_price)
-            spot_str = f"{spot_price:.2f}" if spot_price is not None else "NA"
-
-            # --- W%R string safely ---
-            wr_str = f"{wr:.2f}" if not np.isnan(wr) else "NA"
-
-            # --- Volatility module integration ---
-            vol_regime = classify_volatility(atr)
-            if not targets:  # ensure targets always exist
-                targets = dynamic_targets(atr, side)
-
-            logging.info(
-                f"[SIGNAL FOUND] side={side} reason={reason} "
-                f"Bias={bias} ATR={atr:.2f} VolRegime={vol_regime} "
-                f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
-                f"Confidence={confidence} W%R={wr_str} "
-                f"SupertrendSlope={st_slope} spot={spot_str}"
-            )
-            return side, reason, targets, confidence
-
-        except Exception as e:
-            logging.error(f"[SIGNAL ERROR] Exception while processing signal: {e}")
+        if wr < -90 and final_bias == "BEARISH":
+            logging.info("[EXHAUSTION FILTER] Oversold zone, skipping signal")
             return None
 
-    logging.info("[NO SIGNAL] No valid breakout/rejection detected")
-    return None
+    # --- Structural signal detection ---
+    signal = (
+        detect_cpr(last, atr, cpr_levels, call_ok, put_ok, final_bias) or
+        detect_camarilla(last, rng, atr, camarilla_levels, call_ok, put_ok, final_bias) or
+        detect_traditional_acceptance(last, atr, traditional_levels, call_ok, put_ok) or
+        detect_traditional_rejection(last, rng, traditional_levels, call_ok, put_ok) or
+        detect_traditional_continuation(last, atr, traditional_levels, call_ok, put_ok, final_bias) or
+        detect_pivot_acceptance(last, prev, atr, traditional_levels, call_ok, put_ok) or
+        detect_pivot_rejection(last, rng, traditional_levels, call_ok, put_ok) or
+        detect_pivot_continuation(last, atr, traditional_levels, call_ok, put_ok, final_bias)
+    )
+
+    # --- Structural zone gate ---
+    key_levels = [
+        cpr_levels.get("bc"), cpr_levels.get("tc"),
+        traditional_levels.get("r1"), traditional_levels.get("s1"),
+        traditional_levels.get("r2"), traditional_levels.get("s2"),
+        camarilla_levels.get("r3"), camarilla_levels.get("s3"),
+        prev_day_high, prev_day_low
+    ]
+    key_levels = [lvl for lvl in key_levels if lvl is not None]
+
+    if key_levels:
+        dist = min(abs(to_scalar(spot_price) - lvl) for lvl in key_levels)
+        if dist > 0.3 * atr:
+            logging.info("[ZONE FILTER] Price mid-range, NO_SIGNAL")
+            return None
+
+    # --- Flip logic (fallback only) ---
+    flip_side, flip_confidence, flip_score = flip_signal(
+        candles_3m, candles_15m, spot_price, atr, cpr_levels,
+        prev_day_high=prev_day_high,
+        prev_day_low=prev_day_low
+    )
+
+    if not signal and flip_side in ("CALL", "PUT") and flip_confidence in ("MEDIUM", "HIGH"):
+        side = flip_side
+        confidence = flip_confidence
+        reason = f"FLIP(score={flip_score})"
+        targets = dynamic_targets(atr, side)
+
+    elif signal:
+        side, reason, targets, confidence = signal
+    else:
+        logging.info("[NO SIGNAL] No valid breakout/rejection detected")
+        return None
+
+    # --- Confidence gate ---
+    if confidence not in ("MEDIUM", "HIGH"):
+        logging.info(f"[SIGNAL FILTERED] side={side} confidence={confidence}")
+        return None
+
+    # --- Signal state machine ---
+    if side == last_signal or side == "NO_SIGNAL":
+        logging.info(f"[STATE MACHINE] Ignored repeat/no signal side={side}")
+        return None
+
+    last_signal = side
+
+    # --- Final logging ---
+    spot_price = to_scalar(spot_price)
+    spot_str = f"{spot_price:.2f}" if spot_price is not None else "NA"
+    wr_str = f"{wr:.2f}" if not np.isnan(wr) else "NA"
+    vol_regime = classify_volatility(atr)
+
+    logging.info(
+        f"[SIGNAL FOUND] side={side} reason={reason} "
+        f"Bias={final_bias} ATR={atr:.2f} VolRegime={vol_regime} "
+        f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
+        f"Confidence={confidence} W%R={wr_str} "
+        f"SupertrendSlope={st_slope} FlipScore={flip_score} "
+        f"FlipConf={flip_confidence} spot={spot_str}"
+    )
+
+    return side, reason, targets, confidence

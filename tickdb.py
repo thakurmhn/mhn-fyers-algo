@@ -294,7 +294,7 @@ class TickDatabase:
             return pd.DataFrame()
 
         from datetime import datetime, timedelta
-        import pytz
+        import pytz, os, sqlite3
         time_zone = pytz.timezone("Asia/Kolkata")
         today = datetime.now(time_zone).date()
 
@@ -309,8 +309,17 @@ class TickDatabase:
                 if symbol:
                     query += " AND symbol = ?"
                     params.append(symbol)
+
                 try:
+                    # Try current connection first
                     df = pd.read_sql_query(query, self.conn, params=params)
+                    if df.empty:
+                        # If empty, try opening the snapshot DB for that date
+                        db_path = f"C:/SQLite/ticks/ticks_{trade_date}.db"
+                        if os.path.exists(db_path):
+                            with sqlite3.connect(db_path) as alt_conn:
+                                df = pd.read_sql_query(query, alt_conn, params=params)
+                                logging.debug(f"[DB INFO] Loaded {resolution} candles from {db_path}")
                     if not df.empty:
                         break
                 except Exception as e:
@@ -326,7 +335,6 @@ class TickDatabase:
                 query += " AND symbol = ?"
                 params.append(symbol)
 
-            # --- Apply time filters before executing ---
             if start_time:
                 query += " AND ist_slot >= ?"
                 params.append(start_time)

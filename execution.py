@@ -1248,7 +1248,7 @@ def sleep_until_next_boundary(interval=180, tz="Asia/Kolkata"):
 # --- Main Orchestration Loop ---
 # ===== execution.py =====
 
-def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
+def run_strategy(symbols, tz=time_zone, end_time=None):
     """
     Orchestration loop:
     - Refresh spot price
@@ -1274,8 +1274,7 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
             # --- Delegate candles + signal detection ---
             signal, candles_3m = update_candles_and_signals(
                 symbol=sym,
-                hist_yesterday_15m=hist_yesterday_15m.get(sym),
-                spot_price=spot_price   # ✅ pass spot price down
+                spot_price=spot_price   # ✅ only pass spot price now
             )
 
             # --- Route orders if signal fired ---
@@ -1298,9 +1297,9 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
 
                 # --- Order routing ---
                 if account_type.upper() == "PAPER":
-                    paper_order(candles_3m, hist_yesterday_15m[sym])
+                    paper_order(candles_3m)   # ✅ no hist_yesterday_15m
                 else:
-                    live_order(candles_3m, hist_yesterday_15m[sym])
+                    live_order(candles_3m)    # ✅ no hist_yesterday_15m
 
             # --- Extra bias logic on 15m close ---
             if now.minute % 15 == 0 and now.second == 0:
@@ -1319,7 +1318,6 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
                     atr_value, atr_source = resolve_atr(hist_data, daily_val)
                     atr_str = f"{atr_value:.2f}" if atr_value is not None else "NA"
                     logging.info(f"[ATR] {sym} source={atr_source} value={atr_str}")
-
                     
 if __name__ == "__main__":
     # --- Restrict to indices explicitly ---

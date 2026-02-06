@@ -103,7 +103,7 @@ async def main_strategy_code():
         # --- Mode control ---
         if MODE == "STRATEGY":
             try:
-                run_strategy(symbols, hist_yesterday_15m, tz=time_zone, end_time=end_time)
+                run_strategy(symbols, end_time=end_time)
             except Exception as e:
                 logging.error(f"[STRATEGY ERROR] {e}", exc_info=True)
         else:
