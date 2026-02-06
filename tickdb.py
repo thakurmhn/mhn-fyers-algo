@@ -141,6 +141,25 @@ class TickDatabase:
             logging.error(f"[DB ERROR] Failed to fetch ticks: {e}")
             return pd.DataFrame(columns=["timestamp", "last_price", "volume"])
 
+    def get_latest_tick(self, symbol):
+        """Fetch the most recent tick for a symbol."""
+        try:
+            df = pd.read_sql_query(
+                "SELECT * FROM ticks WHERE symbol=? ORDER BY timestamp DESC LIMIT 1",
+                self.conn, params=[symbol]
+            )
+            if df.empty:
+                return None
+            # Normalize numeric fields
+            for col in ["last_price", "volume", "bid", "ask"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df.iloc[0].to_dict()
+        except Exception as e:
+            logging.error(f"[DB ERROR] Failed to fetch latest tick for {symbol}: {e}")
+            return None
+
+
     def replay_ticks(self, symbol):
         try:
             df = pd.read_sql_query(

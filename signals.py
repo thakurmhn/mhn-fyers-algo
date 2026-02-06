@@ -336,14 +336,23 @@ def bias_from_indicators(row, df_15m=None):
     elif row['ema20'] < row['ema50']:
         reason.append("EMA20<EMA50"); score += 20
 
-    # Supertrend (3m)
-    st_val = row['supertrend']
-    if isinstance(st_val, (int, float)):
-        st_val = "up" if st_val > 0 else "down"
-    if st_val == 'up':
+    # Supertrend (3m bias + slope)
+    st_bias = row.get('supertrend_bias')
+    st_slope = row.get('supertrend_slope')
+    if st_bias == "BULLISH":
         reason.append("3m Supertrend=UP"); score += 20
-    elif st_val == 'down':
+    elif st_bias == "BEARISH":
         reason.append("3m Supertrend=DOWN"); score += 20
+    if st_slope:
+        reason.append(f"Slope={st_slope}")
+
+    # Confidence boost/penalty based on slope
+    if st_slope == "UP" and st_bias == "BULLISH":
+        score += 10
+    elif st_slope == "DOWN" and st_bias == "BEARISH":
+        score += 10
+    elif st_slope == "FLAT":
+        score -= 10
 
     # ADX
     if row['adx14'] > 20:
@@ -355,23 +364,24 @@ def bias_from_indicators(row, df_15m=None):
     elif row['cci20'] < -50:
         reason.append("CCI<-50"); score += 20
 
-    # Multi-timeframe Supertrend
-    st_15m = None
+    # Multi-timeframe Supertrend (15m bias + slope)
+    st_15m_bias, st_15m_slope = None, None
     if df_15m is not None and not df_15m.empty:
-        st_val_15m = df_15m.iloc[-1]['supertrend']
-        if isinstance(st_val_15m, (int, float)):
-            st_val_15m = "up" if st_val_15m > 0 else "down"
-        st_15m = st_val_15m
-        reason.append(f"15m Supertrend={st_15m.upper()}"); score += 20
+        st_15m_bias = df_15m.iloc[-1].get('supertrend_bias')
+        st_15m_slope = df_15m.iloc[-1].get('supertrend_slope')
+        if st_15m_bias:
+            reason.append(f"15m Supertrend={st_15m_bias}")
+        if st_15m_slope:
+            reason.append(f"15m Slope={st_15m_slope}")
 
-    # Decision
-    if (row['supertrend'] == 'up' and st_15m == 'up'
+    # Decision with slope filter
+    if (st_bias == "BULLISH" and st_slope == "UP" and st_15m_bias == "BULLISH" and st_15m_slope == "UP"
         and row['close'] > row['ema20']
         and row['cci20'] > 50
         and row['adx14'] > 20):
         return "CALL BUY | " + ", ".join(reason), score
 
-    elif (row['supertrend'] == 'down' and st_15m == 'down'
+    elif (st_bias == "BEARISH" and st_slope == "DOWN" and st_15m_bias == "BEARISH" and st_15m_slope == "DOWN"
           and row['close'] < row['ema20']
           and row['cci20'] < -50
           and row['adx14'] > 20):
@@ -379,7 +389,6 @@ def bias_from_indicators(row, df_15m=None):
 
     else:
         return "HOLD | " + ", ".join(reason), score
-
 
 def to_scalar(val):
     """Convert Series/DataFrame cell to scalar float if possible."""
@@ -503,15 +512,17 @@ def classify_volatility(atr_val, thresholds=(15, 30)):
     else:
         return "HIGH"
 
+def dynamic_targets(atr, side):
+    # ATR multiples for different levels
+    sl_val = atr * 1.5
+    pt_val = atr * 1.0   # partial target (closer)
+    tg_val = atr * 2.0   # final target (further)
 
-def dynamic_targets(atr_val, side):
-    """
-    Generate dynamic SL/PT/TG based on ATR.
-    """
-    sl = 1.5 * atr_val
-    pt = 2.0 * atr_val
-    tg = atr_val  # expected move per candle
-    return {"side": side, "SL": sl, "PT": pt, "TG": tg}
+    return {
+        "SL": sl_val,
+        "PT": pt_val,    # partial target
+        "TG": tg_val     # final target
+    }
 
 
 def signal_confidence(vol_regime, reason):
@@ -557,10 +568,13 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
         logging.error(f"[BIAS ERROR] {e}")
         bias = "NEUTRAL"
 
-    # --- Supertrend slope diagnostic ---
-    st_result = supertrend(candles_15m, atr_val=daily_atr)
-    st_bias = st_result.get("bias", "NEUTRAL")
-    st_slope = st_result.get("slope", "FLAT")
+    # --- Supertrend slope diagnostic (patched: unpack tuple) ---
+    try:
+        st_bias, st_slope = supertrend(candles_15m, atr_val=daily_atr)
+    except Exception as e:
+        logging.error(f"[SUPERTREND ERROR] {e}")
+        st_bias, st_slope = "NEUTRAL", "FLAT"
+
     logging.info(f"[SUPERTREND] Bias={st_bias} Slope={st_slope}")
 
     # --- Candle references ---
@@ -608,26 +622,48 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
 
     # --- Decision ---
     if signal:
-        side, reason = signal
-        spot_price = to_scalar(spot_price)
-        spot_str = f"{spot_price:.2f}" if spot_price is not None else "NA"
+        try:
+            # ✅ Safe unpacking: handle both 2‑tuple and 4‑tuple returns
+            if isinstance(signal, (list, tuple)):
+                if len(signal) == 4:
+                    side, reason, targets, confidence = signal
+                elif len(signal) == 2:
+                    side, reason = signal
+                    # Build default targets/confidence if not provided
+                    vol_regime = classify_volatility(atr)
+                    targets = dynamic_targets(atr, side)
+                    confidence = signal_confidence(vol_regime, reason)
+                else:
+                    logging.error(f"[SIGNAL ERROR] Unexpected signal format: {signal}")
+                    return None
+            else:
+                logging.error(f"[SIGNAL ERROR] Signal not tuple/list: {signal}")
+                return None
 
-        # ✅ Fix: build W%R string safely
-        wr_str = f"{wr:.2f}" if not np.isnan(wr) else "NA"
+            # --- Spot price formatting ---
+            spot_price = to_scalar(spot_price)
+            spot_str = f"{spot_price:.2f}" if spot_price is not None else "NA"
 
-        # --- Volatility module integration ---
-        vol_regime = classify_volatility(atr)
-        targets = dynamic_targets(atr, side)
-        confidence = signal_confidence(vol_regime, reason)
+            # --- W%R string safely ---
+            wr_str = f"{wr:.2f}" if not np.isnan(wr) else "NA"
 
-        logging.info(
-            f"[SIGNAL FOUND] side={side} reason={reason} "
-            f"Bias={bias} ATR={atr:.2f} VolRegime={vol_regime} "
-            f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
-            f"Confidence={confidence} W%R={wr_str} "
-            f"SupertrendSlope={st_slope} spot={spot_str}"
-        )
-        return side, reason, targets, confidence
+            # --- Volatility module integration ---
+            vol_regime = classify_volatility(atr)
+            if not targets:  # ensure targets always exist
+                targets = dynamic_targets(atr, side)
+
+            logging.info(
+                f"[SIGNAL FOUND] side={side} reason={reason} "
+                f"Bias={bias} ATR={atr:.2f} VolRegime={vol_regime} "
+                f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
+                f"Confidence={confidence} W%R={wr_str} "
+                f"SupertrendSlope={st_slope} spot={spot_str}"
+            )
+            return side, reason, targets, confidence
+
+        except Exception as e:
+            logging.error(f"[SIGNAL ERROR] Exception while processing signal: {e}")
+            return None
 
     logging.info("[NO SIGNAL] No valid breakout/rejection detected")
     return None

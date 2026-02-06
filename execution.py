@@ -126,17 +126,47 @@ def store(data, account_type_):
 
 def load(account_type_):
     """
-    Load the full ledger from pickle file.
-    Returns a list of snapshots (each with timestamp + state).
+    Load the latest trading state from pickle file.
+    Returns the most recent snapshot's state dict.
     """
     filename = f"data-{dt.now(time_zone).date()}-{account_type_}.pickle"
     try:
         with open(filename, "rb") as f:
             ledger = pickle.load(f)
-        return ledger
+
+        # Ledger is a list of snapshots; return the latest state
+        if isinstance(ledger, list) and ledger:
+            return ledger[-1]["state"]
+        elif isinstance(ledger, dict):
+            # Legacy single snapshot
+            return ledger
+        else:
+            raise ValueError("Ledger format invalid or empty")
     except Exception as e:
         logging.warning(f"State load failed (fresh start): {e}")
         raise
+
+
+def load_ledger(account_type_):
+    """
+    Load the full ledger (all snapshots) from pickle file.
+    Useful for audit, replay, or debugging.
+    """
+    filename = f"data-{dt.now(time_zone).date()}-{account_type_}.pickle"
+    try:
+        with open(filename, "rb") as f:
+            ledger = pickle.load(f)
+
+        # Normalize legacy formats
+        if isinstance(ledger, dict):
+            return [ledger]
+        elif isinstance(ledger, list):
+            return ledger
+        else:
+            return []
+    except Exception as e:
+        logging.warning(f"Ledger load failed: {e}")
+        return []
 
 def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
     """
@@ -357,9 +387,13 @@ if account_type == 'PAPER':
                 'underlying_price_level': 0,
                 'quantity': quantity,
                 'pnl': 0,
-                'trade_count': 0,
                 'trail_start_pnl': 0,
-                'trail_step_points': 0
+                'trail_step_points': 0,
+                'reason': None,
+                'confidence': 0,
+                'order_id': None,
+                'entry_time': None,
+                'partial_booked': False,
             },
             'put_buy': {
                 'option_name': put_option,
@@ -373,14 +407,19 @@ if account_type == 'PAPER':
                 'underlying_price_level': 0,
                 'quantity': quantity,
                 'pnl': 0,
-                'trade_count': 0,
                 'trail_start_pnl': 0,
-                'trail_step_points': 0
+                'trail_step_points': 0,
+                'reason': None,
+                'confidence': 0,
+                'order_id': None,
+                'entry_time': None,
+                'partial_booked': False,
             },
             'condition': False,
             'total_pnl': 0,
             'trade_count': 0,
-            'max_trades': MAX_TRADES_PER_DAY
+            'max_trades': MAX_TRADES_PER_DAY,
+            'last_exit_time': None,
         }
 
 else:
@@ -434,9 +473,13 @@ else:
                 'underlying_price_level': 0,
                 'quantity': quantity,
                 'pnl': 0,
-                'trade_count': 0,
                 'trail_start_pnl': 0,
-                'trail_step_points': 0
+                'trail_step_points': 0,
+                'reason': None,
+                'confidence': 0,
+                'order_id': None,
+                'entry_time': None,
+                'partial_booked': False,
             },
             'put_buy': {
                 'option_name': put_option,
@@ -450,15 +493,21 @@ else:
                 'underlying_price_level': 0,
                 'quantity': quantity,
                 'pnl': 0,
-                'trade_count': 0,
                 'trail_start_pnl': 0,
-                'trail_step_points': 0
+                'trail_step_points': 0,
+                'reason': None,
+                'confidence': 0,
+                'order_id': None,
+                'entry_time': None,
+                'partial_booked': False,
             },
             'condition': False,
             'total_pnl': 0,
             'trade_count': 0,
-            'max_trades': MAX_TRADES_PER_DAY
+            'max_trades': MAX_TRADES_PER_DAY,
+            'last_exit_time': None,
         }
+
 
 # ===== Broker order functions =====
 
@@ -1231,8 +1280,23 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
 
             # --- Route orders if signal fired ---
             if signal:
-                side, reason = signal
-                logging.info(f"{YELLOW}[SIGNAL FIRED] {sym} side={side} reason={reason}{RESET}")
+                if isinstance(signal, (list, tuple)):
+                    if len(signal) == 4:
+                        side, reason, targets, confidence = signal
+                        logging.info(
+                            f"{YELLOW}[SIGNAL FIRED] {sym} side={side} reason={reason} "
+                            f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
+                            f"Confidence={confidence}{RESET}"
+                        )
+                    elif len(signal) == 2:
+                        side, reason = signal
+                        logging.info(f"{YELLOW}[SIGNAL FIRED] {sym} side={side} reason={reason}{RESET}")
+                    else:
+                        logging.error(f"[SIGNAL ERROR] Unexpected signal format: {signal}")
+                else:
+                    logging.error(f"[SIGNAL ERROR] Signal not tuple/list: {signal}")
+
+                # --- Order routing ---
                 if account_type.upper() == "PAPER":
                     paper_order(candles_3m, hist_yesterday_15m[sym])
                 else:
@@ -1256,16 +1320,17 @@ def run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=None):
                     atr_str = f"{atr_value:.2f}" if atr_value is not None else "NA"
                     logging.info(f"[ATR] {sym} source={atr_source} value={atr_str}")
 
-
                     
 if __name__ == "__main__":
-    symbols = symbols  # restrict to indices only
+    # --- Restrict to indices explicitly ---
+    symbols = ["NSE:NIFTY50-INDEX"]  # adjust as needed
 
     today = dt.now("Asia/Kolkata").date()
     end_time = dt.datetime(today.year, today.month, today.day, 15, 30, tz="Asia/Kolkata")
 
     logging.info(f"[SESSION] Trading until {end_time}")
 
+    # --- Bootstrap yesterday’s 15m candles ---
     hist_yesterday_15m = {
         sym: tick_db.fetch_candles("15m", use_yesterday=True, symbol=sym)
         for sym in symbols
@@ -1273,6 +1338,10 @@ if __name__ == "__main__":
 
     # ✅ Visibility: log how many 15m candles were bootstrapped per symbol
     for sym, df in hist_yesterday_15m.items():
-        logging.info(f"{CYAN}[BOOTSTRAP] {sym} yesterday 15m candles={len(df)}{RESET}")
+        if df is not None and not df.empty:
+            logging.info(f"{CYAN}[BOOTSTRAP] {sym} yesterday 15m candles={len(df)}{RESET}")
+        else:
+            logging.warning(f"{CYAN}[BOOTSTRAP] {sym} no 15m candles found for yesterday{RESET}")
 
+    # --- Run strategy orchestration ---
     run_strategy(symbols, hist_yesterday_15m, tz="Asia/Kolkata", end_time=end_time)

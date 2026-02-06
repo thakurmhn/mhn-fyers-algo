@@ -276,16 +276,16 @@ def supertrend(df, atr_val=None, period=7, multiplier=3, slope_lookback=5):
     """
     Compute Supertrend bias and slope.
     - df: DataFrame with 'high','low','close'
-    - atr_val: optional float ATR override
+    - atr_val: optional float ATR override (from resolve_atr)
     - period: ATR period if computing internally
     - multiplier: Supertrend multiplier
     - slope_lookback: number of candles to measure slope
-    Returns dict: {"bias": "BULLISH/BEARISH/NEUTRAL", "slope": "UP/DOWN/FLAT"}
+    Returns tuple: (bias, slope)
     """
 
     if df is None or df.empty:
         logging.warning("[SUPERTREND] No candles provided")
-        return {"bias": "NEUTRAL", "slope": "FLAT"}
+        return "NEUTRAL", "FLAT"
 
     # --- ATR resolution ---
     if atr_val is None or pd.isna(atr_val):
@@ -295,8 +295,8 @@ def supertrend(df, atr_val=None, period=7, multiplier=3, slope_lookback=5):
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         atr_series = tr.rolling(period).mean().dropna()
         if atr_series.empty:
-            logging.warning("[SUPERTREND] ATR unavailable")
-            return {"bias": "NEUTRAL", "slope": "FLAT"}
+            logging.warning("[SUPERTREND] ATR unavailable (internal calc)")
+            return "NEUTRAL", "FLAT"
         atr_val = float(atr_series.iloc[-1])
         logging.debug(f"[SUPERTREND] ATR calculated={atr_val:.2f}")
     else:
@@ -305,7 +305,7 @@ def supertrend(df, atr_val=None, period=7, multiplier=3, slope_lookback=5):
             logging.debug(f"[SUPERTREND] ATR override={atr_val:.2f}")
         except Exception:
             logging.error("[SUPERTREND] Invalid ATR override")
-            return {"bias": "NEUTRAL", "slope": "FLAT"}
+            return "NEUTRAL", "FLAT"
 
     # --- Supertrend bands ---
     hl2 = (df['high'] + df['low']) / 2
@@ -334,9 +334,8 @@ def supertrend(df, atr_val=None, period=7, multiplier=3, slope_lookback=5):
     else:
         slope = "FLAT"
 
-    logging.info(f"[SUPERTREND] Bias={bias} Slope={slope}")
-    return {"bias": bias, "slope": slope}
-
+    logging.info(f"[SUPERTREND] Bias={bias} Slope={slope} (ATR={atr_val:.2f})")
+    return bias, slope
 
 def calculate_adx(df, period=14):
     """Average Directional Index (ADX) that always returns a Series."""
@@ -422,16 +421,9 @@ def check_bias(df_15m, daily_atr=None):
 
     row = df_15m.iloc[-1]
 
-    # Supertrend normalization
-    st_val = row.get("supertrend", "NEUTRAL")
-    if isinstance(st_val, (int, float)):
-        st_val = "BULLISH" if st_val > 0 else "BEARISH"
-    elif str(st_val).lower() == "up":
-        st_val = "BULLISH"
-    elif str(st_val).lower() == "down":
-        st_val = "BEARISH"
-    else:
-        st_val = "NEUTRAL"
+    # --- Supertrend bias/slope ---
+    st_bias = row.get("supertrend_bias", "NEUTRAL")
+    st_slope = row.get("supertrend_slope", "FLAT")
 
     ema_val = "BULLISH" if row["ema20"] > row["ema50"] else "BEARISH"
 
@@ -461,8 +453,14 @@ def check_bias(df_15m, daily_atr=None):
         scores[adx_bias] += 2 if adx_val and adx_val > 25 else 1
     if cci_bias in scores:
         scores[cci_bias] += 1
-    if st_val in ("BULLISH", "BEARISH"):
-        scores[st_val] += 2
+    if st_bias in ("BULLISH", "BEARISH"):
+        scores[st_bias] += 2
+
+    # ✅ slope contribution
+    if st_slope == "UP" and st_bias == "BULLISH":
+        scores["BULLISH"] += 1
+    elif st_slope == "DOWN" and st_bias == "BEARISH":
+        scores["BEARISH"] += 1
 
     # ATR contribution
     if daily_atr is not None and row["close"]:
@@ -472,7 +470,8 @@ def check_bias(df_15m, daily_atr=None):
 
     logging.info(
         f"[BIAS CHECK] ATR={daily_atr if daily_atr else 'NA'} "
-        f"Supertrend={st_val} EMA={ema_val} ADX={adx_bias}({adx_val}) CCI={cci_bias}({cci_val})"
+        f"Supertrend={st_bias} Slope={st_slope} EMA={ema_val} "
+        f"ADX={adx_bias}({adx_val}) CCI={cci_bias}({cci_val})"
     )
     logging.info(f"[BIAS SCORES] BULLISH={scores['BULLISH']} BEARISH={scores['BEARISH']}")
 
@@ -485,7 +484,6 @@ def check_bias(df_15m, daily_atr=None):
     else:
         logging.info("[BIAS RESULT] NEUTRAL (tie)")
         return "NEUTRAL"
-    
 
 # def cci_indicator(candles, period=20):
 #     if len(candles) < period:

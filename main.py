@@ -6,7 +6,7 @@ import pandas as pd
 import pendulum as dt
 import warnings
 
-from config import time_zone, MODE
+from config import time_zone, MODE, symbols
 from execution import run_strategy
 from data_feed import fyers_socket, fyers_order_socket, chase_order, fyers_async, tick_db, symbols
 from indicators import (

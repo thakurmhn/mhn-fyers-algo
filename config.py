@@ -22,7 +22,7 @@ redirect_uri = os.getenv("FYERS_REDIRECT_URI")
 
 strategy_name = 'option_buying_pivot'
 index_name = 'NIFTY50'
-symbols = ["NSE:NIFTY50-INDEX",  "NSE:FINNIFTY-INDEX"]
+symbols = ["NSE:NIFTY50-INDEX"]
 # # ["NSE:NIFTY50-INDEX", "NSE:BANKNIFTY-INDEX", "NSE:FINNIFTY-INDEX"]
 exchange = 'NSE'
 ticker = f"{exchange}:{index_name}-INDEX"
@@ -89,7 +89,7 @@ OSCILLATOR_EXIT_MODE = "HARD"   # or "TRAIL"
 
 # ========================= MODE ====================
 
-MODE = "COLLECT"   # or "STRATEGY"      # Collet and build db with tick data #Strategy - run the whole bot strategy 
+MODE =  "STRATEGY"  # "COLLECT" or "STRATEGY"      # Collet = and build db with tick data #Strategy = run the whole bot strategy 
 
 
 

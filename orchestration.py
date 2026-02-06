@@ -32,7 +32,6 @@ GRAY    = "\033[90m"
 CYAN    = "\033[96m"
 
 
-
 def build_indicator_dataframe(symbol, interval="3m", df_15m=None):
     # --- Fetch candles from DB ---
     df = tick_db.fetch_candles(resolution=interval, symbol=symbol)
@@ -40,29 +39,59 @@ def build_indicator_dataframe(symbol, interval="3m", df_15m=None):
         logging.warning(f"[INDICATORS] No {interval} candles for {symbol}")
         return pd.DataFrame()
 
-    # --- Apply indicators using standardized function names ---
+    # --- Append latest in-progress candle from ticks ---
+    latest_tick = tick_db.get_latest_tick(symbol)
+    if latest_tick is not None:
+        in_progress = {
+            "open": latest_tick["last_price"],
+            "high": latest_tick["last_price"],
+            "low": latest_tick["last_price"],
+            "close": latest_tick["last_price"],
+            "volume": latest_tick.get("volume", 0),
+            "trade_date": latest_tick["trade_date"],
+            "ist_slot": pd.to_datetime(latest_tick["timestamp"])
+                          .tz_localize("UTC")
+                          .tz_convert("Asia/Kolkata")
+                          .strftime("%H:%M:%S"),
+            "symbol": symbol,
+            "in_progress": True,
+        }
+        df = pd.concat([df, pd.DataFrame([in_progress])], ignore_index=True)
+
+    # --- Indicators ---
     df["ema20"] = calculate_ema(df, column="close", period=20)
     df["ema50"] = calculate_ema(df, column="close", period=50)
     df["adx14"] = calculate_adx(df)
     df["cci20"] = calculate_cci(df)
-    df["supertrend"] = supertrend(df)
+
+    # --- ATR resolution for Supertrend ---
+    daily_val = daily_atr(df_15m) if df_15m is not None and not df_15m.empty else None
+    atr, atr_source = resolve_atr(df, daily_val)
+
+    # --- Supertrend bias/slope assignment (last row only) ---
+    bias, slope = supertrend(df, atr_val=atr)
+    df.loc[df.index[-1], "supertrend_bias"] = bias
+    df.loc[df.index[-1], "supertrend_slope"] = slope
 
     # --- Enrich with bias/signal ---
     df["signal"], df["confidence"] = zip(*df.apply(
         lambda row: bias_from_indicators(row, df_15m), axis=1
     ))
 
-    # --- Debug log: show last enriched row ---
+    # --- Debug log ---
     last_row = df.iloc[-1]
+    progress_tag = "LIVE" if last_row.get("in_progress", False) else "FINAL"
     logging.info(
-        f"{CYAN}[INDICATOR DF] {symbol} {interval} "
+        f"{CYAN}[INDICATOR DF] {symbol} {interval} ({progress_tag}) "
         f"ema20={last_row['ema20']:.2f} ema50={last_row['ema50']:.2f} "
         f"adx14={last_row['adx14']:.2f} cci20={last_row['cci20']:.2f} "
-        f"supertrend={last_row['supertrend']} "
+        f"supertrend_bias={last_row['supertrend_bias']} "
+        f"slope={last_row['supertrend_slope']} "
         f"signal={last_row['signal']} confidence={last_row['confidence']}{RESET}"
     )
 
     return df
+
 
 def build_multi_symbol_indicators(symbols=None, interval="3m"):
     if symbols is None:
@@ -245,9 +274,24 @@ def update_candles_and_signals(symbol, hist_yesterday_15m=None, spot_price=None)
             spot_price=spot_price,
             daily_atr=daily_val
         )
+
         if signal:
-            side, reason = signal
-            logging.info(f"{GREEN}[SIGNAL FIRED] {symbol} side={side} reason={reason}{RESET}")
+            if isinstance(signal, (list, tuple)):
+                if len(signal) == 4:
+                    side, reason, targets, confidence = signal
+                    logging.info(
+                        f"{GREEN}[SIGNAL FIRED] {symbol} side={side} reason={reason} "
+                        f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
+                        f"Confidence={confidence}{RESET}"
+                    )
+                elif len(signal) == 2:
+                    side, reason = signal
+                    logging.info(f"{GREEN}[SIGNAL FIRED] {symbol} side={side} reason={reason}{RESET}")
+                else:
+                    logging.error(f"[SIGNAL ERROR] Unexpected signal format: {signal}")
+            else:
+                logging.error(f"[SIGNAL ERROR] Signal not tuple/list: {signal}")
+
             return signal, df_3m
         else:
             logging.debug(f"[SIGNAL CHECK] No signal for {symbol}")
