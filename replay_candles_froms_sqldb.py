@@ -1,100 +1,117 @@
-import sqlite3
 import pandas as pd
+import sqlite3
 import logging
 import os
+from datetime import datetime
 
-from indicators import (
-    calculate_cpr,
-    calculate_traditional_pivots,
-    calculate_camarilla_pivots,
-    calculate_atr,
-    calculate_ema,
-    calculate_adx,
-    calculate_cci,
-    supertrend,
-    daily_atr,
-    check_bias,
-    resolve_atr   # <-- updated rolling ATR function
-)
+from indicators import resolve_atr
+from signals import detect_signal, check_exit_condition
+from previous_day_pivot_testing import compute_levels
+from execution import run_strategy   # <-- import your orchestration loop
 
-from orchestration import build_indicator_dataframe
-from signals import detect_signal
-from setup import fyers_async
+# --- Colors ---
+RESET   = "\033[0m"
+GREEN   = "\033[92m"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 
-def fetch_candles(db_path, table, date=None):
-    conn = sqlite3.connect(db_path)
-    query = f"SELECT * FROM {table}"
-    if date:
-        query += f" WHERE trade_date='{date}'"
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    return df
+def fmt(val):
+    try:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return "NA"
+        return f"{val:.2f}"
+    except Exception:
+        return str(val) if val is not None else "NA"
 
-def replay_signals(symbol, date):
-    # --- Auto resolve DB path ---
-    db_path = os.path.join(r"C:\\SQLite\\ticks", f"ticks_{date}.db")
-    logging.info(f"[DB PATH] Using database at {db_path}")
+def replay_run_strategy(symbol, date):
+    # --- Connect to DBs ---
+    db_path_prev = os.path.join(r"C:\\SQLite\\ticks", f"ticks_2026-02-05.db")
+    db_path_curr = os.path.join(r"C:\\SQLite\\ticks", f"ticks_{date}.db")
 
-    df_15m = fetch_candles(db_path, "candles_15m_ist", date)
-    df_3m  = fetch_candles(db_path, "candles_3m_ist", date)
+    conn_prev = sqlite3.connect(db_path_prev)
+    conn_curr = sqlite3.connect(db_path_curr)
 
-    # --- Filter for symbol ---
-    df_15m = df_15m[df_15m["symbol"] == symbol]
-    df_3m  = df_3m[df_3m["symbol"] == symbol]
+    # --- Query 15m candles for daily OHLC ---
+    query_15m = f"""
+    SELECT trade_date, ist_slot, open, high, low, close
+    FROM candles_15m_ist
+    WHERE symbol = '{symbol}'
+    """
+    df_prev_15m = pd.read_sql(query_15m, conn_prev)
+    df_curr_15m = pd.read_sql(query_15m, conn_curr)
+    df_15m = pd.concat([df_prev_15m, df_curr_15m], ignore_index=True)
 
-    if df_15m.empty or df_3m.empty:
-        logging.warning(f"[REPLAY] Missing candles for {date} {symbol}")
-        return
+    df_15m["datetime"] = pd.to_datetime(df_15m["trade_date"] + " " + df_15m["ist_slot"])
+    df_15m.set_index("datetime", inplace=True)
 
-    logging.info(f"[REPLAY] Loaded {len(df_15m)} 15m candles and {len(df_3m)} 3m candles for {symbol} on {date}")
+    # --- Build daily OHLC ---
+    df_daily = df_15m.resample("1D").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last"
+    }).dropna()
 
-    # --- Compute levels from last 15m candle ---
-    last_15m = df_15m.iloc[-1]
-    cpr_levels         = calculate_cpr(last_15m.high, last_15m.low, last_15m.close)
-    traditional_levels = calculate_traditional_pivots(last_15m.high, last_15m.low, last_15m.close)
-    camarilla_levels   = calculate_camarilla_pivots(last_15m.high, last_15m.low, last_15m.close)
+    prev_day = df_daily.iloc[-2]
+    prev_high, prev_low, prev_close = prev_day.high, prev_day.low, prev_day.close
 
-    # --- Enrich 15m DF with indicators ---
-    df_15m = build_indicator_dataframe(symbol, interval="15m")
+    # --- Compute levels ---
+    traditional_levels, cpr_levels, camarilla_levels = compute_levels(prev_high, prev_low, prev_close)
+    logging.info(f"[LEVELS] Traditional={traditional_levels} CPR={cpr_levels} Camarilla={camarilla_levels}")
 
-    # --- Sequential replay over 3m candles ---
-    for i in range(2, len(df_3m) + 1):  # start from 2nd candle (need prev + last)
-        df_slice = df_3m.iloc[:i]  # progressively larger slice
-        df_slice = build_indicator_dataframe(symbol, interval="3m", df_15m=df_15m)
+    # --- Query 3m candles (current day only) ---
+    query_3m = f"""
+    SELECT trade_date, ist_slot, open, high, low, close
+    FROM candles_3m_ist
+    WHERE symbol = '{symbol}'
+      AND trade_date = '{date}'
+    """
+    df_3m = pd.read_sql(query_3m, conn_curr)
+    df_3m["datetime"] = pd.to_datetime(df_3m["trade_date"] + " " + df_3m["ist_slot"])
+    df_3m.set_index("datetime", inplace=True)
 
-        # --- Rolling ATR per slice ---
-        atr_val, source = resolve_atr(df_slice, None, period=14)
-        if atr_val is None:
-            logging.warning(f"[REPLAY] ATR unavailable at candle {i}")
+    # --- Replay orchestration ---
+    state = None
+    counters = {"CALL": 0, "PUT": 0}
+
+    for i in range(len(df_3m)):
+        df_slice = df_3m.iloc[: i + 1]
+
+        # Warm-up guard
+        if len(df_slice) < 20:
             continue
 
-        # Debug log to confirm ATR evolution
-        logging.info(f"[ATR CALC] candle={i} period=14 value={atr_val:.2f} source={source}")
+        atr_val, _ = resolve_atr(df_slice, None)
+        if atr_val is None:
+            continue
 
-        try:
+        # Entry detection
+        if state is None:
             signal = detect_signal(
                 cpr_levels=cpr_levels,
                 traditional_levels=traditional_levels,
                 camarilla_levels=camarilla_levels,
                 candles_3m=df_slice,
-                candles_15m=df_15m,
-                spot_price=None,
-                daily_atr=atr_val  # <-- evolving ATR per slice
+                atr=atr_val,
+                bias=None
             )
             if signal:
-                side, reason, targets, confidence = signal
-                ts = df_slice.iloc[-1]["ist_slot"]
-                logging.info(
-                    f"[REPLAY SIGNAL] {ts} side={side} reason={reason} "
-                    f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
-                    f"Confidence={confidence} ATR={atr_val:.2f}"
-                )
-        except Exception as e:
-            logging.error(f"[REPLAY ERROR] Candle {i}: {e}")
+                state = signal
+                counters[state["side"]] += 1
+                print(f"{GREEN}[ENTRY] Candle {i}: side={state['side']} reason={state['reason']} ATR={fmt(atr_val)}{RESET}")
+            continue
+
+        # Exit detection
+        if state and check_exit_condition(df_slice, state):
+            print(f"{GREEN}[EXIT] Candle {i}: side={state['side']} exit triggered "
+                  f"Peak={fmt(state['peak_momentum'])} at Candle {state['peak_candle']}{RESET}")
+            state = None
+
+    # --- Summary counters ---
+    logging.info(f"[SUMMARY] CALL trades={counters['CALL']} PUT trades={counters['PUT']}")
 
 if __name__ == "__main__":
-    date = "2026-02-05"
+    date = "2026-02-06"
     symbol = "NSE:NIFTY50-INDEX"
-    replay_signals(symbol, date)
+    replay_run_strategy(symbol, date)

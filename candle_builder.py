@@ -13,14 +13,7 @@ GRAY    = "\033[90m"
 CYAN    = "\033[96m"
 
 from indicators import (
-    calculate_atr,
     resolve_atr,
-    daily_atr,
-    check_bias,
-    momentum_ok,
-    oscillator_entry_filter,
-    oscillator_exit_trigger,
-    williams_r,
     supertrend, 
     calculate_ema, 
     calculate_adx,
@@ -28,9 +21,8 @@ from indicators import (
 )
 
 
-# ===== Candle Builder (3m) =====
-def build_3min_candle(df_ticks, tick_db, symbol):
-    """Incrementally build and persist 3m candles for a given symbol."""
+def build_3min_candle(df_ticks, symbol):
+    """Build 3m candles from tick data for a given symbol (no DB persistence)."""
     try:
         if df_ticks.empty or not isinstance(df_ticks, pd.DataFrame):
             logging.debug(f"[CANDLE BUILDER] No tick data available for {symbol}, skipping")
@@ -45,60 +37,35 @@ def build_3min_candle(df_ticks, tick_db, symbol):
         df_ticks['timestamp'] = pd.to_datetime(df_ticks['timestamp'], errors='coerce')
         df_ticks = df_ticks.dropna(subset=['timestamp'])
         if df_ticks.empty:
-            logging.debug(f"{CYAN}[CANDLE BUILDER] No valid rows after cleaning for {symbol}, skipping{RESET}")
+            logging.debug(f"[CANDLE BUILDER] No valid rows after cleaning for {symbol}, skipping")
             return pd.DataFrame()
 
         df_ticks.set_index('timestamp', inplace=True)
         df_ticks['last_price'] = pd.to_numeric(df_ticks['last_price'], errors='coerce')
         df_ticks['volume'] = pd.to_numeric(df_ticks['volume'], errors='coerce').fillna(0)
 
-        # Use .loc with a time mask instead of .last()
-        end_time = df_ticks.index.max()
-        start_time = end_time - pd.Timedelta(minutes=30)
-        window = df_ticks.loc[start_time:end_time]
+        # Resample into 3m OHLCV
+        ohlcv = df_ticks['last_price'].resample('3min').ohlc()
+        ohlcv['volume'] = df_ticks['volume'].resample('3min').sum()
 
-        ohlcv = window['last_price'].resample('3min').ohlc()
-        ohlcv['volume'] = window['volume'].resample('3min').sum()
-
-        # Fetch already persisted candles to avoid duplicates
-        existing = tick_db.fetch_candles("3m", symbol=symbol)
-        existing_slots = set(existing['ist_slot']) if not existing.empty else set()
-
-        new_rows = []
-        for ts, row in ohlcv.iterrows():
-            ist_slot = ts.strftime("%H:%M:%S")
-            if ist_slot in existing_slots:
-                continue
-
-            trade_date = ts.date().isoformat()
-            tick_db.insert_3m_candle(
-                trade_date, ist_slot,
-                row['open'], row['high'], row['low'], row['close'], row['volume'],
-                symbol
-            )
-            new_rows.append((ts, row))
-
-        if new_rows:
-            logging.info(f"[CANDLE BUILDER] Added {len(new_rows)} new 3m candles for {symbol}")
-        else:
-            logging.debug(f"[CANDLE BUILDER] No new 3m candles for {symbol}")
-
-        # Return candles for orchestration layer
+        # Add metadata
         ohlcv["trade_date"] = ohlcv.index.date.astype(str)
         ohlcv["ist_slot"] = ohlcv.index.strftime("%H:%M:%S")
         ohlcv["symbol"] = symbol
 
-        # ✅ Enrich with indicators including Supertrend bias/slope
+        # ✅ Enrich with indicators
         ohlcv["ema20"] = calculate_ema(ohlcv, column="close", period=20)
         ohlcv["ema50"] = calculate_ema(ohlcv, column="close", period=50)
         ohlcv["adx14"] = calculate_adx(ohlcv)
         ohlcv["cci20"] = calculate_cci(ohlcv)
 
-        atr, atr_source = resolve_atr(ohlcv, daily_val=None)
+        # ✅ Corrected ATR call
+        atr, atr_source = resolve_atr(ohlcv, daily_atr=None)
         bias, slope = supertrend(ohlcv, atr_val=atr)
         ohlcv.loc[ohlcv.index[-1], "supertrend_bias"] = bias
         ohlcv.loc[ohlcv.index[-1], "supertrend_slope"] = slope
 
+        logging.info(f"[CANDLE BUILDER] Built {len(ohlcv)} 3m candles for {symbol}")
         return ohlcv
 
     except Exception as e:

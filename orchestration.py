@@ -1,89 +1,68 @@
-# ===== orchestration.py =====
-
 import logging
 import pandas as pd
-import pendulum as dt
-from candle_builder import build_3min_candle, build_15m_candles
+import sqlite3
+import os
+from datetime import datetime, timedelta
+
+from candle_builder import build_3min_candle
 from tickdb import tick_db
 from indicators import (
     calculate_cpr,
     calculate_traditional_pivots,
     calculate_camarilla_pivots,
     resolve_atr,
-    daily_atr,
-    calculate_ema, 
-    calculate_atr, 
-    calculate_adx, 
-    calculate_cci, 
+    calculate_ema,
+    calculate_adx,
+    calculate_cci,
     supertrend
 )
-
-from signals import detect_signal, evaluate_candle
-from signals import bias_from_indicators 
-from config import symbols, time_zone
+from signals import detect_signal, classify_volatility, signal_confidence, bias_from_indicators
 from setup import fyers_async
-from datetime import timedelta
 
-# ANSI COLORS
 RESET   = "\033[0m"
 GREEN   = "\033[92m"
-YELLOW  = "\033[93m"
-RED     = "\033[91m"
-MAGENTA = "\033[95m"
-GRAY    = "\033[90m"
 CYAN    = "\033[96m"
 
+def fmt(val):
+    return f"{val:.2f}" if val is not None and not pd.isna(val) else "NA"
 
-def build_indicator_dataframe(symbol, interval="3m", df=None, df_15m=None):
-    """
-    Build an enriched indicator DataFrame for the given symbol and interval.
-    If df is provided, use it directly; otherwise fetch candles from DB.
-    Optionally pass df_15m for ATR resolution and bias context.
-    """
+def fetch_ticks_from_db(symbol, date_str):
+    """Fetch ticks directly from SQLite DB for a given date."""
+    db_path = os.path.join(r"C:\\SQLite\\ticks", f"ticks_{date_str}.db")
+    logging.info(f"[DB PATH] Using database at {db_path}")
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql_query("SELECT * FROM ticks", conn)
+    conn.close()
+    df = df[df["symbol"] == symbol]
+    return df
 
-    # --- Use provided DF or fetch from DB ---
-    if df is None:
-        df = tick_db.fetch_candles(resolution=interval, symbol=symbol)
-    if df is None or df.empty:
-        logging.warning(f"[INDICATORS] No {interval} candles for {symbol}")
-        return pd.DataFrame()
+def fetch_previous_day_candles(symbol, date_str, lookback_days=1):
+    """Fetch previous day's 3m candles for continuity."""
+    base_date = datetime.strptime(date_str, "%Y-%m-%d")
+    dfs = []
+    for d in range(1, lookback_days+1):
+        prev_date = (base_date - timedelta(days=d)).strftime("%Y-%m-%d")
+        df_ticks_prev = fetch_ticks_from_db(symbol, prev_date)
+        if not df_ticks_prev.empty:
+            df_prev_3m = build_3min_candle(df_ticks_prev, symbol)
+            logging.info(f"[PREV DAY] Built {len(df_prev_3m)} 3m candles for {symbol} on {prev_date}")
+            dfs.append(df_prev_3m)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-    # --- Append latest in-progress candle from ticks ---
-    latest_tick = tick_db.get_latest_tick(symbol)
-    if latest_tick is not None:
-        in_progress = {
-            "open": latest_tick["last_price"],
-            "high": latest_tick["last_price"],
-            "low": latest_tick["last_price"],
-            "close": latest_tick["last_price"],
-            "volume": latest_tick.get("volume", 0),
-            "trade_date": latest_tick["trade_date"],
-            "ist_slot": pd.to_datetime(latest_tick["timestamp"])
-                          .tz_localize("UTC")
-                          .tz_convert("Asia/Kolkata")
-                          .strftime("%H:%M:%S"),
-            "symbol": symbol,
-            "in_progress": True,
-        }
-        df = pd.concat([df, pd.DataFrame([in_progress])], ignore_index=True)
-
-    # --- Indicators ---
+def build_indicator_dataframe(symbol, df):
+    """Enrich candles with indicators."""
+    df = df.copy()
     df["ema20"] = calculate_ema(df, column="close", period=20)
     df["ema50"] = calculate_ema(df, column="close", period=50)
-
     if len(df) >= 20:
         df["adx14"] = calculate_adx(df)
         df["cci20"] = calculate_cci(df)
     else:
         df["adx14"] = float("nan")
         df["cci20"] = float("nan")
-        logging.warning(f"[INDICATORS] {symbol} {interval} insufficient bars ({len(df)}) for ADX/CCI")
+        logging.warning(f"[INDICATORS] {symbol} insufficient bars ({len(df)}) for ADX/CCI")
 
-    # --- ATR resolution for Supertrend ---
-    daily_val = daily_atr(df_15m) if df_15m is not None and not df_15m.empty else None
-    atr, atr_source = resolve_atr(df, daily_atr=daily_val)
-
-    # --- Supertrend bias/slope assignment (last row only) ---
+    atr, _ = resolve_atr(df, None)
     try:
         bias, slope = supertrend(df, atr_val=atr)
         df.loc[df.index[-1], "supertrend_bias"] = bias
@@ -93,126 +72,54 @@ def build_indicator_dataframe(symbol, interval="3m", df=None, df_15m=None):
         df.loc[df.index[-1], "supertrend_bias"] = "NEUTRAL"
         df.loc[df.index[-1], "supertrend_slope"] = "FLAT"
 
-    # --- Enrich with bias/signal ---
-    df["signal"], df["confidence"] = zip(*df.apply(
-        lambda row: bias_from_indicators(row, df_15m), axis=1
-    ))
+    bias_reason, bias_score = bias_from_indicators(df.iloc[-1])
+    vol_regime = classify_volatility(atr)
+    conf_bucket = signal_confidence(vol_regime, bias_score, bias_reason)
 
-    # --- Debug log ---
+    df.loc[df.index[-1], "bias_reason"] = bias_reason
+    df.loc[df.index[-1], "bias_score"] = bias_score
+    df.loc[df.index[-1], "vol_regime"] = vol_regime
+    df.loc[df.index[-1], "confidence"] = conf_bucket
+
     last_row = df.iloc[-1]
-    progress_tag = "LIVE" if last_row.get("in_progress", False) else "FINAL"
     logging.info(
-        f"{CYAN}[INDICATOR DF] {symbol} {interval} ({progress_tag}) "
-        f"ema20={last_row['ema20']:.2f} ema50={last_row['ema50']:.2f} "
-        f"adx14={last_row['adx14'] if not pd.isna(last_row['adx14']) else 'NA'} "
-        f"cci20={last_row['cci20'] if not pd.isna(last_row['cci20']) else 'NA'} "
-        f"supertrend_bias={last_row['supertrend_bias']} "
-        f"slope={last_row['supertrend_slope']} "
-        f"signal={last_row['signal']} confidence={last_row['confidence']}{RESET}"
+        f"{CYAN}[INDICATOR DF] {symbol} 3m "
+        f"ema20={fmt(last_row['ema20'])} ema50={fmt(last_row['ema50'])} "
+        f"adx14={fmt(last_row['adx14'])} cci20={fmt(last_row['cci20'])} "
+        f"supertrend_bias={last_row['supertrend_bias']} slope={last_row['supertrend_slope']} "
+        f"bias={last_row['bias_reason']} score={last_row['bias_score']} "
+        f"vol={last_row['vol_regime']} confidence={last_row['confidence']}{RESET}"
     )
-
     return df
 
+def update_candles_and_signals(symbol, spot_price=None, lookback_days=2):
+    """
+    Update loop with previous day candles included.
+    Ensures enough historical candles are fetched for indicator warm-up.
+    """
 
-def build_multi_symbol_indicators(symbols=None, interval="3m"):
-    if symbols is None:
-        symbols = symbols
-
-    result = {}
-    for sym in symbols:
-        df_15m = build_indicator_dataframe(sym, interval="15m")
-        df = build_indicator_dataframe(sym, interval=interval, df_15m=df_15m)
-        result[sym] = df
-        logging.info(f"[INDICATORS] Built {interval} DataFrame for {sym} with {len(df)} rows")
-
-    return result
-
-def fetch_yesterday_15m(symbol):
-    """Fetch yesterday's 15m candles from SQL DB for bootstrapping indicators."""
     try:
-        df = tick_db.fetch_candles(resolution="15m", symbol=symbol)
-        if df is None or df.empty:
-            logging.warning(f"[BOOTSTRAP] No 15m candles found in DB for {symbol}")
-            return pd.DataFrame()
+        today_str = datetime.now().strftime("%Y-%m-%d")
 
-        # Filter to yesterday’s date
-        yesterday = (dt.now(time_zone) - dt.timedelta(days=1)).date()
-        df_yday = df[df["trade_date"] == str(yesterday)]
-
-        if df_yday.empty:
-            logging.warning(f"[BOOTSTRAP] No 15m candles for {symbol} on {yesterday}")
-            return pd.DataFrame()
-
-        # Enrich with indicators (same as build_15m_candles)
-        df_yday["ema20"] = calculate_ema(df_yday, column="close", period=20)
-        df_yday["ema50"] = calculate_ema(df_yday, column="close", period=50)
-        df_yday["adx14"] = calculate_adx(df_yday)
-        df_yday["cci20"] = calculate_cci(df_yday)
-
-        atr, atr_source = resolve_atr(df_yday, daily_val=None)
-        bias, slope = supertrend(df_yday, atr_val=atr)
-        df_yday.loc[df_yday.index[-1], "supertrend_bias"] = bias
-        df_yday.loc[df_yday.index[-1], "supertrend_slope"] = slope
-
-        logging.info(f"[BOOTSTRAP] Loaded {len(df_yday)} yesterday 15m candles for {symbol}")
-        return df_yday
-
-    except Exception as e:
-        logging.error(f"[BOOTSTRAP ERROR] Failed to fetch yesterday 15m candles for {symbol}: {e}")
-        return pd.DataFrame()
-
-
-def update_candles_and_signals(symbol, spot_price=None):
-    try:
-        # --- Fetch latest ticks from DB ---
-        df_ticks = tick_db.fetch_ticks(symbol)
-        if df_ticks.empty:
+        # --- Fetch today's ticks ---
+        df_ticks_today = fetch_ticks_from_db(symbol, today_str)
+        if df_ticks_today.empty:
             logging.warning(f"[UPDATE] No ticks found for {symbol}")
             return None, None
 
-        # --- Fetch today’s 15m candles ---
-        df_15m_today = tick_db.fetch_candles(resolution="15m", symbol=symbol)
-        if df_15m_today.empty:
-            logging.warning(f"[UPDATE] No 15m candles built for {symbol}")
-            return None, None
+        df_3m_today = build_3min_candle(df_ticks_today, symbol)
 
-        # --- Fetch yesterday’s 15m candles ---
-        try:
-            df_15m_yday = tick_db.fetch_candles(resolution="15m", symbol=symbol, use_yesterday=True)
+        # --- Fetch previous day candles for continuity ---
+        df_3m_prev = fetch_previous_day_candles(symbol, today_str, lookback_days=lookback_days)
 
-            if df_15m_yday is not None and not df_15m_yday.empty:
-                logging.debug(f"[BOOTSTRAP DEBUG] {symbol} available trade_dates: {df_15m_yday['trade_date'].unique()}")
-
-                yesterday = (dt.now(time_zone) - timedelta(days=1)).strftime("%Y-%m-%d")
-                df_15m_yday = df_15m_yday[df_15m_yday["trade_date"] == yesterday]
-
-                if not df_15m_yday.empty:
-                    logging.info(f"[BOOTSTRAP] Found {len(df_15m_yday)} yesterday 15m candles for {symbol}")
-
-                    # --- Merge yesterday + today ---
-                    merged_df = pd.concat([df_15m_yday, df_15m_today]).drop_duplicates(
-                        subset=["trade_date", "ist_slot", "symbol"], keep="last"
-                    )
-
-                    # ✅ Build indicators on merged DF
-                    df_15m = build_indicator_dataframe(symbol, interval="15m", df=merged_df)
-                    logging.info(f"{CYAN}[BOOTSTRAP] Merged yesterday’s 15m candles with today for {symbol}{RESET}")
-                else:
-                    logging.warning(f"[BOOTSTRAP] No 15m candles found for {symbol} on {yesterday}")
-                    df_15m = build_indicator_dataframe(symbol, interval="15m", df=df_15m_today)
-            else:
-                logging.warning(f"[BOOTSTRAP] No 15m candles in DB for {symbol}")
-                df_15m = build_indicator_dataframe(symbol, interval="15m", df=df_15m_today)
-
-        except Exception as e:
-            logging.warning(f"[BOOTSTRAP ERROR] Could not fetch yesterday’s 15m candles: {e}")
-            df_15m = build_indicator_dataframe(symbol, interval="15m", df=df_15m_today)
-
-        # --- Build enriched 3m candles (with reference to 15m DF) ---
-        df_3m = build_indicator_dataframe(symbol, interval="3m", df_15m=df_15m)
+        # --- Concatenate prev + today ---
+        df_3m = pd.concat([df_3m_prev, df_3m_today], ignore_index=True)
         if df_3m.empty:
             logging.warning(f"[UPDATE] No 3m candles built for {symbol}")
             return None, None
+
+        # --- Enrich with indicators ---
+        df_3m = build_indicator_dataframe(symbol, df=df_3m)
 
         # --- Resolve spot price ---
         if spot_price is None:
@@ -231,46 +138,31 @@ def update_candles_and_signals(symbol, spot_price=None):
             logging.warning(f"[UPDATE] No spot price available for {symbol}")
             return None, df_3m
 
-        # --- ATR calculation ---
-        daily_val = daily_atr(df_15m)
-        atr_value, atr_source = resolve_atr(df_15m, daily_atr=daily_val)
-        atr_str = f"{atr_value:.2f}" if atr_value is not None else "NA"
-        logging.info(f"[ATR] {symbol} source={atr_source} value={atr_str}")
+        # --- Compute levels from last candle ---
+        last_candle = df_3m.iloc[-1]
+        cpr_levels = calculate_cpr(last_candle.high, last_candle.low, last_candle.close)
+        traditional_levels = calculate_traditional_pivots(last_candle.high, last_candle.low, last_candle.close)
+        camarilla_levels = calculate_camarilla_pivots(last_candle.high, last_candle.low, last_candle.close)
 
-        # --- Compute levels from last 15m candle ---
-        last_candle_15m = df_15m.iloc[-1]
-        cpr_levels = calculate_cpr(last_candle_15m.high, last_candle_15m.low, last_candle_15m.close)
-        traditional_levels = calculate_traditional_pivots(last_candle_15m.high, last_candle_15m.low, last_candle_15m.close)
-        camarilla_levels = calculate_camarilla_pivots(last_candle_15m.high, last_candle_15m.low, last_candle_15m.close)
+        atr = last_candle.get("atr")
+        bias_score = last_candle.get("bias_score")
+        confidence = last_candle.get("confidence")
 
-        # --- Detect signal ---
+        # --- Detect signal with full history ---
         signal = detect_signal(
             cpr_levels,
             traditional_levels,
             camarilla_levels,
             df_3m,
-            df_15m,
-            spot_price=spot_price,
-            daily_atr=daily_val
+            atr=atr,
+            bias=bias_score  # bias-aware continuation
         )
 
         if signal:
-            if isinstance(signal, (list, tuple)):
-                if len(signal) == 4:
-                    side, reason, targets, confidence = signal
-                    logging.info(
-                        f"{GREEN}[SIGNAL FIRED] {symbol} side={side} reason={reason} "
-                        f"SL={targets['SL']:.2f} PT={targets['PT']:.2f} TG={targets['TG']:.2f} "
-                        f"Confidence={confidence}{RESET}"
-                    )
-                elif len(signal) == 2:
-                    side, reason = signal
-                    logging.info(f"{GREEN}[SIGNAL FIRED] {symbol} side={side} reason={reason}{RESET}")
-                else:
-                    logging.error(f"[SIGNAL ERROR] Unexpected signal format: {signal}")
-            else:
-                logging.error(f"[SIGNAL ERROR] Signal not tuple/list: {signal}")
-
+            logging.info(
+                f"{GREEN}[SIGNAL FIRED] {symbol} side={signal['side']} reason={signal['reason']} "
+                f"PeakMomentum={fmt(signal['peak_momentum'])} ATR={fmt(atr)} Confidence={confidence}{RESET}"
+            )
             return signal, df_3m
         else:
             logging.debug(f"[SIGNAL CHECK] No signal for {symbol}")

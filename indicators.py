@@ -65,32 +65,6 @@ def calculate_camarilla_pivots(prev_high, prev_low, prev_close):
     return {"r3": round(r3, 2), "r4": round(r4, 2),
             "s3": round(s3, 2), "s4": round(s4, 2)}
 
-
-# # ===== Pivot Calculations =====
-# def calculate_cpr(high, low, close):
-#     pivot = (high + low + close) / 3
-#     bc = (high + low) / 2
-#     tc = (pivot - bc) + pivot
-#     return {"pivot": round(pivot, 2), "bc": round(bc, 2), "tc": round(tc, 2)}
-
-# def calculate_traditional_pivots(high, low, close):
-#     pivot = (high + low + close) / 3
-#     r1 = (2 * pivot) - low
-#     s1 = (2 * pivot) - high
-#     r2 = pivot + (high - low)
-#     s2 = pivot - (high - low)
-#     return {"pivot": round(pivot, 2), "r1": round(r1, 2), "s1": round(s1, 2),
-#             "r2": round(r2, 2), "s2": round(s2, 2)}
-
-# def calculate_camarilla_pivots(high, low, close):
-#     range_val = high - low
-#     r3 = close + (range_val * 1.1 / 4)
-#     r4 = close + (range_val * 1.1 / 2)
-#     s3 = close - (range_val * 1.1 / 4)
-#     s4 = close - (range_val * 1.1 / 2)
-#     return {"r3": round(r3, 2), "r4": round(r4, 2),
-#             "s3": round(s3, 2), "s4": round(s4, 2)}
-
 # # ===== ATR =====
 
 def calculate_atr(candles: pd.DataFrame, period: int = 14):
@@ -214,18 +188,6 @@ def calculate_cci(df, period=20):
     cci = (tp - ma) / (0.015 * md)
     return cci
 
-
-def cci_indicator(df, period=20):
-    """Return the latest CCI value for bias checks."""
-    cci_series = calculate_cci(df, period=period)
-    if cci_series is None or cci_series.empty:
-        logging.warning("[CCI INDICATOR] No CCI available")
-        return np.nan
-
-    latest_val = cci_series.iloc[-1]
-    logging.debug(f"[CCI INDICATOR] Latest CCI={latest_val:.2f}")
-    return latest_val
-
 def ema_bias(df, period=20):
     """EMA bias: compares last close vs EMA."""
     if df is None or df.empty or "close" not in df.columns:
@@ -235,20 +197,6 @@ def ema_bias(df, period=20):
         return "NEUTRAL"
     last_close = df["close"].iloc[-1]
     return "BULLISH" if last_close > ema.iloc[-1] else "BEARISH"
-
-
-# def cci_bias(df, period=20, threshold=100):
-#     tp = (df['high'] + df['low'] + df['close']) / 3
-#     ma = tp.rolling(period).mean()
-#     md = (tp - ma).abs().rolling(period).mean()
-#     cci = (tp - ma) / (0.015 * md)
-#     last_cci = cci.iloc[-1]
-#     if last_cci > threshold:
-#         return "BULLISH"
-#     elif last_cci < -threshold:
-#         return "BEARISH"
-#     else:
-#         return "NEUTRAL"
 
 def cci_bias(df, period=20, threshold=60):
     """CCI bias: checks last CCI value against thresholds."""
@@ -414,90 +362,6 @@ def adx_bias(df, period=14, threshold=20):
         return "NEUTRAL"
     return "BULLISH" if plus_di.iloc[-1] > minus_di.iloc[-1] else "BEARISH"
 
-def check_bias(df_15m, daily_atr=None):
-    if df_15m is None or df_15m.empty:
-        logging.warning("[BIAS] No 15m candles available")
-        return None
-
-    row = df_15m.iloc[-1]
-
-    # --- Supertrend bias/slope ---
-    st_bias = row.get("supertrend_bias", "NEUTRAL")
-    st_slope = row.get("supertrend_slope", "FLAT")
-
-    ema_val = "BULLISH" if row["ema20"] > row["ema50"] else "BEARISH"
-
-    adx_val = row.get("adx14", None)
-    if adx_val is None or pd.isna(adx_val):
-        adx_bias = "NEUTRAL"
-    elif adx_val > 25:
-        adx_bias = ema_val
-    elif adx_val < 15:
-        adx_bias = "BEARISH" if ema_val == "BEARISH" else "NEUTRAL"
-    else:
-        adx_bias = "NEUTRAL"
-
-    cci_val = row.get("cci20", None)
-    if cci_val is None or pd.isna(cci_val):
-        cci_bias = "NEUTRAL"
-    elif cci_val > 50:
-        cci_bias = "BULLISH"
-    elif cci_val < -50:
-        cci_bias = "BEARISH"
-    else:
-        cci_bias = "NEUTRAL"
-
-    scores = {"BULLISH": 0, "BEARISH": 0}
-    scores[ema_val] += 2
-    if adx_bias in scores:
-        scores[adx_bias] += 2 if adx_val and adx_val > 25 else 1
-    if cci_bias in scores:
-        scores[cci_bias] += 1
-    if st_bias in ("BULLISH", "BEARISH"):
-        scores[st_bias] += 2
-
-    # ✅ slope contribution
-    if st_slope == "UP" and st_bias == "BULLISH":
-        scores["BULLISH"] += 1
-    elif st_slope == "DOWN" and st_bias == "BEARISH":
-        scores["BEARISH"] += 1
-
-    # ATR contribution
-    if daily_atr is not None and row["close"]:
-        atr_ratio = daily_atr / row["close"]
-        if atr_ratio > 0.005:  # >0.5% volatility
-            scores[ema_val] += 1
-
-    logging.info(
-        f"[BIAS CHECK] ATR={daily_atr if daily_atr else 'NA'} "
-        f"Supertrend={st_bias} Slope={st_slope} EMA={ema_val} "
-        f"ADX={adx_bias}({adx_val}) CCI={cci_bias}({cci_val})"
-    )
-    logging.info(f"[BIAS SCORES] BULLISH={scores['BULLISH']} BEARISH={scores['BEARISH']}")
-
-    if scores["BULLISH"] > scores["BEARISH"]:
-        logging.info("[BIAS RESULT] BULLISH (weighted)")
-        return "BULLISH"
-    elif scores["BEARISH"] > scores["BULLISH"]:
-        logging.info("[BIAS RESULT] BEARISH (weighted)")
-        return "BEARISH"
-    else:
-        logging.info("[BIAS RESULT] NEUTRAL (tie)")
-        return "NEUTRAL"
-
-# def cci_indicator(candles, period=20):
-#     if len(candles) < period:
-#         logging.warning("[CCI] Not enough candles")
-#         return np.nan
-#     tp = (candles['high'] + candles['low'] + candles['close']) / 3
-#     ma = tp.tail(period).mean()
-#     md = (tp.tail(period) - ma).abs().mean()
-#     if md == 0:
-#         logging.warning("[CCI] Mean deviation = 0")
-#         return np.nan
-#     cci = (tp.iloc[-1] - ma) / (0.015 * md)
-#     logging.debug(f"[CCI] tp={tp.iloc[-1]:.2f}, ma={ma:.2f}, md={md:.2f}, CCI={cci:.2f}")
-#     return cci
 
 def williams_r(candles, period=14):
     """
@@ -528,46 +392,3 @@ def williams_r(candles, period=14):
         f"close={last_close:.2f}, W%R={wr:.2f}"
     )
     return wr
-
-def oscillator_entry_filter(side, candles_3m):
-    if len(candles_3m) < 20:
-        logging.warning(f"{CYAN}[ENTRY FILTER][OSC] Not enough candles, allowing entry{RESET}")
-        return True
-    wr  = williams_r(candles_3m)
-    cci = cci_indicator(candles_3m)
-    if np.isnan(wr) or np.isnan(cci):
-        logging.warning(f"{CYAN}[ENTRY FILTER][OSC] Oscillator NaN, allowing entry{RESET}")
-        return True
-    if side == "CALL" and (wr >= -10 or cci >= 200):
-        logging.info(f"{CYAN}[ENTRY BLOCKED][OSC] CALL skipped (W%R={wr:.2f}, CCI={cci:.2f}){RESET}")
-        return False
-    if side == "PUT" and (wr <= -90 or cci <= -200):
-        logging.info(f"{CYAN}[ENTRY BLOCKED][OSC] PUT skipped (W%R={wr:.2f}, CCI={cci:.2f}){RESET}")
-        return False
-    return True
-
-
-def oscillator_exit_trigger(side, candles_15m):
-    if len(candles_15m) < 20:
-        logging.warning("[EXIT FILTER][OSC] Not enough candles")
-        return False, ""
-    wr  = williams_r(candles_15m)
-    cci = cci_indicator(candles_15m)
-    if np.isnan(wr) or np.isnan(cci):
-        logging.warning("[EXIT FILTER][OSC] Oscillator NaN, no exit")
-        return False, ""
-    if side == "CALL":
-        if wr >= -5:
-            logging.info(f"{YELLOW}[EXIT SIGNAL][OSC] CALL exit W%R={wr:.2f}{RESET}")
-            return True, "W%R near 0 (overbought extreme)"
-        if cci >= 200:
-            logging.info(f"{YELLOW}[EXIT SIGNAL][OSC] CALL exit CCI={cci:.2f}{RESET}")
-            return True, f"CCI={cci:.2f} >= 200 (bullish extreme)"
-    elif side == "PUT":
-        if wr <= -95:
-            logging.info(f"{YELLOW}[EXIT SIGNAL][OSC] PUT exit W%R={wr:.2f}{RESET}")
-            return True, "W%R near -100 (oversold extreme)"
-        if cci <= -200:
-            logging.info(f"{YELLOW}[EXIT SIGNAL][OSC] PUT exit CCI={cci:.2f}{RESET}")
-            return True, f"CCI={cci:.2f} <= -200 (bearish extreme)"
-    return False, ""
