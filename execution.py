@@ -20,11 +20,13 @@ from indicators import (
     calculate_camarilla_pivots,
     resolve_atr,
     daily_atr,
+    williams_r,
+    calculate_cci,
+    momentum_ok
+    
 )
 
-
-# from candle_builder import build_3min_candle, build_15m_candles, get_today_15m_candles
-from signals import detect_signal, check_exit_condition
+from signals import detect_signal
 from tickdb import tick_db
 from orchestration import update_candles_and_signals
 
@@ -220,109 +222,205 @@ def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
 
     return sel.squeeze(), strike
 
-# Dynamic ATR based SL/PT/TG 
-
-# def build_dynamic_levels(entry_price, atr, rr_ratio=2.0, profit_loss_point=5):
-#     """
-#     Build stop-loss, partial/full targets, and trailing parameters.
-#     Long-only logic (works for both CALL and PUT).
-#     Adaptive ATR thresholds:
-#       - Non-expiry days (Wed–Mon except Tuesday)
-#       - Expiry regime (Tuesday)
-#     """
-
-#     weekday = dt.now(time_zone).weekday()  # Monday=0 ... Sunday=6
-#     is_expiry_day = (weekday == 1)  # Tuesday
-
-#     # ---- Decision: Normal / Volatile / Extreme ----
-#     if is_expiry_day:
-#         if atr <= 40:
-#             mode = "normal"
-#         elif atr <= 180:
-#             mode = "volatile"
-#         else:
-#             mode = "extreme"
-#     else:
-#         if atr <= 25:
-#             mode = "normal"
-#         elif atr <= 120:
-#             mode = "volatile"
-#         else:
-#             mode = "extreme"
-
-#     if mode == "normal":
-#         risk_points   = max(profit_loss_point, atr * 0.25)
-#         reward_points = risk_points * rr_ratio
-
-#         stop  = entry_price - risk_points
-#         partial_target = entry_price + reward_points / 2
-#         full_target    = entry_price + reward_points
-
-#         trail_start = reward_points / 2
-#         trail_step  = max(atr * 0.1, 0.5)
-
-#         if is_expiry_day:
-#             logging.info(
-#                 f"{CYAN}[LEVELS][EXPIRY-NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
-#             )
-#         else:
-#             logging.info(
-#                 f"{CYAN}[LEVELS][NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
-#             )
-
-#     elif mode == "volatile":
-#         risk_points   = atr * 0.5
-#         reward_points = atr * 1.0
-
-#         stop  = entry_price - risk_points
-#         partial_target = entry_price + reward_points * 0.5
-#         full_target    = entry_price + reward_points
-
-#         trail_start = reward_points * 0.25
-#         trail_step  = max(atr * 0.2, 1.0)
-
-#         if is_expiry_day:
-#             logging.info(
-#                 f"{CYAN}[LEVELS][EXPIRY-VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
-#             )
-#         else:
-#             logging.info(
-#                 f"{CYAN}[LEVELS][VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} Reward={reward_points:.2f}{RESET}"
-#             )
-
-#     else:
-#         if is_expiry_day:
-#             logging.warning(
-#                 f"{CYAN}[LEVELS][EXPIRY-EXTREME] ATR={atr:.2f} → Trade skipped due to excessive expiry-day volatility{RESET}"
-#             )
-#         else:
-#             logging.warning(
-#                 f"{CYAN}[LEVELS][EXTREME] ATR={atr:.2f} → Trade skipped due to excessive volatility{RESET}"
-#             )
-#         return None, None, None, None, None
-
-#     return stop, partial_target, full_target, trail_start, trail_step
 
 
+def check_exit_condition(df_slice, state):
+    """
+    Hybrid exit logic for live trading:
+    - ATR-based dynamic levels (stop-loss, partial/full targets, trailing stop)
+    - EMA plateau + momentum drop + oscillator confirmation
+    - Consecutive candle reversal guard (anticipates 3–4 candle reversals)
+    - Time-based guard (max 5 candles unless trailing engaged)
+    Returns: (bool, reason_str)
+    """
 
-# def update_trailing_stop(current_price, entry_price, current_stop, trail_start_pnl, trail_step_points):
-#     """
-#     Update trailing stop once partial target booked.
-#     Long-only logic (works for both CALL and PUT).
-#     - Ratchets stop upward as option price rises.
-#     """
+    i = len(df_slice) - 1
+    side = state["side"]
+    entry_price = state.get("buy_price")
+    current_price = df_slice["close"].iloc[-1]
 
-#     pnl = current_price - entry_price
-#     if pnl >= trail_start_pnl and trail_step_points > 0:
-#         candidate = current_price - trail_step_points
-#         new_stop = max(current_stop, candidate)
-#         if new_stop != current_stop:
-#             logging.info(
-#                 f"{YELLOW}[TRAIL UPDATE] Stop moved from {current_stop:.2f} → {new_stop:.2f}{RESET}"
-#             )
-#         return new_stop
+    # --- Minimum hold period ---
+    if i - state["entry_candle"] < 2:  # allow at least 2 candles before exit checks
+        return False, None
 
-#     return current_stop
+    # --- EMA gap & momentum ---
+    ema9 = df_slice["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+    ema13 = df_slice["close"].ewm(span=13, adjust=False).mean().iloc[-1]
+    ema_gap = abs(ema9 - ema13)
+
+    ok, momentum = momentum_ok(df_slice, side)
+    if not ok or momentum is None:
+        momentum = 0
+
+    # --- ATR-based dynamic levels ---
+    stop = state.get("stop")
+    tg   = state.get("tg")
+    trail_step = state.get("trail_step")
+
+    # --- ATR exits (same for CALL and PUT since both are long) ---
+    if stop and current_price <= stop:
+        logging.info(f"{YELLOW}[EXIT] ATR Stop Loss hit side={side} stop={stop} current={current_price}{RESET}")
+        return True, "SL_HIT"
+
+    if tg and current_price >= tg:
+        logging.info(f"{YELLOW}[EXIT] ATR Full Target hit side={side} target={tg} current={current_price}{RESET}")
+        return True, "TARGET_HIT"
+
+    # --- Buffered trailing stop update ---
+    buffer_points = 12  # minimum favorable move before trailing engages
+    if current_price >= entry_price + buffer_points:
+        new_stop = current_price - trail_step
+        if new_stop > state["stop"]:
+            state["stop"] = new_stop
+            state["trail_updates"] += 1
+            logging.info(f"[TRAIL] {side} stop updated → {state['stop']:.2f} at Candle {i}")
+
+    # --- Consecutive candle reversal guard ---
+    if "consec_count" not in state:
+        state["consec_count"] = 0
+
+    last_candle = df_slice.iloc[-1]
+    if last_candle["close"] > last_candle["open"]:
+        state["consec_count"] += 1
+    else:
+        state["consec_count"] = 0
+
+    if state["consec_count"] >= 4:
+        logging.info(f"{YELLOW}[EXIT] Consecutive candles → reversal risk side={side}{RESET}")
+        return True, "REVERSAL_EXIT"
+
+    # --- Momentum exits ---
+    if ema_gap > state["prev_gap"]:
+        state["prev_gap"] = ema_gap
+        if abs(momentum) > state["peak_momentum"]:
+            state["peak_momentum"] = abs(momentum)
+            state["peak_candle"] = i
+        state["plateau_count"] = 0
+        return False, None
+
+    if ema_gap <= state["prev_gap"]:
+        state["plateau_count"] += 1
+    else:
+        state["plateau_count"] = 0
+
+    if state["plateau_count"] >= 2 and abs(momentum) < state["peak_momentum"] * 0.4:
+        cci_series = calculate_cci(df_slice)
+        cci_val = cci_series.iloc[-1] if not cci_series.empty else None
+        wr_val = williams_r(df_slice)
+
+        if (cci_val is not None and cci_val > 120) or (wr_val is not None and wr_val < -85):
+            logging.info(f"{YELLOW}[EXIT] EMA plateau + momentum drop + oscillator confirm side={side}{RESET}")
+            return True, "MOMENTUM_EXIT"
+
+    # --- Time guard ---
+    if i - state["entry_candle"] >= 5 and state["trail_updates"] == 0:
+        logging.info(f"{YELLOW}[EXIT] Max hold time (5 candles) exceeded side={side}{RESET}")
+        return True, "TIME_EXIT"
+
+    return False, None
+
+
+def build_dynamic_levels(entry_price, atr, side, entry_candle,
+                         rr_ratio=2.0, profit_loss_point=5):
+    """
+    Build stop-loss, partial/full targets, and trailing parameters.
+    Adjustments for live market:
+    - SL anchored to entry candle extremes
+    - Wider reward points (2 × ATR in normal regime)
+    - Buffered trailing stop
+    - Unified PT/TG logic for long CALL and long PUT
+    """
+
+    # weekday = dt.now(time_zone).weekday()  # Monday=0 ... Sunday=6
+    # is_expiry_day = (weekday == 1)  # Tuesday
+    
+    # ---- Decision: Normal / Volatile / Extreme ----
+
+    if atr <= 80:          # calm to moderate
+        mode = "normal"
+    elif atr <= 200:       # active but tradable
+        mode = "volatile"
+    else:                  # ATR > 200 → extreme swings
+        mode = "extreme"
+
+    if mode == "normal":
+        risk_points   = max(profit_loss_point, atr * 0.25)
+        reward_points = atr * rr_ratio   # widened target
+
+        # --- SL anchored to entry candle extremes ---
+        if side == "CALL":
+            stop = entry_candle["low"]
+        elif side == "PUT":
+            stop = entry_candle["high"]
+        else:
+            stop = entry_price - risk_points  # fallback
+
+        # --- Unified PT/TG logic for long CALL and long PUT ---
+        partial_target = entry_price + reward_points / 2
+        full_target    = entry_price + reward_points
+
+        trail_start = reward_points / 2
+        trail_step  = max(atr * 0.2, 1.0)  # buffered step
+
+        logging.info(
+            f"{CYAN}[LEVELS][NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} "
+            f"Reward={reward_points:.2f} SL={stop:.2f}{RESET}"
+        )
+
+    elif mode == "volatile":
+        risk_points   = atr * 0.5
+        reward_points = atr * 2.0   # widened target
+
+        if side == "CALL":
+            stop = entry_candle["low"]
+        elif side == "PUT":
+            stop = entry_candle["high"]
+        else:
+            stop = entry_price - risk_points
+
+        partial_target = entry_price + reward_points * 0.5
+        full_target    = entry_price + reward_points
+
+        trail_start = reward_points * 0.25
+        trail_step  = max(atr * 0.3, 1.5)
+
+        logging.info(
+            f"{CYAN}[LEVELS][VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} "
+            f"Reward={reward_points:.2f} SL={stop:.2f}{RESET}"
+        )
+
+    else:
+        logging.warning(
+            f"{CYAN}[LEVELS][EXTREME] ATR={atr:.2f} → Trade skipped due to excessive volatility{RESET}"
+        )
+        return None, None, None, None, None
+
+    return stop, partial_target, full_target, trail_start, trail_step
+
+
+def update_trailing_stop(current_price, entry_price, current_stop,
+                         trail_start_pnl, trail_step_points, buffer_points=12):
+    """
+    Update trailing stop once partial target booked.
+    Adjustments for live market:
+    - Buffered trailing (≥ buffer_points move in favor)
+    - Ratchets stop upward/downward depending on side
+    """
+
+    pnl = current_price - entry_price
+
+    # Only trail if price has moved enough in favor
+    if abs(pnl) >= buffer_points and trail_step_points > 0:
+        candidate = current_price - trail_step_points if pnl > 0 else current_price + trail_step_points
+        new_stop = max(current_stop, candidate) if pnl > 0 else min(current_stop, candidate)
+
+        if new_stop != current_stop:
+            logging.info(
+                f"{YELLOW}[TRAIL UPDATE] Stop moved from {current_stop:.2f} → {new_stop:.2f}{RESET}"
+            )
+        return new_stop
+
+    return current_stop
 
 
 # ===== PAPER/LIVE STATE INIT =====
@@ -672,13 +770,12 @@ def check_order_status(order_id, fyers):
 # ===== process_order =====
 def process_order(state, df_slice, info, spot_price, account_type="paper"):
     """
-    Manage exits for an active trade using new check_exit_condition logic.
-    Args:
-        state       : trade state dict from detect_signal()
-        df_slice    : current 3m candle DataFrame slice
-        info        : trade info dict (paper_info or live_info)
-        spot_price  : current spot price
-        account_type: "paper" or "live"
+    Manage exits for an active trade using SL/Target + hybrid exit logic.
+    Adjustments for live market:
+    - Explicit SL/Target checks with latency buffer
+    - Hybrid exit logic (ATR, momentum, reversal, time)
+    - Market exits for guaranteed fills
+    - Audit logging with trail updates
     """
 
     side   = state["side"]
@@ -686,54 +783,81 @@ def process_order(state, df_slice, info, spot_price, account_type="paper"):
     entry  = state.get("buy_price", 0)
     qty    = state.get("quantity", 0)
 
-    # --- Poll exit condition ---
-    if check_exit_condition(df_slice, state):
-        # Route exit order
-        if account_type.lower() == "paper":
-            success, order_id = send_paper_exit_order(symbol, qty, "LOGIC_EXIT")
-        else:
-            success, order_id = send_live_exit_order(symbol, qty, "LOGIC_EXIT")
+    current_candle = df_slice.iloc[-1]
 
-        if success:
-            exit_price = df_slice.iloc[-1]["close"]
-            pnl_points = exit_price - entry
-            pnl_value  = pnl_points * qty
+    # --- Latency buffer (2–3 points) ---
+    buffer = 2.0
 
-            # Update trade info
-            trade = info["call_buy"] if side == "CALL" else info["put_buy"]
-            trade["pnl"] += pnl_value
-            info["total_pnl"] = info["call_buy"].get("pnl", 0) + info["put_buy"].get("pnl", 0)
-            trade["trade_flag"] = 0
-            trade["quantity"] = 0
+    # --- Explicit SL/Target checks ---
+    exit_reason = None
+    if side == "CALL":
+        if current_candle["low"] <= state["stop"] + buffer:
+            exit_reason = "SL_HIT"
+        elif spot_price >= state["pt"] - buffer:
+            exit_reason = "TARGET_HIT"
+    elif side == "PUT":
+        if current_candle["high"] >= state["stop"] - buffer:
+            exit_reason = "SL_HIT"
+        elif spot_price <= state["pt"] + buffer:
+            exit_reason = "TARGET_HIT"
 
-            # Record exit with full audit fields
-            trade["filled_df"].loc[dt.now(time_zone)] = [
-                symbol,
-                entry,
-                exit_price,
-                side,
-                state.get("reason", "UNKNOWN"),       # entry reason
-                "LOGIC_EXIT",                         # exit reason
-                state.get("entry_candle", -1),        # entry candle number
-                len(df_slice) - 1,                    # exit candle number
-                pnl_points,
-                pnl_value,
-                spot_price,
-                qty
-            ]
+    # --- Hybrid exit logic (ATR, momentum, reversal, time) ---
+    if not exit_reason:
+        triggered, reason = check_exit_condition(df_slice, state)
+        if triggered and reason:
+            exit_reason = reason
 
-            logging.info(
-                f"{YELLOW}[EXIT][{account_type.upper()} LOGIC] {side} {symbol} "
-                f"EntryCandle={state['entry_candle']} ExitCandle={len(df_slice)-1} "
-                f"Entry={entry:.2f} Exit={exit_price:.2f} Qty={qty} "
-                f"PnL={pnl_value:.2f} (points={pnl_points:.2f}) "
-                f"Reason={state.get('reason','UNKNOWN')}{RESET}"
-            )
+    # --- If no exit condition met, keep trade alive ---
+    if not exit_reason:
+        return False, None
 
-            update_order_status(order_id, "PENDING", qty, exit_price, symbol)
-            return True
+    # --- Route exit order ---
+    if account_type.lower() == "paper":
+        success, order_id = send_paper_exit_order(symbol, qty, exit_reason)
+    else:
+        # Live trading: always use market order for exit
+        success, order_id = send_live_exit_order(symbol, qty, exit_reason, order_type="MARKET")
 
-    return False
+    if success:
+        exit_price = current_candle["close"]
+        pnl_points = exit_price - entry if side == "CALL" else entry - exit_price
+        pnl_value  = pnl_points * qty
+
+        trade = info["call_buy"] if side == "CALL" else info["put_buy"]
+        trade["pnl"] += pnl_value
+        info["total_pnl"] = info["call_buy"].get("pnl", 0) + info["put_buy"].get("pnl", 0)
+        trade["trade_flag"] = 0
+        trade["quantity"] = 0
+
+        trade["filled_df"].loc[dt.now(time_zone)] = [
+            symbol,
+            entry,
+            exit_price,
+            side,
+            state.get("reason", "UNKNOWN"),   # entry reason
+            exit_reason,                      # exit reason
+            state.get("entry_candle", -1),    # entry candle number
+            len(df_slice) - 1,                # exit candle number
+            pnl_points,
+            pnl_value,
+            spot_price,
+            qty
+        ]
+
+        logging.info(
+            f"{YELLOW}[EXIT][{account_type.upper()} {exit_reason}] {side} {symbol} "
+            f"EntryCandle={state['entry_candle']} ExitCandle={len(df_slice)-1} "
+            f"Entry={entry:.2f} Exit={exit_price:.2f} Qty={qty} "
+            f"PnL={pnl_value:.2f} (points={pnl_points:.2f}) "
+            f"Reason={state.get('reason','UNKNOWN')} "
+            f"TrailUpdates={state.get('trail_updates',0)}{RESET}"
+        )
+
+        update_order_status(order_id, "PENDING", qty, exit_price, symbol)
+        return True, exit_reason
+
+    return False, None
+
 
 def cleanup_trade_exit(info, leg, side, name, qty, exit_price, mode, reason):
     """
@@ -840,28 +964,33 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     paper_info["last_exit_time"] = ct
                     logging.info(f"{YELLOW}[EXIT][PAPER] {side} {state['option_name']} at {paper_info['last_exit_time']}{RESET}")
         return
-
-    # 5. Signal evaluation (entry detection)
+    
+    # 5. Signal evaluation (entry detection on 3m candles only)
     signal = None
-    if not candles_3m.empty and hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
+    if not candles_3m.empty:
         last_candle_time = candles_3m.iloc[-1]["time"]
         if last_signal_candle_time != last_candle_time:
             last_signal_candle_time = last_candle_time
-            daily_val = daily_atr(hist_yesterday_15m)
-            atr, atr_source = resolve_atr(candles_3m, daily_val)
-            logging.info(f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}")
 
-            prev_day = hist_yesterday_15m.iloc[-1]
-            cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
-            trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-            cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
+            # ATR from 3m candles
+            atr, atr_source = resolve_atr(candles_3m)
+            logging.info(
+                f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} "
+                f"candles={len(candles_3m)} atr={atr:.2f} source={atr_source}{RESET}"
+            )
 
+            # Pivot calculations from the most recent 3m candle
+            prev_candle = candles_3m.iloc[-1]
+            cpr  = calculate_cpr(prev_candle["high"], prev_candle["low"], prev_candle["close"])
+            trad = calculate_traditional_pivots(prev_candle["high"], prev_candle["low"], prev_candle["close"])
+            cam  = calculate_camarilla_pivots(prev_candle["high"], prev_candle["low"], prev_candle["close"])
+
+            # Detect signal using 3m pivots + ATR
             signal = detect_signal(cpr, trad, cam, candles_3m, atr=atr)
 
     # 6. Paper entry logic
     if signal:
         side, reason = signal["side"], signal["reason"]
-
         logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) spot={spot_price}{RESET}")
 
         # --- Filters ---
@@ -886,6 +1015,12 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
                 if opt_name and opt_name in df.index:
                     entry_price = df.loc[opt_name, "ltp"] or spot_price
 
+                    # --- ATR dynamic levels ---
+                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(entry_price, atr)
+                    if stop is None:
+                        logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} ATR regime extreme → skipping trade{RESET}")
+                        return
+
                     # --- Update trade state ---
                     paper_info[leg].update({
                         "option_name": opt_name,
@@ -899,6 +1034,17 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         "entry_time": ct,
                         "entry_candle": len(candles_3m) - 1,
                         "side": side,
+                        # ATR dynamic levels
+                        "stop": stop,
+                        "pt": pt,
+                        "tg": tg,
+                        "trail_start": trail_start,
+                        "trail_step": trail_step,
+                        # Momentum state
+                        "prev_gap": 0,
+                        "peak_momentum": 0,
+                        "peak_candle": len(candles_3m) - 1,
+                        "plateau_count": 0,
                     })
 
                     # --- Record entry in filled_df ---
@@ -921,7 +1067,8 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
 
                     logging.info(
                         f"{GREEN}[ENTRY][PAPER] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"Reason={reason} EntryCandle={len(candles_3m)-1}{RESET}"
+                        f"Reason={reason} ATR={atr:.2f} SL={stop:.2f} PT={pt:.2f} TG={tg:.2f} "
+                        f"TrailStart={trail_start:.2f} TrailStep={trail_step:.2f}{RESET}"
                     )
                 else:
                     logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}{CYAN}")
@@ -936,11 +1083,9 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
         combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv")
     store(paper_info, account_type)
 
-
 # =============================== Live Trading =======================================
 
 # ===== real_order =====
-# ===== live_order =====
 def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     global quantity, live_info, df, spot_price, last_signal_candle_time, risk_info
 
@@ -987,26 +1132,32 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         return
 
     # 5. Signal evaluation (entry detection)
+    # 5. Signal evaluation (entry detection on 3m candles only)
     signal = None
-    if not candles_3m.empty and hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
+    if not candles_3m.empty:
         last_candle_time = candles_3m.iloc[-1]["time"]
         if last_signal_candle_time != last_candle_time:
             last_signal_candle_time = last_candle_time
-            daily_val = daily_atr(hist_yesterday_15m)
-            atr, atr_source = resolve_atr(candles_3m, daily_val)
-            logging.info(f"{YELLOW}[SIGNAL EVAL][LIVE] candle={last_candle_time} candles={len(candles_3m)} atr={atr} source={atr_source}{RESET}")
 
-            prev_day = hist_yesterday_15m.iloc[-1]
-            cpr  = calculate_cpr(prev_day["high"], prev_day["low"], prev_day["close"])
-            trad = calculate_traditional_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
-            cam  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
+            # ATR from 3m candles
+            atr, atr_source = resolve_atr(candles_3m)
+            logging.info(
+                f"{YELLOW}[SIGNAL EVAL][LIVE] candle={last_candle_time} "
+                f"candles={len(candles_3m)} atr={atr:.2f} source={atr_source}{RESET}"
+            )
 
+            # Pivot calculations from the most recent 3m candle
+            prev_candle = candles_3m.iloc[-1]
+            cpr  = calculate_cpr(prev_candle["high"], prev_candle["low"], prev_candle["close"])
+            trad = calculate_traditional_pivots(prev_candle["high"], prev_candle["low"], prev_candle["close"])
+            cam  = calculate_camarilla_pivots(prev_candle["high"], prev_candle["low"], prev_candle["close"])
+
+            # Detect signal using 3m pivots + ATR
             signal = detect_signal(cpr, trad, cam, candles_3m, atr=atr)
 
     # 6. Live entry logic
     if signal:
         side, reason = signal["side"], signal["reason"]
-
         logging.info(f"[SIGNAL][LIVE] {side} ({reason}) spot={spot_price}")
 
         # --- Filters ---
@@ -1031,6 +1182,12 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                 if opt_name and opt_name in df.index:
                     entry_price = df.loc[opt_name, "ltp"] or spot_price
 
+                    # --- ATR dynamic levels ---
+                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(entry_price, atr)
+                    if stop is None:
+                        logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} ATR regime extreme → skipping trade{RESET}")
+                        return
+
                     # Place live order
                     success, order_id = send_live_entry_order(opt_name, quantity, 1)  # BUY side=1
                     if not success:
@@ -1050,6 +1207,17 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                         "entry_time": ct,
                         "entry_candle": len(candles_3m) - 1,
                         "side": side,
+                        # ATR dynamic levels
+                        "stop": stop,
+                        "pt": pt,
+                        "tg": tg,
+                        "trail_start": trail_start,
+                        "trail_step": trail_step,
+                        # Momentum state
+                        "prev_gap": 0,
+                        "peak_momentum": 0,
+                        "peak_candle": len(candles_3m) - 1,
+                        "plateau_count": 0,
                     })
 
                     # --- Record entry in filled_df ---
@@ -1072,7 +1240,8 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
 
                     logging.info(
                         f"{GREEN}[ENTRY][LIVE] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"Reason={reason} EntryCandle={len(candles_3m)-1}{RESET}"
+                        f"Reason={reason} ATR={atr:.2f} SL={stop:.2f} PT={pt:.2f} TG={tg:.2f} "
+                        f"TrailStart={trail_start:.2f} TrailStep={trail_step:.2f}{RESET}"
                     )
                 else:
                     logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}{RESET}")

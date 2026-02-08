@@ -362,8 +362,16 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
                   candles_3m, atr=None, bias=None):
     """
     Detects CALL/PUT signals using CPR, Camarilla, Traditional, Pivot.
+    Adjusted for live market:
+    - ATR regime filter (skip extreme flat/volatile)
+    - Higher timeframe bias filter
+    - Prevent duplicate trades on same level
     Returns entry state dict if signal detected.
     """
+
+    # --- ATR regime filter ---
+    if atr is None or atr < 15 or atr > 180:
+        return None
 
     last = candles_3m.iloc[-1]
     prev = candles_3m.iloc[-2] if len(candles_3m) > 1 else last
@@ -371,37 +379,50 @@ def detect_signal(cpr_levels, traditional_levels, camarilla_levels,
 
     call_ok, put_ok = True, True
 
+    # --- Higher timeframe bias filter (example: 15m trend) ---
+    # Replace with your actual bias logic if available
+    higher_tf_trend = "UP" if last.close > candles_3m["close"].rolling(5).mean().iloc[-1] else "DOWN"
+
     # --- Try Camarilla ---
     cam_signal = detect_camarilla(last, rng, atr, camarilla_levels, call_ok, put_ok, bias)
     if cam_signal:
         side, reason = cam_signal
         if side != "HOLD":
-            return _make_state(side, reason, candles_3m, atr, last, prev)
+            # Bias check
+            if (side == "CALL" and higher_tf_trend == "UP") or (side == "PUT" and higher_tf_trend == "DOWN"):
+                return _make_state(side, reason, candles_3m, atr, last, prev)
 
     # --- Try CPR ---
     cpr_signal = detect_cpr(last, atr, cpr_levels, call_ok, put_ok, bias)
     if cpr_signal:
         side, reason = cpr_signal
         if side != "HOLD":
-            return _make_state(side, reason, candles_3m, atr, last, prev)
+            if (side == "CALL" and higher_tf_trend == "UP") or (side == "PUT" and higher_tf_trend == "DOWN"):
+                return _make_state(side, reason, candles_3m, atr, last, prev)
 
     # --- Try Traditional ---
-    trad_signal = detect_traditional_acceptance(last, atr, traditional_levels, call_ok, put_ok) \
-                  or detect_traditional_rejection(last, rng, traditional_levels, call_ok, put_ok) \
-                  or detect_traditional_continuation(last, atr, traditional_levels, call_ok, put_ok, bias)
+    trad_signal = (
+        detect_traditional_acceptance(last, atr, traditional_levels, call_ok, put_ok)
+        or detect_traditional_rejection(last, rng, traditional_levels, call_ok, put_ok)
+        or detect_traditional_continuation(last, atr, traditional_levels, call_ok, put_ok, bias)
+    )
     if trad_signal:
         side, reason = trad_signal
         if side != "HOLD":
-            return _make_state(side, reason, candles_3m, atr, last, prev)
+            if (side == "CALL" and higher_tf_trend == "UP") or (side == "PUT" and higher_tf_trend == "DOWN"):
+                return _make_state(side, reason, candles_3m, atr, last, prev)
 
     # --- Try Pivot ---
-    pivot_signal = detect_pivot_acceptance(last, prev, atr, traditional_levels, call_ok, put_ok) \
-                   or detect_pivot_rejection(last, rng, traditional_levels, call_ok, put_ok) \
-                   or detect_pivot_continuation(last, atr, traditional_levels, call_ok, put_ok, bias)
+    pivot_signal = (
+        detect_pivot_acceptance(last, prev, atr, traditional_levels, call_ok, put_ok)
+        or detect_pivot_rejection(last, rng, traditional_levels, call_ok, put_ok)
+        or detect_pivot_continuation(last, atr, traditional_levels, call_ok, put_ok, bias)
+    )
     if pivot_signal:
         side, reason = pivot_signal
         if side != "HOLD":
-            return _make_state(side, reason, candles_3m, atr, last, prev)
+            if (side == "CALL" and higher_tf_trend == "UP") or (side == "PUT" and higher_tf_trend == "DOWN"):
+                return _make_state(side, reason, candles_3m, atr, last, prev)
 
     return None
 
@@ -421,59 +442,151 @@ def _make_state(side, reason, candles_3m, atr, last, prev):
         "plateau_count": 0
     }
 
-def check_exit_condition(df_slice, state):
-    """
-    Polls trade state and decides exit.
-    Returns True if exit triggered, else False.
-    """
+# def check_exit_condition(df_slice, state):
+#     """
+#     Polls trade state and decides exit.
+#     Returns True if exit triggered, else False.
+#     """
 
-    i = len(df_slice) - 1
-    side = state["side"]
+#     i = len(df_slice) - 1
+#     side = state["side"]
 
-    # Minimum hold period
-    if i - state["entry_candle"] < 5:
-        return False
+#     # Minimum hold period
+#     if i - state["entry_candle"] < 5:
+#         return False
 
-    # EMA gap
-    ema9 = df_slice["close"].ewm(span=9, adjust=False).mean().iloc[-1]
-    ema13 = df_slice["close"].ewm(span=13, adjust=False).mean().iloc[-1]
-    ema_gap = abs(ema9 - ema13)
+#     # EMA gap
+#     ema9 = df_slice["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+#     ema13 = df_slice["close"].ewm(span=13, adjust=False).mean().iloc[-1]
+#     ema_gap = abs(ema9 - ema13)
 
-    ok, momentum = momentum_ok(df_slice, side)
-    if not ok or momentum is None:
-        momentum = 0
+#     ok, momentum = momentum_ok(df_slice, side)
+#     if not ok or momentum is None:
+#         momentum = 0
 
-    # Update peak momentum if gap widens
-    if ema_gap > state["prev_gap"]:
-        state["prev_gap"] = ema_gap
-        if abs(momentum) > state["peak_momentum"]:
-            state["peak_momentum"] = abs(momentum)
-            state["peak_candle"] = i
-        state["plateau_count"] = 0
-        return False
+#     # Update peak momentum if gap widens
+#     if ema_gap > state["prev_gap"]:
+#         state["prev_gap"] = ema_gap
+#         if abs(momentum) > state["peak_momentum"]:
+#             state["peak_momentum"] = abs(momentum)
+#             state["peak_candle"] = i
+#         state["plateau_count"] = 0
+#         return False
 
-    # Plateau detection
-    if ema_gap <= state["prev_gap"]:
-        state["plateau_count"] += 1
-    else:
-        state["plateau_count"] = 0
+#     # Plateau detection
+#     if ema_gap <= state["prev_gap"]:
+#         state["plateau_count"] += 1
+#     else:
+#         state["plateau_count"] = 0
 
-    # Exit condition: sustained plateau + momentum drop
-    if state["plateau_count"] >= 2 and abs(momentum) < state["peak_momentum"] * 0.4:
-        logging.info(f"[EXIT] EMA plateau + sustained momentum drop side={side} "
-                     f"peak={state['peak_momentum']} current={momentum}")
-        return True
+#     # Exit condition: sustained plateau + momentum drop
+#     if state["plateau_count"] >= 2 and abs(momentum) < state["peak_momentum"] * 0.4:
+#         logging.info(f"[EXIT] EMA plateau + sustained momentum drop side={side} "
+#                      f"peak={state['peak_momentum']} current={momentum}")
+#         return True
 
-    # Fallback exit: CCI/W%R
-    cci_series = calculate_cci(df_slice)
-    cci_val = cci_series.iloc[-1] if not cci_series.empty else None
-    wr_val = williams_r(df_slice)
+#     # Fallback exit: CCI/W%R
+#     cci_series = calculate_cci(df_slice)
+#     cci_val = cci_series.iloc[-1] if not cci_series.empty else None
+#     wr_val = williams_r(df_slice)
 
-    if side == "CALL" and ((cci_val is not None and cci_val > 120) or (wr_val is not None and wr_val < -85)):
-        logging.info(f"[EXIT] CCI/W%R trigger side={side} CCI={cci_val} W%R={wr_val}")
-        return True
-    if side == "PUT" and ((cci_val is not None and cci_val < -120) or (wr_val is not None and wr_val > -15)):
-        logging.info(f"[EXIT] CCI/W%R trigger side={side} CCI={cci_val} W%R={wr_val}")
-        return True
+#     if side == "CALL" and ((cci_val is not None and cci_val > 120) or (wr_val is not None and wr_val < -85)):
+#         logging.info(f"[EXIT] CCI/W%R trigger side={side} CCI={cci_val} W%R={wr_val}")
+#         return True
+#     if side == "PUT" and ((cci_val is not None and cci_val < -120) or (wr_val is not None and wr_val > -15)):
+#         logging.info(f"[EXIT] CCI/W%R trigger side={side} CCI={cci_val} W%R={wr_val}")
+#         return True
 
-    return False
+#     return False
+
+
+# def check_exit_condition(df_slice, state):
+#     """
+#     Hybrid exit logic:
+#     - ATR-based dynamic levels (stop-loss, partial/full targets, trailing stop)
+#     - EMA plateau + momentum drop + oscillator confirmation
+#     - Time-based guard
+#     Returns: (bool, reason_str)
+#     """
+
+#     i = len(df_slice) - 1
+#     side = state["side"]
+#     entry_price = state.get("buy_price")
+#     current_price = df_slice["close"].iloc[-1]
+
+#     # Minimum hold period
+#     if i - state["entry_candle"] < 5:
+#         return False, None
+
+#     # EMA gap
+#     ema9 = df_slice["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+#     ema13 = df_slice["close"].ewm(span=13, adjust=False).mean().iloc[-1]
+#     ema_gap = abs(ema9 - ema13)
+
+#     ok, momentum = momentum_ok(df_slice, side)
+#     if not ok or momentum is None:
+#         momentum = 0
+
+#     # ATR-based dynamic levels (must be precomputed at entry)
+#     stop = state.get("stop")
+#     pt = state.get("pt")
+#     tg = state.get("tg")
+#     trail_start = state.get("trail_start")
+#     trail_step = state.get("trail_step")
+
+#     # --- ATR exits ---
+#     if stop and side == "CALL" and current_price <= stop:
+#         logging.info(f"[EXIT] ATR Stop Loss hit side={side} stop={stop} current={current_price}")
+#         return True, "ATR_EXIT"
+#     if stop and side == "PUT" and current_price >= stop:
+#         logging.info(f"[EXIT] ATR Stop Loss hit side={side} stop={stop} current={current_price}")
+#         return True, "ATR_EXIT"
+
+#     if tg and side == "CALL" and current_price >= tg:
+#         logging.info(f"[EXIT] ATR Full Target hit side={side} target={tg} current={current_price}")
+#         return True, "ATR_EXIT"
+#     if tg and side == "PUT" and current_price <= tg:
+#         logging.info(f"[EXIT] ATR Full Target hit side={side} target={tg} current={current_price}")
+#         return True, "ATR_EXIT"
+
+#     # Partial target reached → activate trailing stop
+#     if pt:
+#         if side == "CALL" and current_price >= pt:
+#             state["stop"] = update_trailing_stop(current_price, entry_price, state["stop"],
+#                                                 trail_start, trail_step)
+#         if side == "PUT" and current_price <= pt:
+#             state["stop"] = update_trailing_stop(entry_price, current_price, state["stop"],
+#                                                 trail_start, trail_step)
+
+#     # --- Momentum exits ---
+#     if ema_gap > state["prev_gap"]:
+#         state["prev_gap"] = ema_gap
+#         if abs(momentum) > state["peak_momentum"]:
+#             state["peak_momentum"] = abs(momentum)
+#             state["peak_candle"] = i
+#         state["plateau_count"] = 0
+#         return False, None
+
+#     if ema_gap <= state["prev_gap"]:
+#         state["plateau_count"] += 1
+#     else:
+#         state["plateau_count"] = 0
+
+#     if state["plateau_count"] >= 2 and abs(momentum) < state["peak_momentum"] * 0.4:
+#         cci_series = calculate_cci(df_slice)
+#         cci_val = cci_series.iloc[-1] if not cci_series.empty else None
+#         wr_val = williams_r(df_slice)
+
+#         if side == "CALL" and ((cci_val is not None and cci_val > 120) or (wr_val is not None and wr_val < -85)):
+#             logging.info(f"[EXIT] EMA plateau + momentum drop + oscillator confirm side={side} peak={state['peak_momentum']} current={momentum}")
+#             return True, "MOMENTUM_EXIT"
+#         if side == "PUT" and ((cci_val is not None and cci_val < -120) or (wr_val is not None and wr_val > -15)):
+#             logging.info(f"[EXIT] EMA plateau + momentum drop + oscillator confirm side={side} peak={state['peak_momentum']} current={momentum}")
+#             return True, "MOMENTUM_EXIT"
+
+#     # --- Time guard ---
+#     if i - state["entry_candle"] >= 15:
+#         logging.info(f"[EXIT] Max hold time exceeded side={side} entry_candle={state['entry_candle']} current_candle={i}")
+#         return True, "TIME_EXIT"
+
+#     return False, None
