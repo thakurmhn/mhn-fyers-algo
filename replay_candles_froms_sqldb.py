@@ -12,6 +12,7 @@ from indicators import (
 )
 from signals import detect_signal
 from execution import build_dynamic_levels, process_order
+from orchestration import build_indicator_dataframe
 
 RESET   = "\033[0m"
 GREEN   = "\033[92m"
@@ -34,7 +35,7 @@ def replay_run_strategy(symbol, prev_date, curr_date, cooldown=20):
     conn_prev = sqlite3.connect(db_path_prev)
     conn_curr = sqlite3.connect(db_path_curr)
 
-    # Previous day OHLC
+    # --- Previous day OHLC (3m) ---
     query_prev = f"""
     SELECT trade_date, ist_slot, open, high, low, close
     FROM candles_3m_ist
@@ -55,16 +56,39 @@ def replay_run_strategy(symbol, prev_date, curr_date, cooldown=20):
     cam_levels  = calculate_camarilla_pivots(prev_day["high"], prev_day["low"], prev_day["close"])
     logging.info(f"[LEVELS] CPR={cpr_levels} Traditional={trad_levels} Camarilla={cam_levels}")
 
-    # Current day 3m candles
-    query_curr = f"""
+    # --- Current day 3m candles ---
+    query_curr_3m = f"""
     SELECT trade_date, ist_slot, open, high, low, close
     FROM candles_3m_ist
     WHERE symbol = '{symbol}' AND trade_date = '{curr_date}'
     """
-    df_curr = pd.read_sql(query_curr, conn_curr)
-    df_curr["datetime"] = pd.to_datetime(df_curr["trade_date"] + " " + df_curr["ist_slot"])
-    df_curr.set_index("datetime", inplace=True)
+    df_curr_3m = pd.read_sql(query_curr_3m, conn_curr)
+    df_curr_3m["datetime"] = pd.to_datetime(df_curr_3m["trade_date"] + " " + df_curr_3m["ist_slot"])
+    df_curr_3m.set_index("datetime", inplace=True)
 
+    # --- Current day 15m candles ---
+    query_curr_15m = f"""
+    SELECT trade_date, ist_slot, open, high, low, close
+    FROM candles_15m_ist
+    WHERE symbol = '{symbol}' AND trade_date = '{curr_date}'
+    """
+    df_curr_15m = pd.read_sql(query_curr_15m, conn_curr)
+    df_curr_15m["datetime"] = pd.to_datetime(df_curr_15m["trade_date"] + " " + df_curr_15m["ist_slot"])
+    df_curr_15m.set_index("datetime", inplace=True)
+
+    # --- Previous day 15m candles for continuity ---
+    query_prev_15m = f"""
+    SELECT trade_date, ist_slot, open, high, low, close
+    FROM candles_15m_ist
+    WHERE symbol = '{symbol}' AND trade_date = '{prev_date}'
+    """
+    df_prev_15m = pd.read_sql(query_prev_15m, conn_prev)
+    df_prev_15m["datetime"] = pd.to_datetime(df_prev_15m["trade_date"] + " " + df_prev_15m["ist_slot"])
+    df_prev_15m.set_index("datetime", inplace=True)
+
+    logging.info(f"[DEBUG] Current day 3m candles={len(df_curr_3m)} | 15m candles={len(df_curr_15m)} | Prev 15m={len(df_prev_15m)}")
+
+    # --- Replay loop ---
     state = None
     counters = {"CALL": 0, "PUT": 0}
     exit_counters = {"ATR_EXIT": 0, "MOMENTUM_EXIT": 0, "TIME_EXIT": 0,
@@ -75,13 +99,18 @@ def replay_run_strategy(symbol, prev_date, curr_date, cooldown=20):
     last_exit_candle = None
     traded_levels = set()
 
-    for i in range(len(df_curr)):
-        df_slice = df_curr.iloc[: i + 1]
+    for i in range(len(df_curr_3m)):
+        df_slice_3m = df_curr_3m.iloc[: i + 1]
 
-        if len(df_slice) < 20:
+        # ✅ Merge continuity for 15m before enrichment
+        merged_15m = pd.concat([df_prev_15m, df_curr_15m], ignore_index=False)
+        merged_15m = merged_15m.drop_duplicates(subset=["trade_date","ist_slot"], keep="last").sort_index()
+        df_slice_15m = merged_15m.loc[merged_15m.index <= df_slice_3m.index[-1]]
+
+        if len(df_slice_3m) < 20:
             continue
 
-        atr_val, _ = resolve_atr(df_slice)
+        atr_val, _ = resolve_atr(df_slice_3m)
         if atr_val is None:
             continue
 
@@ -93,9 +122,11 @@ def replay_run_strategy(symbol, prev_date, curr_date, cooldown=20):
                 cpr_levels=cpr_levels,
                 traditional_levels=trad_levels,
                 camarilla_levels=cam_levels,
-                candles_3m=df_slice,
+                candles_3m=df_slice_3m,
                 atr=atr_val,
-                bias="PREV_DAY"
+                bias="PREV_DAY",
+                higher_tf=df_slice_15m if not df_slice_15m.empty else None,
+                include_partial=False
             )
             if signal:
                 level_key = f"{signal['reason']}_{signal['side']}"
@@ -104,8 +135,8 @@ def replay_run_strategy(symbol, prev_date, curr_date, cooldown=20):
                 traded_levels.add(level_key)
 
                 side, reason = signal["side"], signal["reason"]
-                entry_price = df_slice.iloc[-1]["close"]
-                entry_candle = df_slice.iloc[-1]
+                entry_price = df_slice_3m.iloc[-1]["close"]
+                entry_candle = df_slice_3m.iloc[-1]
 
                 stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
                     entry_price, atr_val, side, entry_candle
@@ -130,12 +161,16 @@ def replay_run_strategy(symbol, prev_date, curr_date, cooldown=20):
                     "peak_momentum": 0,
                     "peak_candle": i,
                     "plateau_count": 0,
-                    "trail_updates": 0,   # NEW: count trailing stop updates
+                    "trail_updates": 0,
                 }
 
                 counters[side] += 1
                 print(f"{GREEN}[ENTRY] Candle {i}: side={side} reason={reason} ATR={fmt(atr_val)} SL={fmt(stop)}{RESET}")
             continue
+
+        if not df_slice_15m.empty:
+            enriched_15m = build_indicator_dataframe(symbol, df_slice_15m.copy(), interval="15m")
+            logging.info(f"[15m CONTEXT] Tail of 15m candles at entry:\n{enriched_15m.tail(3)}")
 
         if state:
             dummy_info = {
@@ -160,9 +195,9 @@ def replay_run_strategy(symbol, prev_date, curr_date, cooldown=20):
 
             triggered, reason = process_order(
                 state,
-                df_slice,
+                df_slice_3m,
                 dummy_info,
-                spot_price=df_slice.iloc[-1]["close"],
+                spot_price=df_slice_3m.iloc[-1]["close"],
                 account_type="paper"
             )
 
@@ -186,8 +221,10 @@ def replay_run_strategy(symbol, prev_date, curr_date, cooldown=20):
             logging.info(f"[HOLD] {reason} average candles held={avg:.2f}")
 
     if trail_updates_summary:
-        avg_updates = sum(trail_updates_summary) / len(trail_updates_summary)
-        logging.info(f"[TRAIL SUMMARY] Average trailing stop updates per trade={avg_updates:.2f}")
+       avg_updates = sum(trail_updates_summary) / len(trail_updates_summary)
+       logging.info(f"[TRAIL SUMMARY] Average trailing stop updates per trade={avg_updates:.2f}")
+
+
 
 if __name__ == "__main__":
     symbol = "NSE:NIFTY50-INDEX"

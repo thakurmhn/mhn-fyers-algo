@@ -392,3 +392,26 @@ def williams_r(candles, period=14):
         f"close={last_close:.2f}, W%R={wr:.2f}"
     )
     return wr
+
+
+def compute_rsi(series, period=14):
+    """
+    Compute Relative Strength Index (RSI).
+    series: pandas Series of closing prices
+    period: lookback period (default 14)
+    Returns: pandas Series of RSI values
+    """
+    delta = series.diff()
+
+    # Separate gains and losses
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    # Use exponential moving average for smoothing
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi

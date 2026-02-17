@@ -1,3 +1,5 @@
+# ========= candle_builder.py ===========
+
 import logging
 import pandas as pd
 import pendulum as dt
@@ -17,8 +19,11 @@ from indicators import (
     supertrend, 
     calculate_ema, 
     calculate_adx,
-    calculate_cci
+    calculate_cci,
+    compute_rsi
 )
+
+
 
 
 def build_3min_candle(df_ticks, symbol):
@@ -53,14 +58,16 @@ def build_3min_candle(df_ticks, symbol):
         ohlcv["ist_slot"] = ohlcv.index.strftime("%H:%M:%S")
         ohlcv["symbol"] = symbol
 
-        # ✅ Enrich with indicators
+        # ✅ Add unified 'time' column for downstream strategy
+        ohlcv["time"] = ohlcv.index.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Indicators
         ohlcv["ema20"] = calculate_ema(ohlcv, column="close", period=20)
         ohlcv["ema50"] = calculate_ema(ohlcv, column="close", period=50)
         ohlcv["adx14"] = calculate_adx(ohlcv)
         ohlcv["cci20"] = calculate_cci(ohlcv)
 
-        # ✅ Corrected ATR call
-        atr, atr_source = resolve_atr(ohlcv, daily_atr=None)
+        atr, _ = resolve_atr(ohlcv, daily_atr=None)
         bias, slope = supertrend(ohlcv, atr_val=atr)
         ohlcv.loc[ohlcv.index[-1], "supertrend_bias"] = bias
         ohlcv.loc[ohlcv.index[-1], "supertrend_slope"] = slope
@@ -70,7 +77,9 @@ def build_3min_candle(df_ticks, symbol):
 
     except Exception as e:
         logging.error(f"[CANDLE BUILDER ERROR] {e}")
-        return pd.DataFrame(columns=["trade_date","ist_slot","open","high","low","close","volume","symbol"])
+        return pd.DataFrame(columns=[
+            "trade_date","ist_slot","time","open","high","low","close","volume","symbol"
+        ])
 
 
 # ===== Candle Builder (15m) =====
@@ -142,7 +151,6 @@ def persist_15m_candle(tick_db, symbol, ts, row):
         trade_date, ist_slot, row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
     )
 
-
 def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
     """Incrementally build and persist 15m candles for a given symbol."""
     try:
@@ -151,11 +159,12 @@ def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
             logging.warning(f"[CANDLE BUILDER] No intraday data for {symbol}")
             return pd.DataFrame()
 
-        # Use .loc with a time mask instead of .last()
+        # Restrict to last 1 day window
         end_time = df.index.max()
         start_time = end_time - pd.Timedelta(days=1)
         window = df.loc[start_time:end_time]
 
+        # Resample into 15m OHLCV
         df_15m = resample_15m(window)
         if df_15m.empty:
             logging.warning(f"[CANDLE BUILDER] No 15m candles built for {symbol}")
@@ -170,7 +179,6 @@ def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
             ist_slot = ts.strftime("%H:%M:%S")
             if ist_slot in existing_slots:
                 continue
-
             persist_15m_candle(tick_db, symbol, ts, row)
             new_rows.append((ts, row))
 
@@ -184,13 +192,16 @@ def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
         df_15m["ist_slot"] = df_15m.index.strftime("%H:%M:%S")
         df_15m["symbol"] = symbol
 
+        # ✅ Add unified 'time' column for downstream strategy
+        df_15m["time"] = df_15m.index.strftime("%Y-%m-%d %H:%M:%S")
+
         # ✅ Enrich with indicators including Supertrend bias/slope
         df_15m["ema20"] = calculate_ema(df_15m, column="close", period=20)
         df_15m["ema50"] = calculate_ema(df_15m, column="close", period=50)
         df_15m["adx14"] = calculate_adx(df_15m)
         df_15m["cci20"] = calculate_cci(df_15m)
 
-        atr, atr_source = resolve_atr(df_15m, daily_val=None)
+        atr, _ = resolve_atr(df_15m, daily_atr=None)
         bias, slope = supertrend(df_15m, atr_val=atr)
         df_15m.loc[df_15m.index[-1], "supertrend_bias"] = bias
         df_15m.loc[df_15m.index[-1], "supertrend_slope"] = slope
@@ -199,7 +210,9 @@ def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
 
     except Exception as e:
         logging.error(f"[CANDLE BUILDER ERROR] {e}")
-        return pd.DataFrame(columns=["trade_date","ist_slot","open","high","low","close","volume","symbol"])
+        return pd.DataFrame(columns=[
+            "trade_date","ist_slot","time","open","high","low","close","volume","symbol"
+        ])
 
 def get_today_15m_candles(hist_data):
     """Return today's 15m candles enriched with indicators and supertrend bias/slope."""
@@ -214,18 +227,29 @@ def get_today_15m_candles(hist_data):
         if df_15m.empty:
             return pd.DataFrame()
 
+        # Add metadata
+        df_15m["trade_date"] = df_15m.index.date.astype(str)
+        df_15m["ist_slot"] = df_15m.index.strftime("%H:%M:%S")
+        df_15m["symbol"] = hist_data["symbol"].iloc[0] if "symbol" in hist_data.columns else "UNKNOWN"
+
+        # ✅ Add unified 'time' column for downstream strategy
+        df_15m["time"] = df_15m.index.strftime("%Y-%m-%d %H:%M:%S")
+
         # Enrich with indicators
         df_15m["ema20"] = calculate_ema(df_15m, column="close", period=20)
         df_15m["ema50"] = calculate_ema(df_15m, column="close", period=50)
         df_15m["adx14"] = calculate_adx(df_15m)
         df_15m["cci20"] = calculate_cci(df_15m)
 
-        atr, atr_source = resolve_atr(df_15m, daily_val=None)
+        atr, _ = resolve_atr(df_15m, daily_atr=None)
         bias, slope = supertrend(df_15m, atr_val=atr)
         df_15m.loc[df_15m.index[-1], "supertrend_bias"] = bias
         df_15m.loc[df_15m.index[-1], "supertrend_slope"] = slope
 
         return df_15m
+
     except Exception as e:
         logging.error(f"{RED}[get_today_15m_candles ERROR] {e}{RESET}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[
+            "trade_date","ist_slot","time","open","high","low","close","volume","symbol"
+        ])

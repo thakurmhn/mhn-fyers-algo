@@ -9,19 +9,51 @@ import pytz
 time_zone = pytz.timezone("Asia/Kolkata")
 today = datetime.now(time_zone).date()
 
+import sqlite3
+import pandas as pd
+import logging
+import os
+from datetime import datetime, timedelta
+import pytz
+
+time_zone = pytz.timezone("Asia/Kolkata")
+
+def fmt(val):
+    """Format numeric values safely for logs."""
+    return f"{val:.2f}" if val is not None and not pd.isna(val) else "NA"
+
 class TickDatabase:
-    def __init__(self, base_path=r"C:\SQLite\ticks"):
+    def __init__(self, base_path=r"C:\SQLite\ticks", max_lookback=5):
         base_path = os.path.abspath(base_path)
         os.makedirs(base_path, exist_ok=True)
 
-        trade_date = datetime.now().strftime("%Y-%m-%d")
-        db_file = os.path.join(base_path, f"ticks_{trade_date}.db")
+        # Always create/use today's DB file for persistence
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        db_file = os.path.join(base_path, f"ticks_{today_str}.db")
 
+        # Ensure file exists and tables are created
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self._create_tables()
 
         logging.info(f"[DB PATH] Using database at {db_file}")
+
+        # Store base_path and max_lookback for continuity fetches
+        self.base_path = base_path
+        self.max_lookback = max_lookback
+
+    def _get_latest_db_file(self, base_path, today_str, max_lookback):
+        """
+        Find the most recent DB file up to max_lookback days before today.
+        Used for continuity lookbacks, not for persistence.
+        """
+        base_date = datetime.strptime(today_str, "%Y-%m-%d")
+        for d in range(0, max_lookback + 1):
+            check_date = (base_date - timedelta(days=d)).strftime("%Y-%m-%d")
+            db_file = os.path.join(base_path, f"ticks_{check_date}.db")
+            if os.path.exists(db_file):
+                return db_file
+        return None
 
     def _create_tables(self):
         # Raw ticks
@@ -42,6 +74,7 @@ class TickDatabase:
             ist_slot TEXT NOT NULL,
             symbol TEXT NOT NULL,
             open REAL, high REAL, low REAL, close REAL, volume REAL,
+            is_partial INTEGER DEFAULT 0,
             PRIMARY KEY (trade_date, ist_slot, symbol)
         )""")
 
@@ -52,6 +85,7 @@ class TickDatabase:
             ist_slot TEXT NOT NULL,
             symbol TEXT NOT NULL,
             open REAL, high REAL, low REAL, close REAL, volume REAL,
+            is_partial INTEGER DEFAULT 0,
             PRIMARY KEY (trade_date, ist_slot, symbol)
         )""")
 
@@ -76,46 +110,92 @@ class TickDatabase:
         except Exception as e:
             logging.error(f"[DB ERROR] Failed to insert tick: {e}")
 
-    # ===== Candle persistence =====
+    # # ===== Candle persistence =====
+    # def insert_3m_candle(self, trade_date, ist_slot,
+    #                      open_price, high_price, low_price, close_price, volume, symbol):
+    #     """Insert a 3m candle into candles_3m_ist table with symbol included."""
+    #     try:
+    #         self.cursor.execute("""
+    #             INSERT OR REPLACE INTO candles_3m_ist
+    #             (trade_date, ist_slot, symbol, open, high, low, close, volume)
+    #             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    #         """, (
+    #             str(trade_date), str(ist_slot), str(symbol),
+    #             float(open_price) if open_price is not None else None,
+    #             float(high_price) if high_price is not None else None,
+    #             float(low_price) if low_price is not None else None,
+    #             float(close_price) if close_price is not None else None,
+    #             float(volume) if volume is not None else None
+    #         ))
+    #         self.conn.commit()
+    #         logging.debug(f"[DB] Inserted 3m candle {trade_date} {ist_slot} {symbol}")
+    #     except Exception as e:
+    #         logging.error(f"[DB ERROR] Failed to insert 3m candle for {symbol}: {e}")
+
+    # def insert_15m_candle(self, trade_date, ist_slot,
+    #                       open_, high, low, close, volume, symbol):
+    #     """Insert a 15m candle into candles_15m_ist table with symbol included."""
+    #     try:
+    #         self.cursor.execute("""
+    #             INSERT OR REPLACE INTO candles_15m_ist
+    #             (trade_date, ist_slot, symbol, open, high, low, close, volume)
+    #             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    #         """, (
+    #             str(trade_date), str(ist_slot), str(symbol),
+    #             float(open_) if open_ is not None else None,
+    #             float(high) if high is not None else None,
+    #             float(low) if low is not None else None,
+    #             float(close) if close is not None else None,
+    #             float(volume) if volume is not None else None
+    #         ))
+    #         self.conn.commit()
+    #         logging.debug(f"[DB] Inserted 15m candle {trade_date} {ist_slot} {symbol}")
+    #     except Exception as e:
+    #         logging.error(f"[DB ERROR] Failed to insert 15m candle for {symbol}: {e}")
+
     def insert_3m_candle(self, trade_date, ist_slot,
-                         open_price, high_price, low_price, close_price, volume, symbol):
-        """Insert a 3m candle into candles_3m_ist table with symbol included."""
+                     open_price, high_price, low_price, close_price, volume, symbol,
+                     is_partial=False):
+        """Insert a 3m candle into candles_3m_ist table with symbol + partial flag."""
         try:
             self.cursor.execute("""
                 INSERT OR REPLACE INTO candles_3m_ist
-                (trade_date, ist_slot, symbol, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (trade_date, ist_slot, symbol, open, high, low, close, volume, is_partial)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 str(trade_date), str(ist_slot), str(symbol),
                 float(open_price) if open_price is not None else None,
                 float(high_price) if high_price is not None else None,
                 float(low_price) if low_price is not None else None,
                 float(close_price) if close_price is not None else None,
-                float(volume) if volume is not None else None
+                float(volume) if volume is not None else None,
+                int(is_partial)
             ))
             self.conn.commit()
-            logging.debug(f"[DB] Inserted 3m candle {trade_date} {ist_slot} {symbol}")
+            logging.debug(f"[DB] Inserted 3m candle {trade_date} {ist_slot} {symbol} partial={is_partial}")
         except Exception as e:
             logging.error(f"[DB ERROR] Failed to insert 3m candle for {symbol}: {e}")
 
     def insert_15m_candle(self, trade_date, ist_slot,
-                          open_, high, low, close, volume, symbol):
-        """Insert a 15m candle into candles_15m_ist table with symbol included."""
+                        open_, high, low, close, volume, symbol,
+                        is_partial=False):
+        """Insert a 15m candle into candles_15m_ist table with symbol + partial flag."""
         try:
             self.cursor.execute("""
                 INSERT OR REPLACE INTO candles_15m_ist
-                (trade_date, ist_slot, symbol, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (trade_date, ist_slot, symbol, open, high, low, close, volume, is_partial)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 str(trade_date), str(ist_slot), str(symbol),
                 float(open_) if open_ is not None else None,
                 float(high) if high is not None else None,
                 float(low) if low is not None else None,
                 float(close) if close is not None else None,
-                float(volume) if volume is not None else None
+                float(volume) if volume is not None else None,
+                int(is_partial)
             ))
             self.conn.commit()
-            logging.debug(f"[DB] Inserted 15m candle {trade_date} {ist_slot} {symbol}")
+            logging.debug(f"[DB] Inserted 15m candle {trade_date} {ist_slot} {symbol} partial={is_partial}")
         except Exception as e:
             logging.error(f"[DB ERROR] Failed to insert 15m candle for {symbol}: {e}")
 
@@ -173,8 +253,60 @@ class TickDatabase:
             logging.error(f"[DB ERROR] Failed to replay ticks: {e}")
             return pd.DataFrame()
 
+    # def build_candles_from_ticks(self, symbol, interval="3m"):
+    #     # Fetch raw ticks for the symbol
+    #     df = self.fetch_ticks(symbol)
+    #     if df.empty:
+    #         logging.warning(f"[CANDLES] No ticks available for {symbol}, skipping candle build")
+    #         return
+
+    #     # Convert timestamp to IST
+    #     df['ts'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    #     df = df.dropna(subset=['ts'])  # drop rows with invalid timestamps
+    #     df['ts'] = df['ts'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
+
+    #     # Determine resample rule (use 'min' instead of deprecated 'T')
+    #     if interval == "3m":
+    #         rule = "3min"
+    #     elif interval == "15m":
+    #         rule = "15min"
+    #     else:
+    #         logging.error(f"[CANDLES] Unsupported interval={interval}, must be '3m' or '15m'")
+    #         return
+
+    #     # Resample ticks into OHLCV
+    #     ohlc = (
+    #         df.resample(rule, on='ts')
+    #         .agg({
+    #             'last_price': ['first', 'max', 'min', 'last'],
+    #             'volume': 'sum'
+    #         })
+    #         .dropna()
+    #     )
+
+    #     # Flatten multi-index columns
+    #     ohlc.columns = ['open', 'high', 'low', 'close', 'volume']
+    #     ohlc.reset_index(inplace=True)
+
+    #     # Persist each candle into DB
+    #     for _, row in ohlc.iterrows():
+    #         trade_date = row['ts'].date().isoformat()
+    #         ist_slot = row['ts'].strftime('%H:%M:%S')
+
+    #         if interval == "3m":
+    #             self.insert_3m_candle(
+    #                 trade_date, ist_slot,
+    #                 row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
+    #             )
+    #         else:  # 15m
+    #             self.insert_15m_candle(
+    #                 trade_date, ist_slot,
+    #                 row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
+    #             )
+
+    #     logging.info(f"[CANDLES] Built {interval} candles for {symbol} ({len(ohlc)} rows)")
+
     def build_candles_from_ticks(self, symbol, interval="3m"):
-        # Fetch raw ticks for the symbol
         df = self.fetch_ticks(symbol)
         if df.empty:
             logging.warning(f"[CANDLES] No ticks available for {symbol}, skipping candle build")
@@ -182,49 +314,67 @@ class TickDatabase:
 
         # Convert timestamp to IST
         df['ts'] = pd.to_datetime(df['timestamp'], errors='coerce')
-        df = df.dropna(subset=['ts'])  # drop rows with invalid timestamps
+        df = df.dropna(subset=['ts'])
         df['ts'] = df['ts'].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
 
-        # Determine resample rule (use 'min' instead of deprecated 'T')
-        if interval == "3m":
-            rule = "3min"
-        elif interval == "15m":
-            rule = "15min"
-        else:
-            logging.error(f"[CANDLES] Unsupported interval={interval}, must be '3m' or '15m'")
+        # Resample rule
+        rule = "3min" if interval == "3m" else "15min" if interval == "15m" else None
+        if rule is None:
+            logging.error(f"[CANDLES] Unsupported interval={interval}")
             return
 
-        # Resample ticks into OHLCV
+        # Resample ticks into OHLCV (keep partial bins too)
         ohlc = (
             df.resample(rule, on='ts')
             .agg({
                 'last_price': ['first', 'max', 'min', 'last'],
                 'volume': 'sum'
             })
-            .dropna()
         )
-
-        # Flatten multi-index columns
         ohlc.columns = ['open', 'high', 'low', 'close', 'volume']
         ohlc.reset_index(inplace=True)
 
-        # Persist each candle into DB
+        # Fill forward for partial bars
+        ohlc['open']   = ohlc['open'].ffill()
+        ohlc['high']   = ohlc['high'].fillna(ohlc['open'])
+        ohlc['low']    = ohlc['low'].fillna(ohlc['open'])
+        ohlc['close']  = ohlc['close'].fillna(ohlc['open'])
+        ohlc['volume'] = ohlc['volume'].fillna(0)
+
+        # Add flag: mark last row as partial if slot not yet closed
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        ohlc['is_partial'] = False
+        if not ohlc.empty:
+            last_slot = ohlc.iloc[-1]['ts']
+            # If current time is still inside this slot window, mark as partial
+            if (interval == "3m" and (now - last_slot).seconds < 180) or \
+            (interval == "15m" and (now - last_slot).seconds < 900):
+                ohlc.at[ohlc.index[-1], 'is_partial'] = True
+
+        # Persist each candle
         for _, row in ohlc.iterrows():
             trade_date = row['ts'].date().isoformat()
-            ist_slot = row['ts'].strftime('%H:%M:%S')
+            ist_slot   = row['ts'].strftime('%H:%M:%S')
 
             if interval == "3m":
-                self.insert_3m_candle(
-                    trade_date, ist_slot,
-                    row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
-                )
-            else:  # 15m
-                self.insert_15m_candle(
-                    trade_date, ist_slot,
-                    row['open'], row['high'], row['low'], row['close'], row['volume'], symbol
-                )
+                self.insert_3m_candle(trade_date, ist_slot,
+                    row['open'], row['high'], row['low'], row['close'], row['volume'], symbol,
+                    is_partial=row['is_partial'])
+            else:
+                self.insert_15m_candle(trade_date, ist_slot,
+                    row['open'], row['high'], row['low'], row['close'], row['volume'], symbol,
+                    is_partial=row['is_partial'])
 
-        logging.info(f"[CANDLES] Built {interval} candles for {symbol} ({len(ohlc)} rows)")
+        # ✅ Debug: show latest slot values
+        latest = ohlc.iloc[-1]
+        logging.info(
+            f"[LIVE {interval.upper()}] Latest slot {latest['ts']} "
+            f"O={fmt(latest['open'])} H={fmt(latest['high'])} "
+            f"L={fmt(latest['low'])} C={fmt(latest['close'])} V={fmt(latest['volume'])} "
+            f"Partial={latest['is_partial']}"
+        )
+
+        logging.info(f"[CANDLES] Built {interval} candles for {symbol} ({len(ohlc)} rows incl. partial)")
 
 
     def rebuild_candles_from_db(self, symbol, interval="3m"):

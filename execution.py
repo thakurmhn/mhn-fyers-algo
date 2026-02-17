@@ -5,6 +5,8 @@ import pandas as pd
 import pendulum as dt
 from fyers_apiv3 import fyersModel
 import time
+from datetime import datetime, timedelta
+
 from config import (
     time_zone, strategy_name, MAX_TRADES_PER_DAY, account_type, quantity,
     CALL_MONEYNESS, PUT_MONEYNESS, profit_loss_point, ENTRY_OFFSET, ORDER_TYPE,
@@ -30,7 +32,6 @@ from signals import detect_signal
 from tickdb import tick_db
 from orchestration import update_candles_and_signals
 
-
 # ===========================================================
 # ANSI COLORS for order logs
 RESET   = "\033[0m"
@@ -50,6 +51,8 @@ except NameError:
 
 
 #===================================================================
+
+today_str = datetime.now().strftime("%Y-%m-%d")
 
 def map_status_code(code):
     status_map = {
@@ -321,7 +324,7 @@ def check_exit_condition(df_slice, state):
 
 
 def build_dynamic_levels(entry_price, atr, side, entry_candle,
-                         rr_ratio=2.0, profit_loss_point=5):
+                         rr_ratio=2.0, profit_loss_point=5, candles_df=None):
     """
     Build stop-loss, partial/full targets, and trailing parameters.
     Adjustments for live market:
@@ -329,38 +332,52 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
     - Wider reward points (2 × ATR in normal regime)
     - Buffered trailing stop
     - Unified PT/TG logic for long CALL and long PUT
+
+    Parameters:
+    - entry_price: float, trade entry price
+    - atr: float, average true range
+    - side: str, "CALL" or "PUT"
+    - entry_candle: either a DataFrame row (Series) or an integer index
+    - rr_ratio: reward-to-risk multiplier
+    - profit_loss_point: minimum risk points
+    - candles_df: optional DataFrame of candles (required if entry_candle is int)
     """
 
-    # weekday = dt.now(time_zone).weekday()  # Monday=0 ... Sunday=6
-    # is_expiry_day = (weekday == 1)  # Tuesday
-    
-    # ---- Decision: Normal / Volatile / Extreme ----
+    # ---- Resolve entry_candle row ----
+    if isinstance(entry_candle, int):
+        if candles_df is None:
+            logging.error("[LEVELS] entry_candle is int but candles_df not provided")
+            return None, None, None, None, None
+        candle_row = candles_df.iloc[entry_candle]
+    elif isinstance(entry_candle, pd.Series):
+        candle_row = entry_candle
+    else:
+        logging.error("[LEVELS] Invalid entry_candle type")
+        return None, None, None, None, None
 
-    if atr <= 80:          # calm to moderate
+    # ---- Decision: Normal / Volatile / Extreme ----
+    if atr <= 80:
         mode = "normal"
-    elif atr <= 200:       # active but tradable
+    elif atr <= 200:
         mode = "volatile"
-    else:                  # ATR > 200 → extreme swings
+    else:
         mode = "extreme"
 
     if mode == "normal":
         risk_points   = max(profit_loss_point, atr * 0.25)
-        reward_points = atr * rr_ratio   # widened target
+        reward_points = atr * rr_ratio
 
-        # --- SL anchored to entry candle extremes ---
         if side == "CALL":
-            stop = entry_candle["low"]
+            stop = candle_row["low"]
         elif side == "PUT":
-            stop = entry_candle["high"]
+            stop = candle_row["high"]
         else:
-            stop = entry_price - risk_points  # fallback
+            stop = entry_price - risk_points
 
-        # --- Unified PT/TG logic for long CALL and long PUT ---
         partial_target = entry_price + reward_points / 2
         full_target    = entry_price + reward_points
-
-        trail_start = reward_points / 2
-        trail_step  = max(atr * 0.2, 1.0)  # buffered step
+        trail_start    = reward_points / 2
+        trail_step     = max(atr * 0.2, 1.0)
 
         logging.info(
             f"{CYAN}[LEVELS][NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} "
@@ -369,20 +386,19 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
 
     elif mode == "volatile":
         risk_points   = atr * 0.5
-        reward_points = atr * 2.0   # widened target
+        reward_points = atr * 2.0
 
         if side == "CALL":
-            stop = entry_candle["low"]
+            stop = candle_row["low"]
         elif side == "PUT":
-            stop = entry_candle["high"]
+            stop = candle_row["high"]
         else:
             stop = entry_price - risk_points
 
         partial_target = entry_price + reward_points * 0.5
         full_target    = entry_price + reward_points
-
-        trail_start = reward_points * 0.25
-        trail_step  = max(atr * 0.3, 1.5)
+        trail_start    = reward_points * 0.25
+        trail_step     = max(atr * 0.3, 1.5)
 
         logging.info(
             f"{CYAN}[LEVELS][VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} "
@@ -396,7 +412,6 @@ def build_dynamic_levels(entry_price, atr, side, entry_candle,
         return None, None, None, None, None
 
     return stop, partial_target, full_target, trail_start, trail_step
-
 
 def update_trailing_stop(current_price, entry_price, current_stop,
                          trail_start_pnl, trail_step_points, buffer_points=12):
@@ -993,6 +1008,17 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
         side, reason = signal["side"], signal["reason"]
         logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) spot={spot_price}{RESET}")
 
+        # --- Optional 15m bias filter ---
+        if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
+            last_15m = hist_yesterday_15m.iloc[-1]
+            bias15 = last_15m.get("supertrend_bias", "NEUTRAL")
+            slope15 = last_15m.get("supertrend_slope", "FLAT")
+            logging.info(f"[BIAS][15m] bias={bias15} slope={slope15}")
+            # Example filter: block entries if 15m bias is NEUTRAL
+            if bias15 == "NEUTRAL":
+                logging.info(f"{MAGENTA}[ENTRY BLOCKED][15m Bias] Skipping trade due to neutral 15m bias{RESET}")
+                return
+
         # --- Filters ---
         if risk_info.get("halt_trading", False):
             logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
@@ -1016,7 +1042,12 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     entry_price = df.loc[opt_name, "ltp"] or spot_price
 
                     # --- ATR dynamic levels ---
-                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(entry_price, atr)
+                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
+                        entry_price,
+                        atr,
+                        side,
+                        len(candles_3m) - 1
+                    )
                     if stop is None:
                         logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} ATR regime extreme → skipping trade{RESET}")
                         return
@@ -1082,7 +1113,6 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
         combined = pd.concat(frames)
         combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv")
     store(paper_info, account_type)
-
 # =============================== Live Trading =======================================
 
 # ===== real_order =====
@@ -1131,7 +1161,6 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     logging.info(f"{YELLOW}[EXIT][LIVE] {side} {state['option_name']} at {live_info['last_exit_time']}{RESET}")
         return
 
-    # 5. Signal evaluation (entry detection)
     # 5. Signal evaluation (entry detection on 3m candles only)
     signal = None
     if not candles_3m.empty:
@@ -1160,6 +1189,16 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
         side, reason = signal["side"], signal["reason"]
         logging.info(f"[SIGNAL][LIVE] {side} ({reason}) spot={spot_price}")
 
+        # --- Optional 15m bias filter ---
+        if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
+            last_15m = hist_yesterday_15m.iloc[-1]
+            bias15 = last_15m.get("supertrend_bias", "NEUTRAL")
+            slope15 = last_15m.get("supertrend_slope", "FLAT")
+            logging.info(f"[BIAS][15m] bias={bias15} slope={slope15}")
+            if bias15 == "NEUTRAL":
+                logging.info(f"{MAGENTA}[ENTRY BLOCKED][15m Bias] Skipping trade due to neutral 15m bias{RESET}")
+                return
+
         # --- Filters ---
         if risk_info.get("halt_trading", False):
             logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
@@ -1183,7 +1222,12 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
                     entry_price = df.loc[opt_name, "ltp"] or spot_price
 
                     # --- ATR dynamic levels ---
-                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(entry_price, atr)
+                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
+                        entry_price,
+                        atr,
+                        side,
+                        len(candles_3m) - 1
+                    )
                     if stop is None:
                         logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} ATR regime extreme → skipping trade{RESET}")
                         return
@@ -1249,14 +1293,18 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
             logging.error(f"{RED}[ENTRY ERROR][LIVE] {e}{RESET}", exc_info=True)
 
     # 7. Save trades
+    # 7. Save trades
     frames = [live_info["call_buy"]["filled_df"], live_info["put_buy"]["filled_df"]]
     frames = [f for f in frames if not f.empty]
     if frames:
         combined = pd.concat(frames)
-        combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}_LIVE.csv")
+        combined.to_csv(
+            f"trades_{strategy_name}_{dt.now(time_zone).date()}_LIVE.csv",
+            index=True
+        )
     store(live_info, account_type)
-
 # ============================================== RUN Strategy ==============================================
+
 
 # --- Helper: sleep until next boundary ---
 def sleep_until_next_boundary(interval=180, tz="Asia/Kolkata"):
@@ -1267,17 +1315,15 @@ def sleep_until_next_boundary(interval=180, tz="Asia/Kolkata"):
     time.sleep(sleep_time)
 
 
+
 def run_strategy(symbols, tz=time_zone, end_time=None):
     """
     Orchestration loop:
     - Refresh spot price
-    - Delegate candle building + signal detection (with previous day continuity)
+    - Delegate candle building + signal detection (with previous day continuity, 3m + 15m)
     - Route to paper/live order (entry + exit handled inside those functions)
     """
-
     while dt.now(tz) < end_time:
-        now = dt.now(tz)
-
         for sym in symbols:
             logging.info(f"{GRAY}[STRATEGY] Running for {sym}{RESET}")
 
@@ -1290,26 +1336,41 @@ def run_strategy(symbols, tz=time_zone, end_time=None):
                 logging.warning(f"{GRAY}[SPOT REFRESH FAILED] {sym}: {e}{RESET}")
                 continue
 
-            # --- Delegate candles + signal detection ---
-            signal, candles_3m = update_candles_and_signals(
+            # --- Delegate candles + signal detection (3m + 15m continuity) ---
+            signal, candles_3m, candles_15m = update_candles_and_signals(
                 symbol=sym,
                 spot_price=spot_price,
-                lookback_days=2   # ✅ ensure previous day continuity
+                # lookback_days=2   # ✅ ensure previous day continuity
+            )
+
+            # --- Guard against empty DataFrames ---
+            if (candles_3m is None or candles_3m.empty) and (candles_15m is None or candles_15m.empty):
+                logging.warning(f"[STRATEGY] No candles for {sym}, skipping order evaluation")
+                continue
+
+            # --- Summary log ---
+            logging.info(
+                f"[SUMMARY] {sym}: "
+                f"3m candles={len(candles_3m) if candles_3m is not None and not candles_3m.empty else 0} | "
+                f"15m candles={len(candles_15m) if candles_15m is not None and not candles_15m.empty else 0}"
             )
 
             # --- Route to order functions ---
             if account_type.upper() == "PAPER":
-                paper_order(candles_3m)   # ✅ handles entry + exit internally
+                paper_order(candles_3m, hist_yesterday_15m=candles_15m)
             else:
-                live_order(candles_3m)    # ✅ handles entry + exit internally
+                live_order(candles_3m, hist_yesterday_15m=candles_15m)
 
-                    
+        # --- Sleep until next 3m boundary to avoid hammering ---
+        sleep_until_next_boundary(interval=180, tz=tz)
+
+
 if __name__ == "__main__":
     # --- Restrict to indices explicitly ---
     symbols = ["NSE:NIFTY50-INDEX"]  # adjust as needed
 
-    today = dt.now("Asia/Kolkata").date()
-    end_time = dt.datetime(today.year, today.month, today.day, 15, 30, tz="Asia/Kolkata")
+    today = dt.now(time_zone).date()
+    end_time = dt.datetime(today.year, today.month, today.day, 15, 30, tzinfo=time_zone)
 
     logging.info(f"[SESSION] Trading until {end_time}")
 
@@ -1327,4 +1388,4 @@ if __name__ == "__main__":
             logging.warning(f"{CYAN}[BOOTSTRAP] {sym} no 15m candles found for yesterday{RESET}")
 
     # --- Run strategy orchestration ---
-    run_strategy(symbols, tz="Asia/Kolkata", end_time=end_time)
+    run_strategy(symbols, tz=time_zone, end_time=end_time)

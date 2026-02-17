@@ -89,7 +89,7 @@ OSCILLATOR_EXIT_MODE = "HARD"   # or "TRAIL"
 
 # ========================= MODE ====================
 
-MODE =  "STRATEGY"  # "COLLECT" or "STRATEGY"      # Collet = and build db with tick data #Strategy = run the whole bot strategy 
+MODE =   "STRATEGY"                         # "COLLECT" or "STRATEGY"      # Collet = and build db with tick data #Strategy = run the whole bot strategy 
 
 
 
