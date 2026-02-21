@@ -421,9 +421,10 @@ def detect_signal(candles_3m, candles_15m,
                   cpr_levels, camarilla_levels, traditional_levels,
                   atr=None, include_partial=False,
                   current_time=None,
-                  vwap=None,          # NEW: pass VWAP from paper_order / live_order
-                  orb_high=None,      # NEW: opening range high
-                  orb_low=None):      # NEW: opening range low
+                  vwap=None,          # pass VWAP from paper_order / live_order
+                  orb_high=None,      # opening range high
+                  orb_low=None,       # opening range low
+                  day_type_result=None):  # NEW: DayTypeResult for threshold modifier
     """
     Unified signal detection with VWAP, ORB, and volume confirmation.
 
@@ -537,6 +538,7 @@ def detect_signal(candles_3m, candles_15m,
         bias_15m=st_bias,
         pivot_signal=pivot_signal,
         current_time=current_time,
+        day_type_result=day_type_result,
     )
 
     if lz_signal["action"] not in ("BUY", "SELL"):

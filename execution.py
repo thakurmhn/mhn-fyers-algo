@@ -31,7 +31,11 @@ from indicators import (
 
 from signals import detect_signal, get_opening_range
 # from tickdb import tick_db
-from orchestration import update_candles_and_signals
+from orchestration import update_candles_and_signals  # uses fixed ADX/CCI
+from orchestration import build_indicator_dataframe   # uses fixed ADX/CCI
+from position_manager import PositionManager, TradeLogger, make_replay_pm
+from day_type import (make_day_type_classifier, apply_day_type_to_pm,
+                      DayType, DayTypeResult)
 
 # ===========================================================
 # ANSI COLORS for order logs
@@ -1461,7 +1465,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
     """
     import os
     from collections import Counter
-    from orchestration import build_indicator_dataframe
+    # build_indicator_dataframe imported at top of module (from orchestration_v3)
     from signals import detect_signal
 
     if symbols_list is None:
@@ -1755,182 +1759,17 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
         #   MAX_HOLD    — safety valve at MAX_HOLD_BARS bars
         #   EOD_EXIT    — force close at 15:15 IST
 
-        class _PM:
-            """Inline PositionManager — no external import needed.
-
-            Works in BOTH signal_only=True AND signal_only=False modes.
-            Once a position is opened, is_open() returns True and the main
-            loop skips detect_signal entirely — no repeated orders possible.
-            """
-            # ── Tunable thresholds ────────────────────────────────────
-            RSI_OB          = 70     # overbought → exit CALL (was 72, tighter)
-            RSI_OS          = 30     # oversold   → exit PUT  (was 28, tighter)
-            CCI_EXTREME     = 120    # CCI extreme exit (was 150, fires earlier at peak)
-            MIN_HOLD        = 3      # min bars before any momentum/ST exit (was 2)
-            MAX_HOLD        = 20     # hard max hold 20×3m = 60 min (was 12 — too short)
-            TRAIL_ACTIVATE  = 0.25   # trail kicks in after 25% premium gain (was 0.40)
-            TRAIL_STEP      = 0.15   # give back at most 15% of peak gain (was 0.20)
-            HARD_STOP_FRAC  = 0.45   # max loss = 45% of entry premium (was 0.50)
-            PARTIAL_FRAC    = 0.50   # partial profit at 50% gain, stop → breakeven
-            EOD_MIN         = 15 * 60 + 10  # force close at 15:10 IST (was 15:15)
-
-            def __init__(self):
-                self._t = None
-
-            def is_open(self): return self._t is not None
-
-            def open_pos(self, bar_idx, bar_time, underlying, entry_premium, signal):
-                self._t = dict(
-                    entry_bar=bar_idx, entry_time=bar_time,
-                    entry_ul=underlying, entry_px=entry_premium,
-                    side=signal["side"], score=signal.get("score", 0),
-                    source=signal.get("source", "?"),
-                    pivot=signal.get("pivot", ""),
-                    peak_px=entry_premium, bars_held=0,
-                    partial_done=False,
-                    hard_stop=entry_premium * self.HARD_STOP_FRAC,
-                    trail_active=False, trail_stop=None,
-                    entry_st=str(signal.get("st_bias", "?")),
-                )
-                logging.info(
-                    f"{GREEN}[TRADE OPEN] {signal['side']} bar={bar_idx} {bar_time} "
-                    f"underlying={underlying:.2f} premium≈{entry_premium:.1f} "
-                    f"score={signal.get('score','?')} "
-                    f"src={signal.get('source','?')} pivot={signal.get('pivot','')}{RESET}"
-                )
-
-            def update(self, bar_idx, bar_time, underlying, row):
-                """Returns ("HOLD",None) or ("EXIT", reason_str)."""
-                t   = self._t
-                ep  = t["entry_px"]
-                side= t["side"]
-
-                # Simulate current option premium (0.5-delta ATM approx)
-                move = underlying - t["entry_ul"]
-                if side == "PUT": move = -move
-                cur = max(0.1, ep + 0.5 * move)
-
-                t["bars_held"] += 1
-                if cur > t["peak_px"]:
-                    t["peak_px"] = cur
-
-                # Safe indicator reads
-                def _f(k, d=float("nan")):
-                    try:
-                        v = float(row.get(k, d))
-                        import math
-                        return v if math.isfinite(v) else d
-                    except Exception: return d
-
-                rsi = _f("rsi14", 50.0)
-                cci = _f("cci20",  0.0)
-                st  = str(row.get("supertrend_bias","?")).upper()
-                slp = str(row.get("slope","?")).upper()
-
-                # Bar time in minutes
-                try:
-                    ts_str = str(bar_time).split(" ")[-1]
-                    bar_min = int(ts_str[:2])*60 + int(ts_str[3:5])
-                except Exception: bar_min = 0
-
-                gain     = t["peak_px"] - ep
-                cur_gain = cur - ep
-
-                # 1. HARD STOP
-                if cur <= t["hard_stop"]:
-                    return "EXIT", "HARD_STOP", cur
-
-                # 2. TRAIL STOP (activates after TRAIL_ACTIVATE gain)
-                if not t["trail_active"] and gain >= ep * self.TRAIL_ACTIVATE:
-                    t["trail_active"] = True
-                    t["trail_stop"]   = ep + gain * (1 - self.TRAIL_STEP)
-                    logging.info(
-                        f"  {CYAN}[TRAIL ON] bar={bar_idx} peak_gain={gain:.1f} "
-                        f"trail_stop={t['trail_stop']:.1f}{RESET}"
-                    )
-                if t["trail_active"]:
-                    new_trail = ep + gain * (1 - self.TRAIL_STEP)
-                    if new_trail > t["trail_stop"]:
-                        t["trail_stop"] = new_trail
-                    if cur <= t["trail_stop"]:
-                        return "EXIT", "TRAIL_STOP", cur
-
-                # 3. PARTIAL PROFIT — move hard stop to breakeven
-                if not t["partial_done"] and cur_gain >= ep * self.PARTIAL_FRAC:
-                    t["partial_done"] = True
-                    t["hard_stop"]    = ep
-                    logging.info(
-                        f"  {CYAN}[PARTIAL] bar={bar_idx} {bar_time} {side} "
-                        f"cur={cur:.1f} gain={cur_gain:.1f} "
-                        f"→ stop moved to breakeven {ep:.1f}{RESET}"
-                    )
-
-                if t["bars_held"] >= self.MIN_HOLD:
-                    # 4. MOMENTUM PEAK EXIT
-                    rsi_extreme = (side=="CALL" and rsi >= self.RSI_OB) or \
-                                  (side=="PUT"  and rsi <= self.RSI_OS)
-                    cci_extreme = (side=="CALL" and cci >= self.CCI_EXTREME) or \
-                                  (side=="PUT"  and cci <= -self.CCI_EXTREME)
-                    slope_rev   = (side=="CALL" and slp=="DOWN") or \
-                                  (side=="PUT"  and slp=="UP")
-
-                    if rsi_extreme and (cci_extreme or slope_rev):
-                        return "EXIT", "MOMENTUM_PEAK", cur
-
-                    # 5. SUPERTREND FLIP
-                    st_flip = (side=="CALL" and st=="DOWN") or \
-                              (side=="PUT"  and st=="UP")
-                    if st_flip:
-                        return "EXIT", "ST_FLIP", cur
-
-                # 6. MAX HOLD
-                if t["bars_held"] >= self.MAX_HOLD:
-                    return "EXIT", "MAX_HOLD", cur
-
-                # 7. EOD
-                if bar_min >= self.EOD_MIN:
-                    return "EXIT", "EOD_EXIT", cur
-
-                return "HOLD", None, cur
-
-            def close_pos(self, bar_idx, bar_time, underlying, exit_px, reason, qty):
-                t   = self._t
-                ep  = t["entry_px"]
-                pnl_pts = exit_px - ep
-                pnl_val = pnl_pts * qty
-                color   = GREEN if pnl_pts >= 0 else RED
-                outcome = "WIN " if pnl_pts >= 0 else "LOSS"
-                logging.info(
-                    f"{color}[TRADE EXIT][{reason}] {outcome} "
-                    f"{t['side']} bar={bar_idx} {bar_time} "
-                    f"premium {ep:.1f}→{exit_px:.1f} "
-                    f"P&L={pnl_pts:+.1f}pts ({pnl_val:+.0f}₹) "
-                    f"peak={t['peak_px']:.1f} held={t['bars_held']}bars{RESET}"
-                )
-                record = {
-                    "date":          bar_time,
-                    "bar":           bar_idx,
-                    "side":          t["side"],
-                    "entry_bar":     t["entry_bar"],
-                    "entry_time":    t["entry_time"],
-                    "entry_ul":      t["entry_ul"],
-                    "entry_premium": ep,
-                    "exit_ul":       underlying,
-                    "exit_premium":  exit_px,
-                    "peak_premium":  t["peak_px"],
-                    "exit_reason":   reason,
-                    "bars_held":     t["bars_held"],
-                    "pnl_points":    round(pnl_pts, 2),
-                    "pnl_value":     round(pnl_val, 2),
-                    "source":        t.get("source", "?"),
-                    "score":         t.get("score", "?"),
-                    "pivot":         t.get("pivot", ""),
-                }
-                self._t = None
-                return record
-
-        pm = _PM()
+        # ── Position Manager (imported from position_manager.py) ──────────────
+        # Single source of truth for all exit logic across replay, paper, live.
+        # Replacing the former inline _PM class — thresholds live in position_manager.py
+        pm = make_replay_pm(lot_size=quantity)
         cooldown_until = 0   # bar index after which new entries are allowed again
+
+        # ── Day Type Classifier — initialized once per session ────────────
+        # Uses previous day OHLC from the first replay bar to build pivot context.
+        # DTC is updated every bar; locked at 12:00 (midday — classification stable).
+        _dtc      = None   # populated on first bar below
+        _day_type = DayTypeResult()   # UNKNOWN until DTC initializes
 
         # Pre-build a simple _FakeTime factory (avoids class-inside-loop issues)
         class _FakeTime:
@@ -1966,13 +1805,48 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             ts    = pd.Timestamp(bar_time)
             bar_t = ts.hour * 60 + ts.minute
 
+            # ── Day Type Classifier — update every bar ─────────────────────────
+            # Initialize DTC on first bar using previous-session OHLC
+            if _dtc is None and len(slice_3m) >= 2:
+                try:
+                    prev_bar = slice_3m.iloc[-2]
+                    _cpr0  = calculate_cpr(float(prev_bar["high"]),
+                                           float(prev_bar["low"]),
+                                           float(prev_bar["close"]))
+                    _cam0  = calculate_camarilla_pivots(float(prev_bar["high"]),
+                                                        float(prev_bar["low"]),
+                                                        float(prev_bar["close"]))
+                    _dtc   = make_day_type_classifier(
+                        _cam0, _cpr0,
+                        float(prev_bar["high"]),
+                        float(prev_bar["low"]),
+                        float(prev_bar["close"]),
+                    )
+                    logging.info(
+                        f"[DAY TYPE] Classifier initialized "
+                        f"R3={_cam0['r3']:.0f} R4={_cam0['r4']:.0f} "
+                        f"S3={_cam0['s3']:.0f} S4={_cam0['s4']:.0f} "
+                        f"NarrowCPR={_dtc.pc.is_narrow_cpr} "
+                        f"CompressedCam={_dtc.pc.is_compressed_camarilla}"
+                    )
+                except Exception as _e:
+                    logging.debug(f"[DAY TYPE] init error: {_e}")
+
+            if _dtc is not None:
+                _day_type = _dtc.update(slice_3m)
+                # Lock classification at 12:00 (midday — stable for rest of session)
+                if bar_t == 12 * 60 and _day_type.confidence in ("MEDIUM", "HIGH"):
+                    _dtc.lock_classification()
+                    _day_type.log()
+
             # ── POSITION MONITOR — runs every bar when a trade is open ─────────
             # Works in both signal_only=True AND False modes.
             # While pm.is_open(): detect_signal is bypassed — no repeated orders.
             if pm.is_open():
-                action, reason, cur_px = pm.update(i, bar_time, bar_close, last_row)
-                if action == "EXIT":
-                    record = pm.close_pos(i, bar_time, bar_close, cur_px, reason, quantity)
+                decision = pm.update(i, bar_time, bar_close, last_row)
+                if decision.should_exit:
+                    record = pm.close(i, bar_time, bar_close,
+                                      decision.exit_px, decision.reason, quantity)
                     trade_log.append(record)
                     cooldown_until = i + 2   # 2-bar cooldown before next entry
                     # After exit: don't evaluate entry on the same bar
@@ -2018,6 +1892,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                     vwap=tpma,
                     orb_high=orb_h,
                     orb_low=orb_l,
+                    day_type_result=_day_type,
                 )
             except Exception as e:
                 logging.debug(f"[REPLAY bar={i}] detect_signal error: {e}")
@@ -2033,9 +1908,13 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             reason = signal["reason"]
             source = signal.get("source", "?")
 
-            # Enrich signal with current ST for PM entry tracking
-            signal["st_bias"] = str(last_row.get("supertrend_bias", "?"))
-            signal["pivot"]   = signal.get("pivot", "")
+            # Enrich signal with current ST and day type for PM entry tracking
+            signal["st_bias"]  = str(last_row.get("supertrend_bias", "?"))
+            signal["pivot"]    = signal.get("pivot", "")
+            signal["day_type"] = _day_type.name.value
+
+            # Apply day type overrides to PM (trail step, max hold)
+            apply_day_type_to_pm(pm, _day_type)
 
             # Option premium approximation: ATM ≈ 0.6% of underlying
             entry_premium = round(bar_close * 0.006, 1)
@@ -2071,21 +1950,16 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             # ── Open position via PositionManager ─────────────────────────────
             # This locks out all subsequent bars from calling detect_signal
             # until this trade is exited.
-            pm.open_pos(i, bar_time, bar_close, entry_premium, signal)
+            pm.open(i, bar_time, bar_close, entry_premium, signal)
 
         # ── Force close if still open at end of data ──────────────────────────
         if pm.is_open():
             last_ul = float(df_3m_all.iloc[-1]["close"])
-            t       = pm._t
-            ep      = t["entry_px"]
-            move    = last_ul - t["entry_ul"]
-            if t["side"] == "PUT": move = -move
-            final_px = max(0.1, ep + 0.5 * move)
-            record   = pm.close_pos(
-                total_bars - 1, df_3m_all.iloc[-1][sc3],
-                last_ul, final_px, "EOD_CLOSE", quantity
+            record  = pm.force_close_eod(
+                total_bars - 1, df_3m_all.iloc[-1][sc3], last_ul
             )
-            trade_log.append(record)
+            if record:
+                trade_log.append(record)
 
         # ── Summary ───────────────────────────────────────────────────────────
         safe_sym  = sym.replace(":", "_")
@@ -2125,7 +1999,7 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
                 color = GREEN if t["pnl_points"] >= 0 else RED
                 logging.info(
                     f"    {color}{t['side']:4s} entry={t['entry_time']} "
-                    f"exit={t['date']} held={t['bars_held']}bars "
+                    f"exit={t['exit_time']} held={t['bars_held']}bars "
                     f"pnl={t['pnl_points']:+.1f}pts ({t['pnl_value']:+.0f}₹) "
                     f"[{t['exit_reason']}]{RESET}"
                 )

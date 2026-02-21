@@ -150,17 +150,24 @@ def calculate_ema(df, period=20, column="close"):
     return series.ewm(span=period, adjust=False).mean()
 
 def calculate_cci(df, period=20):
-    """Commodity Channel Index (CCI) as a Series."""
+    """
+    Commodity Channel Index (CCI) as a Series.
+
+    Fixes vs original:
+    - min_periods = period//4 (=5): produces values from bar 9 instead of bar 39.
+      Eliminates NA at live-mode startup when < 39 bars exist.
+    - md.replace(0, np.nan): eliminates division-by-zero when all prices identical
+      (e.g. end-of-session flat close). Returns NaN instead of 0/0.
+    """
     if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
         logging.warning("[CCI] No data")
         return pd.Series(dtype=float, index=df.index if df is not None else None)
 
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    ma = tp.rolling(period).mean()
-    md = (tp - ma).abs().rolling(period).mean()
-
-    cci = (tp - ma) / (0.015 * md)
-    return cci
+    min_p = max(period // 4, 3)          # 5 for period=20 → valid from bar 9
+    tp    = (df["high"] + df["low"] + df["close"]) / 3
+    ma    = tp.rolling(period, min_periods=min_p).mean()
+    md    = (tp - ma).abs().rolling(period, min_periods=min_p).mean()
+    return  (tp - ma) / (0.015 * md.replace(0, np.nan))
 
 def ema_bias(df, period=20):
     """EMA bias: compares last close vs EMA."""
@@ -260,41 +267,45 @@ def supertrend(df, atr_val=None, period=7, multiplier=3, slope_lookback=5):
     return bias, slope
 
 def calculate_adx(df, period=14):
-    """Average Directional Index (ADX) that always returns a Series."""
-    if not {"high","low","close"}.issubset(df.columns):
+    """
+    Average Directional Index (ADX) using Wilder EWM smoothing.
+
+    Fixes vs original:
+    - Wilder EWM (alpha=1/period) instead of rolling sum × 2.
+      Original needed 2×14=28 bars before first non-NaN.
+      Wilder EWM needs period+1=15 bars. Matches TradingView/Bloomberg.
+      Eliminates NA at live-mode startup when < 28 bars exist.
+    """
+    if not {"high", "low", "close"}.issubset(df.columns):
         logging.error("[ADX] Missing required columns")
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float, index=df.index)
 
-    df = df.copy()
+    if len(df) < period + 1:
+        return pd.Series([float("nan")] * len(df), index=df.index)
 
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    df['TR'] = np.maximum.reduce([high_low, high_close, low_close])
+    df    = df.copy()
+    alpha = 1.0 / period
 
-    df['+DM'] = df['high'].diff()
-    df['-DM'] = df['low'].diff().abs()
-    df['+DM'] = np.where((df['+DM'] > df['-DM']) & (df['+DM'] > 0), df['+DM'], 0.0)
-    df['-DM'] = np.where((df['-DM'] > df['+DM']) & (df['-DM'] > 0), df['-DM'], 0.0)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"]  - df["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
 
-    df['TR14'] = df['TR'].rolling(window=period).sum()
-    df['+DM14'] = df['+DM'].rolling(window=period).sum()
-    df['-DM14'] = df['-DM'].rolling(window=period).sum()
+    up   = df["high"].diff()
+    dn   = (-df["low"].diff())
+    plus_dm  = pd.Series(np.where((up > dn) & (up > 0),   up,  0.0), index=df.index)
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0),   dn,  0.0), index=df.index)
 
-    df['+DI14'] = 100 * (df['+DM14'] / df['TR14'].replace(0, np.nan))
-    df['-DI14'] = 100 * (df['-DM14'] / df['TR14'].replace(0, np.nan))
+    tr_s     = tr.ewm(alpha=alpha,       adjust=False).mean()
+    pdm_s    = plus_dm.ewm(alpha=alpha,  adjust=False).mean()
+    mdm_s    = minus_dm.ewm(alpha=alpha, adjust=False).mean()
 
-    df['DX'] = (abs(df['+DI14'] - df['-DI14']) /
-                (df['+DI14'] + df['-DI14']).replace(0, np.nan)) * 100
-
-    adx = df['DX'].rolling(window=period).mean()
-
-    # Ensure ADX is always a Series
-    if isinstance(adx, (float, int)):
-        adx = pd.Series([adx], index=df.index[-1:])
-    elif not isinstance(adx, pd.Series):
-        adx = pd.Series(dtype=float)
-
+    plus_di  = 100 * pdm_s  / tr_s.replace(0, np.nan)
+    minus_di = 100 * mdm_s  / tr_s.replace(0, np.nan)
+    dx       = 100 * (plus_di - minus_di).abs() /                (plus_di + minus_di).replace(0, np.nan)
+    adx      = dx.ewm(alpha=alpha, adjust=False).mean()
+    adx.iloc[:period] = float("nan")   # blank first (period) rows — insufficient history
     return adx
 
 def adx_bias(df, period=14, threshold=20):

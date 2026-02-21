@@ -13,6 +13,7 @@ All v2 bug-fixes retained.
 
 import logging
 import pandas as pd
+from day_type import apply_day_type_to_threshold, DayTypeResult
 
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
@@ -274,7 +275,8 @@ def _score_vwap(candle, indicators, side):
 # PUBLIC API — check_entry_condition
 # ─────────────────────────────────────────────────────────────────────────────
 def check_entry_condition(candle, indicators, bias_15m,
-                          pivot_signal=None, current_time=None):
+                          pivot_signal=None, current_time=None,
+                          day_type_result=None):
     """
     Scoring engine. All existing call sites work unchanged.
     New: VWAP dimension added to scoring.
@@ -305,7 +307,8 @@ def check_entry_condition(candle, indicators, bias_15m,
         return result
 
     # Time-of-day filter
-    _late_session = False
+    _late_session   = False
+    _afternoon_chop = False
     if current_time is not None:
         h, m = current_time.hour, current_time.minute
         t    = h * 60 + m
@@ -318,10 +321,14 @@ def check_entry_condition(candle, indicators, bias_15m,
         if 12 * 60 <= t < 12 * 60 + 20:
             result["reason"] = "LUNCH_CHOP"
             return result
-        if t >= 15 * 60 + 15:
+        # Hard block: no new entries after 15:05 (leaves ≥1 bar before EOD_MIN)
+        if t >= 15 * 60 + 5:
             result["reason"] = "EOD_BLOCK"
             return result
-        # Late session (14:00+): require stronger confluence
+        # Afternoon chop zone 13:00-14:00: soft lift (+10 pts)
+        if 13 * 60 <= t < 14 * 60:
+            _afternoon_chop = True
+        # Late session 14:00-15:05: strong lift (floor=65)
         if t >= 14 * 60:
             _late_session = True
 
@@ -345,7 +352,27 @@ def check_entry_condition(candle, indicators, bias_15m,
            (side == "PUT"  and st_bias_15m == "BULLISH"):
             side_threshold += 7
 
-        # Late session floor: after 14:00, need score ≥65 for new entries
+        # Day type modifier — applied FIRST, before time-of-day floors.
+        # TRENDING: -8 (easier entry), RANGE: +8, NON_TREND: +15, etc.
+        # Applied here so time floors can enforce hard minimums AFTER the modifier.
+        if day_type_result is not None:
+            side_threshold, _dt_flag = apply_day_type_to_threshold(
+                side_threshold, day_type_result, side
+            )
+        else:
+            _dt_flag = ""
+
+        # ── TIME-OF-DAY HARD FLOORS — applied LAST, cannot be reduced by DT ──
+        # Both AFTN and LATE use max() so DT negative modifier cannot bypass them.
+        #
+        # Afternoon 13:00-14:00: floor = base_threshold + 15
+        #   Normal:     max(50-8, 50+15)=65   (DT -8 discount absorbed)
+        #   CT3m:       max(58-8, 50+15)=65   (DT -8 absorbed by floor)
+        #   Range day:  max(50+8, 50+15)=65+8=73  (DT +8 stacks on top)
+        if _afternoon_chop:
+            side_threshold = max(side_threshold, threshold + 15)
+
+        # Late session 14:00-15:05: hard minimum 65 — DT cannot reduce below this.
         if _late_session:
             side_threshold = max(side_threshold, 65)
         bd = {
@@ -390,8 +417,12 @@ def check_entry_condition(candle, indicators, bias_15m,
         if (best_side == "CALL" and st_bias_15m == "BEARISH") or \
            (best_side == "PUT"  and st_bias_15m == "BULLISH"):
             surcharge_flags.append("CT15m+7")
+        if _afternoon_chop:
+            surcharge_flags.append("AFTN+15")
         if _late_session and best_threshold >= 65:
             surcharge_flags.append("LATE+65")
+        if _dt_flag:
+            surcharge_flags.append(_dt_flag)
         surcharge_note = f" [{','.join(surcharge_flags)}]" if surcharge_flags else ""
         logging.info(
             f"{GREEN}[ENTRY OK] {best_side} score={best_score}/{best_threshold}"

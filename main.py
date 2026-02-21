@@ -123,7 +123,7 @@ def get_live_candles(sym):
     Indicators (Supertrend, EMA, CCI, RSI, ADX) are computed on the combined
     historical + today DataFrame so the Supertrend state machine is correct.
     """
-    try:
+ 
     try:
         # Today's candles from tick_db (live, built from websocket ticks)
         df_3m_today  = tick_db.fetch_candles("3m",  use_yesterday=False, symbol=sym)

@@ -21,10 +21,55 @@ from indicators import (
     calculate_traditional_pivots,
     calculate_camarilla_pivots,
     calculate_ema,
-    calculate_adx,
-    calculate_cci,
+    calculate_adx   as _adx_orig,   # shadowed below with Wilder version
+    calculate_cci   as _cci_orig,   # shadowed below with min_periods version
     compute_rsi,
 )
+
+
+# ── FIXED calculate_adx — Wilder EWM smoothing ────────────────────────────────
+# Original uses rolling sum × 2 → needs 28 bars minimum (NA at live open).
+# Wilder EWM (alpha=1/period) converges from period+1 = 15 bars.
+# Matches TradingView / Bloomberg standard.
+def calculate_adx(df, period=14):
+    if not {"high", "low", "close"}.issubset(df.columns):
+        return pd.Series(dtype=float, index=df.index)
+    if len(df) < period + 1:
+        return pd.Series([float("nan")] * len(df), index=df.index)
+    df      = df.copy()
+    alpha   = 1.0 / period
+    tr      = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"]  - df["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    up      = df["high"].diff()
+    dn      = (-df["low"].diff())
+    plus_dm  = pd.Series(np.where((up > dn) & (up > 0),   up,  0.0), index=df.index)
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0),   dn,  0.0), index=df.index)
+    tr_s     = tr.ewm(alpha=alpha,        adjust=False).mean()
+    pdm_s    = plus_dm.ewm(alpha=alpha,   adjust=False).mean()
+    mdm_s    = minus_dm.ewm(alpha=alpha,  adjust=False).mean()
+    plus_di  = 100 * pdm_s  / tr_s.replace(0, np.nan)
+    minus_di = 100 * mdm_s  / tr_s.replace(0, np.nan)
+    dx       = 100 * (plus_di - minus_di).abs() /                (plus_di + minus_di).replace(0, np.nan)
+    adx      = dx.ewm(alpha=alpha, adjust=False).mean()
+    adx.iloc[:period] = float("nan")   # blank first (period) rows — not enough history
+    return adx
+
+
+# ── FIXED calculate_cci — min_periods warmup ──────────────────────────────────
+# Original double rolling needs 2×period-1 = 39 bars (NA at live open).
+# min_periods=period//4 gives valid estimates from ~9 bars.
+def calculate_cci(df, period=20):
+    if df is None or df.empty or not {"high", "low", "close"}.issubset(df.columns):
+        return pd.Series(dtype=float,
+                         index=df.index if df is not None else None)
+    min_p = max(period // 4, 3)   # 5 for period=20
+    tp    = (df["high"] + df["low"] + df["close"]) / 3
+    ma    = tp.rolling(period, min_periods=min_p).mean()
+    md    = (tp - ma).abs().rolling(period, min_periods=min_p).mean()
+    return  (tp - ma) / (0.015 * md.replace(0, np.nan))
 
 RESET  = "\033[0m"
 GREEN  = "\033[92m"
