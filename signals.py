@@ -528,6 +528,7 @@ def detect_signal(candles_3m, candles_15m,
         "cci":                 _safe(last_3m.get("cci20")),
         "candle_15m":          last_15m if has_15m else None,
         "st_bias_3m":          st_bias_3m,
+        "st_bias_15m":         st_bias,        # FIX: was missing — surcharge +7 for 15m conflict now fires
         "vwap":                vwap,
     }
 

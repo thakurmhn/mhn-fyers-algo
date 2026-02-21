@@ -1765,11 +1765,51 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
         pm = make_replay_pm(lot_size=quantity)
         cooldown_until = 0   # bar index after which new entries are allowed again
 
-        # ── Day Type Classifier — initialized once per session ────────────
-        # Uses previous day OHLC from the first replay bar to build pivot context.
-        # DTC is updated every bar; locked at 12:00 (midday — classification stable).
-        _dtc      = None   # populated on first bar below
-        _day_type = DayTypeResult()   # UNKNOWN until DTC initializes
+        # ── Day Type Classifier — initialized BEFORE replay loop ────────────
+        # BUG FIX: Previous code used slice_3m.iloc[-2] (a single 3m warmup candle)
+        # as the "previous day OHLC". A 3m candle has range ~5-15 pts vs the real
+        # daily range of 150-350+ pts, producing nonsense Camarilla levels and
+        # always classifying as DOUBLE_DIST regardless of market conditions.
+        #
+        # FIX: Aggregate ALL warmup bars before replay_start_idx into daily OHLC.
+        # The warmup data (df_3m_all rows 0..replay_start_idx-1) is yesterday's
+        # 3m session. max(high) / min(low) / last(close) = daily OHLC.
+        #
+        # If date_str is set: warmup bars are rows where date != date_str.
+        # If no date_str: warmup bars are rows 0..replay_start_idx-1.
+        _dtc      = None
+        _day_type = DayTypeResult()
+
+        try:
+            # Identify warmup rows: before replay_start_idx AND (if date given) not replay date
+            _wm_end = replay_start_idx
+            if date_str:
+                # Use only bars strictly before the replay date as prev-day OHLC
+                _prev_mask = ~df_3m_all[sc3].astype(str).str.startswith(date_str)
+                _prev_bars = df_3m_all[_prev_mask]
+            else:
+                _prev_bars = df_3m_all.iloc[:_wm_end]
+
+            if not _prev_bars.empty:
+                _prev_h = float(_prev_bars["high"].max())
+                _prev_l = float(_prev_bars["low"].min())
+                _prev_c = float(_prev_bars["close"].iloc[-1])
+                _prev_range = _prev_h - _prev_l
+                _cpr0 = calculate_cpr(_prev_h, _prev_l, _prev_c)
+                _cam0 = calculate_camarilla_pivots(_prev_h, _prev_l, _prev_c)
+                _dtc  = make_day_type_classifier(
+                    _cam0, _cpr0, _prev_h, _prev_l, _prev_c
+                )
+                logging.info(
+                    f"[DAY TYPE INIT] prev OHLC: H={_prev_h:.0f} L={_prev_l:.0f} "
+                    f"C={_prev_c:.0f} range={_prev_range:.0f}pts | "
+                    f"R3={_cam0['r3']:.0f} R4={_cam0['r4']:.0f} "
+                    f"S3={_cam0['s3']:.0f} S4={_cam0['s4']:.0f}"
+                )
+            else:
+                logging.warning("[DAY TYPE INIT] No warmup bars found — DTC disabled")
+        except Exception as _dte:
+            logging.warning(f"[DAY TYPE INIT] Failed: {_dte}")
 
         # Pre-build a simple _FakeTime factory (avoids class-inside-loop issues)
         class _FakeTime:
@@ -1806,32 +1846,8 @@ def run_offline_replay(tick_db, symbols_list=None, date_str=None,
             bar_t = ts.hour * 60 + ts.minute
 
             # ── Day Type Classifier — update every bar ─────────────────────────
-            # Initialize DTC on first bar using previous-session OHLC
-            if _dtc is None and len(slice_3m) >= 2:
-                try:
-                    prev_bar = slice_3m.iloc[-2]
-                    _cpr0  = calculate_cpr(float(prev_bar["high"]),
-                                           float(prev_bar["low"]),
-                                           float(prev_bar["close"]))
-                    _cam0  = calculate_camarilla_pivots(float(prev_bar["high"]),
-                                                        float(prev_bar["low"]),
-                                                        float(prev_bar["close"]))
-                    _dtc   = make_day_type_classifier(
-                        _cam0, _cpr0,
-                        float(prev_bar["high"]),
-                        float(prev_bar["low"]),
-                        float(prev_bar["close"]),
-                    )
-                    logging.info(
-                        f"[DAY TYPE] Classifier initialized "
-                        f"R3={_cam0['r3']:.0f} R4={_cam0['r4']:.0f} "
-                        f"S3={_cam0['s3']:.0f} S4={_cam0['s4']:.0f} "
-                        f"NarrowCPR={_dtc.pc.is_narrow_cpr} "
-                        f"CompressedCam={_dtc.pc.is_compressed_camarilla}"
-                    )
-                except Exception as _e:
-                    logging.debug(f"[DAY TYPE] init error: {_e}")
-
+            # DTC is pre-initialized above (before loop) with real daily OHLC.
+            # In-loop fallback removed — was the bug source (used 3m bar as daily OHLC).
             if _dtc is not None:
                 _day_type = _dtc.update(slice_3m)
                 # Lock classification at 12:00 (midday — stable for rest of session)

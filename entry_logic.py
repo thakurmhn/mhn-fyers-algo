@@ -1,14 +1,34 @@
-# ===== entry_logic.py (v3 — IMPROVED) =====
+# ===== entry_logic.py (v4 — FULL SIGNAL CONFLUENCE CHECK) =====
 """
-IMPROVEMENTS IN THIS VERSION vs v2:
-1. VWAP score dimension added (replaces nothing; increases total weight range)
-2. Score weights rebalanced — VWAP (10) takes weight from liquidity_zone (5→5, vwap=10)
-3. Time-of-day filter extended: allows 15:00-15:10 window (was completely blocked)
-4. ADX scoring improved: partial credit at ADX 10-15 (trending enough to score minimally)
-5. EMA gap threshold reduced from 2.0 to 1.0 for full credit (NIFTY EMA9/13 typically tight)
-6. Oscillator RSI bounds relaxed: 50-75 for CALL, 25-50 for PUT (was 52-75 / 25-48)
-   → more entries in the 50-52 zone which is a valid BUY zone
-All v2 bug-fixes retained.
+CHANGES IN v4 vs v3:
+
+1. confluence_gate() — new function
+   Seven binary VETO checks that ALL must pass before an entry is allowed.
+   A single veto failure blocks the trade regardless of composite score.
+
+   Check       CALL must                    PUT must
+   ─────────── ─────────────────────────── ───────────────────────────
+   ST_15M      15m SuperTrend = BULLISH    = BEARISH  (NEUTRAL → skip)
+   ST_3M       3m  SuperTrend ≠ BEARISH    ≠ BULLISH  (NEUTRAL → allow)
+   EMA_3M      EMA9 ≥ EMA13               EMA9 ≤ EMA13
+   EMA_15M     15m EMA9 ≥ EMA13           15m EMA9 ≤ EMA13  (no 15m → skip)
+   RSI_ZONE    RSI < 80  (not exhausted)  RSI > 20   (not exhausted)
+   ADX_TREND   ADX ≥ 18  (confirmed trend, not chop)
+   VWAP_SIDE   close ≥ vwap−0.15×ATR      close ≤ vwap+0.15×ATR  (no VWAP → skip)
+
+2. Time-of-day floors tightened
+   LATE  floor: 65 → 75  (14:00–15:05)
+   AFTN  floor: threshold+15 → threshold+20  (13:00–14:00)
+
+3. Base threshold raised
+   NORMAL regime: 50 → 75
+   HIGH   regime: 60 → 80
+
+4. Logging
+   Every blocked confluence check is logged at INFO level in YELLOW.
+   Result dict gains "confluence_fails" list key for diagnostics.
+
+All v3 scorers, weights, and surcharge logic unchanged.
 """
 
 import logging
@@ -18,31 +38,42 @@ from day_type import apply_day_type_to_threshold, DayTypeResult
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
 CYAN   = "\033[96m"
+RED    = "\033[91m"
 RESET  = "\033[0m"
 
-# ── Score weights (sum = 100) ─────────────────────────────────────────────────
+# ── Score weights (sum = 100) — unchanged from v3 ────────────────────────────
 WEIGHTS = {
-    "trend_15m":        20,   # HTF Supertrend direction
-    "trend_3m":         15,   # LTF Supertrend direction
-    "ema_momentum":     15,   # EMA9 vs EMA13 gap & direction (was 20 → reduced to make room)
-    "adx_strength":     10,   # ADX trend strength
-    "oscillators":      15,   # CCI + RSI + W%R composite
-    "pivot_structure":  10,   # pivot level proximity
-    "candle_quality":    5,   # body ratio + correct direction
-    "liquidity_zone":    5,   # ST line proximity
-    "vwap_position":    10,   # NEW: price position relative to VWAP (was 0)
+    "trend_15m":        20,
+    "trend_3m":         15,
+    "ema_momentum":     15,
+    "adx_strength":     10,
+    "oscillators":      15,
+    "pivot_structure":  10,
+    "candle_quality":    5,
+    "liquidity_zone":    5,
+    "vwap_position":    10,
 }
 
-# ── Threshold by ATR regime ───────────────────────────────────────────────────
+# ── Base thresholds raised from v3 (50/60 → 75/80) ───────────────────────────
 THRESHOLDS = {
-    "LOW":    999,    # low vol = never enter
-    "NORMAL":  50,    # relaxed from 52 → fires more reliably
-    "HIGH":    60,    # more volatile → need stronger confluence
+    "LOW":    999,   # low vol = never enter
+    "NORMAL":  75,   # raised from 50 — only high-conviction entries
+    "HIGH":    80,   # raised from 60
 }
+
+# ── Time-of-day floors (raised from v3) ──────────────────────────────────────
+AFTN_FLOOR_ADD  = 20   # 13:00–14:00: base + 20 (was +15)
+LATE_FLOOR      = 75   # 14:00–15:05: hard floor 75 (was 65)
 
 # ── ATR regime boundaries ─────────────────────────────────────────────────────
-ATR_LOW_MAX    = 20   # (was 25 — tightened so 20-25 ATR doesn't block entirely)
-ATR_HIGH_MIN   = 120
+ATR_LOW_MAX  = 20
+ATR_HIGH_MIN = 120
+
+# ── Confluence veto thresholds ────────────────────────────────────────────────
+CONFLUENCE_ADX_MIN  = 18     # ADX below this = chop, block all entries
+CONFLUENCE_RSI_OB   = 80     # CALL veto: RSI above this = exhausted
+CONFLUENCE_RSI_OS   = 20     # PUT  veto: RSI below this = exhausted
+CONFLUENCE_VWAP_TOL = 0.15   # fraction of ATR tolerance around VWAP
 
 
 def _safe_float(val):
@@ -54,42 +85,37 @@ def _safe_float(val):
 
 
 def _atr_regime(atr):
-    if atr is None:              return "UNKNOWN"
-    if atr < ATR_LOW_MAX:        return "LOW"
-    if atr > ATR_HIGH_MIN:       return "HIGH"
+    if atr is None:          return "UNKNOWN"
+    if atr < ATR_LOW_MAX:    return "LOW"
+    if atr > ATR_HIGH_MIN:   return "HIGH"
     return "NORMAL"
 
 
 def _norm_bias(raw):
-    """Accept both 'UP'/'DOWN' (orchestration) and 'BULLISH'/'BEARISH' (signals)."""
+    """Accept 'UP'/'DOWN' (orchestration) and 'BULLISH'/'BEARISH' (signals)."""
     if raw in ("BULLISH", "UP"):   return "BULLISH"
     if raw in ("BEARISH", "DOWN"): return "BEARISH"
     return "NEUTRAL"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LIQUIDITY ZONE (original function, bias normalised)
+# LIQUIDITY ZONE — unchanged from v3
 # ─────────────────────────────────────────────────────────────────────────────
 def liquidity_zone(candle, supertrend_line, bias, atr, timeframe):
     signal = {"zone": None, "action": "HOLD", "reason": ""}
-
     if supertrend_line is None:
         return signal
     st = _safe_float(supertrend_line)
     if st is None:
         return signal
-
     atr_f = _safe_float(atr)
     if atr_f is None or atr_f <= 0:
         return signal
-
     close = _safe_float(candle.get("close"))
     if close is None:
         return signal
-
     bias_norm = _norm_bias(bias)
     tolerance = atr_f
-
     if bias_norm == "BEARISH" and abs(close - st) <= tolerance:
         signal["zone"]   = "RESISTANCE"
         signal["action"] = "SELL"
@@ -98,12 +124,11 @@ def liquidity_zone(candle, supertrend_line, bias, atr, timeframe):
         signal["zone"]   = "SUPPORT"
         signal["action"] = "BUY"
         signal["reason"] = f"{timeframe} bounce at ST {st:.1f}"
-
     return signal
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INDIVIDUAL SCORERS
+# INDIVIDUAL SCORERS — all unchanged from v3
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _score_trend_15m(bias_15m, side):
@@ -133,12 +158,12 @@ def _score_ema(indicators, side):
         return 0
     gap = fast - slow
     if side == "CALL":
-        if gap > 1.0:   return w           # was 2.0 — NIFTY EMA9/13 gap is usually small
-        if gap > 0:     return w // 2
+        if gap > 1.0:  return w
+        if gap > 0:    return w // 2
         return 0
     else:
-        if gap < -1.0:  return w
-        if gap < 0:     return w // 2
+        if gap < -1.0: return w
+        if gap < 0:    return w // 2
         return 0
 
 
@@ -148,8 +173,8 @@ def _score_adx(indicators):
     if adx is None: return 0
     if adx >= 30:   return w
     if adx >= 20:   return int(w * 0.7)
-    if adx >= 15:   return int(w * 0.4)    # was 0.3 — slightly more generous
-    if adx >= 10:   return int(w * 0.15)   # NEW: partial credit, was 0
+    if adx >= 15:   return int(w * 0.4)
+    if adx >= 10:   return int(w * 0.15)
     return 0
 
 
@@ -158,7 +183,6 @@ def _score_oscillators(candle, indicators, side):
     score = 0.0
     max_s = 3.5
 
-    # CCI 3m
     cci3 = _safe_float(candle.get("cci20") or candle.get("cci"))
     if cci3 is not None:
         if side == "CALL":
@@ -166,7 +190,6 @@ def _score_oscillators(candle, indicators, side):
         else:
             score += 1.0 if cci3 < -60 else (0.5 if cci3 < -40 else 0)
 
-    # CCI 15m
     c15 = indicators.get("candle_15m")
     if c15 is not None:
         try:
@@ -177,7 +200,6 @@ def _score_oscillators(candle, indicators, side):
         except Exception:
             pass
 
-    # RSI 3m — relaxed from 52-75 to 50-75 for CALL
     rsi = _safe_float(candle.get("rsi14") or candle.get("rsi"))
     if rsi is not None:
         if side == "CALL":
@@ -185,11 +207,10 @@ def _score_oscillators(candle, indicators, side):
         else:
             score += 1.0 if 25 <= rsi <= 50 else (0.4 if rsi < 25 else 0)
 
-    # Williams %R
     wr = _safe_float(candle.get("wr14") or candle.get("wr"))
     if wr is not None:
-        if side == "CALL" and wr > -40:  score += 1.0
-        if side == "PUT"  and wr < -60:  score += 1.0
+        if side == "CALL" and wr > -40: score += 1.0
+        if side == "PUT"  and wr < -60: score += 1.0
 
     return int(w * min(score / max_s, 1.0))
 
@@ -240,35 +261,119 @@ def _score_lz(candle, indicators, bias_15m, side):
 
 
 def _score_vwap(candle, indicators, side):
-    """
-    NEW: Score based on price position relative to VWAP.
-    - Price above VWAP → bullish context → CALL gets full credit
-    - Price below VWAP → bearish context → PUT gets full credit
-    - Within 0.1 ATR of VWAP → neutral → half credit for trend-side entry
-    """
     w    = WEIGHTS["vwap_position"]
     vwap = _safe_float(indicators.get("vwap"))
     if vwap is None:
-        return w // 4  # VWAP unavailable → small partial credit, don't penalise
-
+        return w // 4
     close = _safe_float(candle.get("close"))
     atr   = _safe_float(indicators.get("atr"))
     if close is None:
         return 0
-
-    tol = (atr * 0.1) if atr else 5.0
+    tol  = (atr * 0.1) if atr else 5.0
     dist = close - vwap
-
     if side == "CALL":
-        if dist > tol:      return w        # above VWAP by meaningful margin
-        if dist > 0:        return w // 2   # just above
-        if abs(dist) < tol: return w // 3   # at VWAP — could bounce
-        return 0                            # below VWAP → no credit for CALL
-    else:  # PUT
+        if dist > tol:      return w
+        if dist > 0:        return w // 2
+        if abs(dist) < tol: return w // 3
+        return 0
+    else:
         if dist < -tol:     return w
         if dist < 0:        return w // 2
         if abs(dist) < tol: return w // 3
         return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFLUENCE GATE  (NEW in v4)
+# ─────────────────────────────────────────────────────────────────────────────
+def confluence_gate(candle, indicators, bias_15m, side, atr):
+    """
+    Seven binary VETO checks. Every check that fails is recorded.
+    Returns a list of failed check names — empty list means all passed.
+
+    Design principles:
+    • NEUTRAL SuperTrend = skip that check (don't penalise ambiguity).
+    • Missing data (no 15m, no VWAP) = skip that check (don't penalise gaps).
+    • Only DIRECT opposition is vetoed — partial signals are not blocked here,
+      they are already penalised by the scoring engine.
+    • Thresholds are intentionally relaxed — this is a safety net for extreme
+      misalignments, not a hair-trigger filter.
+
+    Check definitions
+    ─────────────────
+    ST_15M    15m SuperTrend must agree with side (NEUTRAL → skip)
+    ST_3M     3m  SuperTrend must not directly oppose side (NEUTRAL → pass)
+    EMA_3M    3m  EMA9 must be on correct side of EMA13
+    EMA_15M   15m EMA9 must be on correct side of EMA13 (missing → skip)
+    RSI_ZONE  RSI must not be in exhaustion zone (missing → skip)
+    ADX_TREND ADX must be ≥ CONFLUENCE_ADX_MIN = 18 (missing → skip)
+    VWAP_SIDE Price must be on correct side of VWAP ± tolerance (missing → skip)
+    """
+    fails = []
+
+    # ── ST_15M ───────────────────────────────────────────────────────────────
+    bias15 = _norm_bias(bias_15m)
+    if bias15 != "NEUTRAL":
+        if side == "CALL" and bias15 == "BEARISH":
+            fails.append("ST_15M")
+        elif side == "PUT" and bias15 == "BULLISH":
+            fails.append("ST_15M")
+
+    # ── ST_3M ────────────────────────────────────────────────────────────────
+    bias3 = _norm_bias(indicators.get("st_bias_3m", "NEUTRAL"))
+    if bias3 != "NEUTRAL":
+        if side == "CALL" and bias3 == "BEARISH":
+            fails.append("ST_3M")
+        elif side == "PUT" and bias3 == "BULLISH":
+            fails.append("ST_3M")
+
+    # ── EMA_3M ───────────────────────────────────────────────────────────────
+    ema_fast = _safe_float(indicators.get("ema_fast"))
+    ema_slow = _safe_float(indicators.get("ema_slow"))
+    if ema_fast is not None and ema_slow is not None:
+        if side == "CALL" and ema_fast < ema_slow:
+            fails.append("EMA_3M")
+        elif side == "PUT" and ema_fast > ema_slow:
+            fails.append("EMA_3M")
+
+    # ── EMA_15M ──────────────────────────────────────────────────────────────
+    c15 = indicators.get("candle_15m")
+    if c15 is not None:
+        try:
+            ema9_15  = _safe_float(c15.get("ema9"))
+            ema13_15 = _safe_float(c15.get("ema13"))
+            if ema9_15 is not None and ema13_15 is not None:
+                if side == "CALL" and ema9_15 < ema13_15:
+                    fails.append("EMA_15M")
+                elif side == "PUT" and ema9_15 > ema13_15:
+                    fails.append("EMA_15M")
+        except Exception:
+            pass   # missing 15m data → skip check
+
+    # ── RSI_ZONE ─────────────────────────────────────────────────────────────
+    rsi = _safe_float(candle.get("rsi14") or candle.get("rsi"))
+    if rsi is not None:
+        if side == "CALL" and rsi >= CONFLUENCE_RSI_OB:
+            fails.append("RSI_ZONE")
+        elif side == "PUT" and rsi <= CONFLUENCE_RSI_OS:
+            fails.append("RSI_ZONE")
+
+    # ── ADX_TREND ────────────────────────────────────────────────────────────
+    adx = _safe_float(indicators.get("adx"))
+    if adx is not None and adx < CONFLUENCE_ADX_MIN:
+        fails.append("ADX_TREND")
+
+    # ── VWAP_SIDE ────────────────────────────────────────────────────────────
+    vwap  = _safe_float(indicators.get("vwap"))
+    close = _safe_float(candle.get("close"))
+    if vwap is not None and close is not None and atr is not None and atr > 0:
+        tol = atr * CONFLUENCE_VWAP_TOL
+        if side == "CALL" and close < vwap - tol:
+            fails.append("VWAP_SIDE")
+        elif side == "PUT" and close > vwap + tol:
+            fails.append("VWAP_SIDE")
+
+    return fails
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,19 +383,30 @@ def check_entry_condition(candle, indicators, bias_15m,
                           pivot_signal=None, current_time=None,
                           day_type_result=None):
     """
-    Scoring engine. All existing call sites work unchanged.
-    New: VWAP dimension added to scoring.
+    Scoring engine + confluence gate.
+
+    Flow (v4):
+    1. ATR regime check     — block LOW/UNKNOWN
+    2. Time-of-day filter   — PRE_OPEN / OPENING_NOISE / LUNCH_CHOP / EOD_BLOCK
+    3. Score both sides     — same as v3
+    4. Confluence gate      — 7 binary vetoes on winning side
+    5. If gate passes       — emit ENTRY OK
+    6. If gate fails        — block + log each failed check in YELLOW
+
+    Result dict additions vs v3:
+      "confluence_fails"  list[str]  checks that vetoed the trade ([] = all passed)
     """
 
     result = {
-        "action":    "HOLD",
-        "reason":    "",
-        "strength":  "NONE",
-        "zone_type": None,
-        "side":      None,
-        "score":     0,
-        "threshold": 52,
-        "breakdown": {},
+        "action":           "HOLD",
+        "reason":           "",
+        "strength":         "NONE",
+        "zone_type":        None,
+        "side":             None,
+        "score":            0,
+        "threshold":        52,
+        "breakdown":        {},
+        "confluence_fails": [],   # NEW — diagnostic list
     }
 
     atr = _safe_float(indicators.get("atr"))
@@ -299,14 +415,14 @@ def check_entry_condition(candle, indicators, bias_15m,
         return result
 
     regime    = _atr_regime(atr)
-    threshold = THRESHOLDS.get(regime, 55)
+    threshold = THRESHOLDS.get(regime, 75)
     result["threshold"] = threshold
 
     if regime in ("LOW", "UNKNOWN"):
         result["reason"] = f"Regime blocked: {regime} ATR={atr:.1f}"
         return result
 
-    # Time-of-day filter
+    # ── Time-of-day filter ────────────────────────────────────────────────────
     _late_session   = False
     _afternoon_chop = False
     if current_time is not None:
@@ -321,23 +437,20 @@ def check_entry_condition(candle, indicators, bias_15m,
         if 12 * 60 <= t < 12 * 60 + 20:
             result["reason"] = "LUNCH_CHOP"
             return result
-        # Hard block: no new entries after 15:05 (leaves ≥1 bar before EOD_MIN)
         if t >= 15 * 60 + 5:
             result["reason"] = "EOD_BLOCK"
             return result
-        # Afternoon chop zone 13:00-14:00: soft lift (+10 pts)
         if 13 * 60 <= t < 14 * 60:
             _afternoon_chop = True
-        # Late session 14:00-15:05: strong lift (floor=65)
         if t >= 14 * 60:
             _late_session = True
 
-    best_score, best_side, best_bd, best_threshold = -1, "CALL", {}, threshold
-
-    # Surcharge 1: 3m ST opposes side → +8 pts required
-    # Surcharge 2: Both 3m AND 15m oppose side → +15 pts total (full conflict)
+    # ── Surcharge and ST bias resolution ─────────────────────────────────────
     st_bias_3m  = _norm_bias(indicators.get("st_bias_3m",  "NEUTRAL"))
     st_bias_15m = _norm_bias(indicators.get("st_bias_15m", "NEUTRAL"))
+
+    best_score, best_side, best_bd, best_threshold = -1, "CALL", {}, threshold
+    _dt_flag_best = ""
 
     for side in ("CALL", "PUT"):
         side_threshold = threshold
@@ -347,14 +460,12 @@ def check_entry_condition(candle, indicators, bias_15m,
            (side == "PUT"  and st_bias_3m == "BULLISH"):
             side_threshold += 8
 
-        # Surcharge 2: 15m ST also opposes side (full conflict) → +7 pts more (total +15)
+        # Surcharge 2: 15m ST also opposes side → +7 pts more (total +15)
         if (side == "CALL" and st_bias_15m == "BEARISH") or \
            (side == "PUT"  and st_bias_15m == "BULLISH"):
             side_threshold += 7
 
-        # Day type modifier — applied FIRST, before time-of-day floors.
-        # TRENDING: -8 (easier entry), RANGE: +8, NON_TREND: +15, etc.
-        # Applied here so time floors can enforce hard minimums AFTER the modifier.
+        # Day type modifier
         if day_type_result is not None:
             side_threshold, _dt_flag = apply_day_type_to_threshold(
                 side_threshold, day_type_result, side
@@ -362,19 +473,15 @@ def check_entry_condition(candle, indicators, bias_15m,
         else:
             _dt_flag = ""
 
-        # ── TIME-OF-DAY HARD FLOORS — applied LAST, cannot be reduced by DT ──
-        # Both AFTN and LATE use max() so DT negative modifier cannot bypass them.
-        #
-        # Afternoon 13:00-14:00: floor = base_threshold + 15
-        #   Normal:     max(50-8, 50+15)=65   (DT -8 discount absorbed)
-        #   CT3m:       max(58-8, 50+15)=65   (DT -8 absorbed by floor)
-        #   Range day:  max(50+8, 50+15)=65+8=73  (DT +8 stacks on top)
+        # ── Time-of-day hard floors (tightened in v4) ─────────────────────
+        # AFTN 13:00–14:00: floor = base + AFTN_FLOOR_ADD (20, was 15)
         if _afternoon_chop:
-            side_threshold = max(side_threshold, threshold + 15)
+            side_threshold = max(side_threshold, threshold + AFTN_FLOOR_ADD)
 
-        # Late session 14:00-15:05: hard minimum 65 — DT cannot reduce below this.
+        # LATE 14:00–15:05: hard floor LATE_FLOOR (75, was 65)
         if _late_session:
-            side_threshold = max(side_threshold, 65)
+            side_threshold = max(side_threshold, LATE_FLOOR)
+
         bd = {
             "trend_15m":       _score_trend_15m(bias_15m, side),
             "trend_3m":        _score_trend_3m(indicators, side),
@@ -391,48 +498,66 @@ def check_entry_condition(candle, indicators, bias_15m,
 
         if total > best_score:
             best_score, best_side, best_bd = total, side, bd
-            best_threshold = side_threshold   # track the threshold that applies to the winner
+            best_threshold  = side_threshold
+            _dt_flag_best   = _dt_flag
 
     result["score"]     = best_score
     result["breakdown"] = best_bd
     result["side"]      = best_side
     result["threshold"] = best_threshold
 
-    if best_score >= best_threshold:
-        action    = "BUY"      if best_side == "CALL" else "SELL"
-        zone_type = "SUPPORT"  if best_side == "CALL" else "RESISTANCE"
-        strength  = (
-            "HIGH"   if best_score >= best_threshold + 15 else
-            "MEDIUM" if best_score >= best_threshold + 5  else
-            "WEAK"
-        )
-        result.update(
-            action=action, zone_type=zone_type, strength=strength,
-            reason=f"Score={best_score}/{best_threshold} ({regime}) side={best_side}"
-        )
-        surcharge_flags = []
-        if (best_side == "CALL" and st_bias_3m == "BEARISH") or \
-           (best_side == "PUT"  and st_bias_3m == "BULLISH"):
-            surcharge_flags.append("CT3m+8")
-        if (best_side == "CALL" and st_bias_15m == "BEARISH") or \
-           (best_side == "PUT"  and st_bias_15m == "BULLISH"):
-            surcharge_flags.append("CT15m+7")
-        if _afternoon_chop:
-            surcharge_flags.append("AFTN+15")
-        if _late_session and best_threshold >= 65:
-            surcharge_flags.append("LATE+65")
-        if _dt_flag:
-            surcharge_flags.append(_dt_flag)
-        surcharge_note = f" [{','.join(surcharge_flags)}]" if surcharge_flags else ""
-        logging.info(
-            f"{GREEN}[ENTRY OK] {best_side} score={best_score}/{best_threshold}"
-            f"{surcharge_note} {regime} {strength}{RESET}"
-        )
-    else:
+    # ── Score gate ────────────────────────────────────────────────────────────
+    if best_score < best_threshold:
         result["reason"] = (
             f"Score too low: {best_score}<{best_threshold} ({regime}) "
             f"best_side={best_side}"
         )
         logging.debug(f"[ENTRY BLOCKED] {result['reason']}")
+        return result
 
+    # ── Confluence gate (NEW v4) ──────────────────────────────────────────────
+    fails = confluence_gate(candle, indicators, bias_15m, best_side, atr)
+    result["confluence_fails"] = fails
+
+    if fails:
+        fail_str = ",".join(fails)
+        result["reason"] = f"CONFLUENCE_FAIL [{best_side}]: {fail_str}"
+        logging.info(
+            f"{YELLOW}[CONFLUENCE BLOCK] {best_side} score={best_score}/{best_threshold}"
+            f" | Failed: {fail_str}{RESET}"
+        )
+        return result
+
+    # ── All gates passed — emit entry ─────────────────────────────────────────
+    action    = "BUY"     if best_side == "CALL" else "SELL"
+    zone_type = "SUPPORT" if best_side == "CALL" else "RESISTANCE"
+    strength  = (
+        "HIGH"   if best_score >= best_threshold + 15 else
+        "MEDIUM" if best_score >= best_threshold + 5  else
+        "WEAK"
+    )
+    result.update(
+        action=action, zone_type=zone_type, strength=strength,
+        reason=f"Score={best_score}/{best_threshold} ({regime}) side={best_side}"
+    )
+
+    surcharge_flags = []
+    if (best_side == "CALL" and st_bias_3m == "BEARISH") or \
+       (best_side == "PUT"  and st_bias_3m == "BULLISH"):
+        surcharge_flags.append("CT3m+8")
+    if (best_side == "CALL" and st_bias_15m == "BEARISH") or \
+       (best_side == "PUT"  and st_bias_15m == "BULLISH"):
+        surcharge_flags.append("CT15m+7")
+    if _afternoon_chop:
+        surcharge_flags.append(f"AFTN+{AFTN_FLOOR_ADD}")
+    if _late_session:
+        surcharge_flags.append(f"LATE≥{LATE_FLOOR}")
+    if _dt_flag_best:
+        surcharge_flags.append(_dt_flag_best)
+
+    surcharge_note = f" [{','.join(surcharge_flags)}]" if surcharge_flags else ""
+    logging.info(
+        f"{GREEN}[ENTRY OK] {best_side} score={best_score}/{best_threshold}"
+        f"{surcharge_note} {regime} {strength}{RESET}"
+    )
     return result

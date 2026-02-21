@@ -38,8 +38,9 @@ class TickDatabase:
 
         logging.info(f"[DB PATH] Using database at {db_file}")
 
-        # Store base_path and max_lookback for continuity fetches
-        self.base_path = base_path
+        # Store base_path, db_path and max_lookback for continuity fetches
+        self.base_path  = base_path
+        self.db_path    = db_file       # ← exposes current DB path to run_strategy
         self.max_lookback = max_lookback
 
     def _get_latest_db_file(self, base_path, today_str, max_lookback):
@@ -465,7 +466,7 @@ class TickDatabase:
                     df = pd.read_sql_query(query, self.conn, params=params)
                     if df.empty:
                         # If empty, try opening the snapshot DB for that date
-                        db_path = f"C:/SQLite/ticks/ticks_{trade_date}.db"
+                        db_path = os.path.join(self.base_path, f"ticks_{trade_date}.db")
                         if os.path.exists(db_path):
                             with sqlite3.connect(db_path) as alt_conn:
                                 df = pd.read_sql_query(query, alt_conn, params=params)
