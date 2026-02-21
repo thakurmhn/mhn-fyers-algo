@@ -1,6 +1,7 @@
 # ===== execution.py =====
 import logging
 import pickle
+import pathlib
 import pandas as pd
 import pendulum as dt
 from fyers_apiv3 import fyersModel
@@ -28,8 +29,8 @@ from indicators import (
     
 )
 
-from signals import detect_signal
-from tickdb import tick_db
+from signals import detect_signal, get_opening_range
+# from tickdb import tick_db
 from orchestration import update_candles_and_signals
 
 # ===========================================================
@@ -229,95 +230,145 @@ def get_option_by_moneyness(spot_price_, side, moneyness='ITM', points=0):
 
 def check_exit_condition(df_slice, state):
     """
-    Hybrid exit logic for live trading:
-    - ATR-based dynamic levels (stop-loss, partial/full targets, trailing stop)
-    - EMA plateau + momentum drop + oscillator confirmation
-    - Consecutive candle reversal guard (anticipates 3–4 candle reversals)
-    - Time-based guard (max 5 candles unless trailing engaged)
-    Returns: (bool, reason_str)
+    Exit logic for options buying (CALL and PUT are both LONG positions).
+    All price comparisons use option LTP (injected as df_slice["close"] by process_order).
+
+    FIXES vs original:
+    - Reversal candle direction is side-aware
+    - partial_booked initialised and used correctly
+    - buffer_points = 5 (was 12, too large for option premiums)
+    - trail_updates uses .get() to avoid KeyError
     """
 
-    i = len(df_slice) - 1
-    side = state["side"]
-    entry_price = state.get("buy_price")
-    current_price = df_slice["close"].iloc[-1]
+    i            = len(df_slice) - 1
+    side         = state["side"]
+    entry_price  = state.get("buy_price", 0)
+    entry_candle = state.get("entry_candle", i)
+    current_ltp  = df_slice["close"].iloc[-1]
 
-    # --- Minimum hold period ---
-    if i - state["entry_candle"] < 2:  # allow at least 2 candles before exit checks
+    # Minimum hold: 2 candles
+    if i - entry_candle < 2:
         return False, None
 
-    # --- EMA gap & momentum ---
-    ema9 = df_slice["close"].ewm(span=9, adjust=False).mean().iloc[-1]
+    stop       = state.get("stop")
+    pt         = state.get("pt")
+    tg         = state.get("tg")
+    trail_step = state.get("trail_step", 5)
+
+    # 1. Hard stop loss
+    if stop is not None and current_ltp <= stop:
+        logging.info(f"{RED}[EXIT][SL_HIT] {side} ltp={current_ltp:.2f} stop={stop:.2f}{RESET}")
+        return True, "SL_HIT"
+
+    # 2. Full target
+    if tg is not None and current_ltp >= tg:
+        logging.info(f"{GREEN}[EXIT][TARGET_HIT] {side} ltp={current_ltp:.2f} tg={tg:.2f}{RESET}")
+        return True, "TARGET_HIT"
+
+    # 3. Partial target + lock break-even
+    if pt is not None and not state.get("partial_booked", False):
+        if current_ltp >= pt:
+            state["partial_booked"] = True
+            if (state.get("stop") or 0) < entry_price:
+                state["stop"] = entry_price
+            logging.info(
+                f"{GREEN}[PARTIAL] {side} ltp={current_ltp:.2f} >= pt={pt:.2f} "
+                f"→ stop locked to entry {entry_price:.2f}{RESET}"
+            )
+
+    # 4. Trailing stop (buffer = 5 option pts)
+    pnl = current_ltp - entry_price
+    if pnl >= 5 and trail_step > 0:
+        new_stop = current_ltp - trail_step
+        if new_stop > state.get("stop", 0):
+            state["stop"] = new_stop
+            state["trail_updates"] = state.get("trail_updates", 0) + 1
+            logging.info(f"{CYAN}[TRAIL] {side} stop → {new_stop:.2f} ltp={current_ltp:.2f}{RESET}")
+
+    # 5. Oscillator exhaustion (2-of-3)
+    osc_hits = []
+    try:
+        cci_s = calculate_cci(df_slice) if "cci20" not in df_slice.columns else df_slice["cci20"]
+        cci   = float(cci_s.iloc[-1]) if not cci_s.empty else None
+        if cci and not pd.isna(cci):
+            if side == "CALL" and cci >  130: osc_hits.append(f"CCI={cci:.0f}")
+            if side == "PUT"  and cci < -130: osc_hits.append(f"CCI={cci:.0f}")
+    except Exception: pass
+
+    try:
+        rsi_col = df_slice["rsi14"] if "rsi14" in df_slice.columns else pd.Series(dtype=float)
+        rsi     = float(rsi_col.iloc[-1]) if not rsi_col.empty else None
+        if rsi and not pd.isna(rsi):
+            if side == "CALL" and rsi >  75: osc_hits.append(f"RSI={rsi:.0f}")
+            if side == "PUT"  and rsi <  25: osc_hits.append(f"RSI={rsi:.0f}")
+    except Exception: pass
+
+    try:
+        wr = williams_r(df_slice)
+        if wr and not pd.isna(wr):
+            if side == "CALL" and wr > -10: osc_hits.append(f"WR={wr:.0f}")
+            if side == "PUT"  and wr < -88: osc_hits.append(f"WR={wr:.0f}")
+    except Exception: pass
+
+    if len(osc_hits) >= 2:
+        if OSCILLATOR_EXIT_MODE == "HARD":
+            logging.info(f"{YELLOW}[EXIT][OSC] {side} {'+'.join(osc_hits)}{RESET}")
+            return True, "OSC_EXHAUSTION"
+        else:
+            if state.get("stop", 0) < entry_price:
+                state["stop"] = entry_price
+
+    # 6. Supertrend flip: 2 consecutive opposing candles
+    if "supertrend_bias" in df_slice.columns and len(df_slice) >= 2:
+        def norm(b):
+            return "UP" if b in ("UP","BULLISH") else ("DOWN" if b in ("DOWN","BEARISH") else "N")
+        b1 = norm(df_slice["supertrend_bias"].iloc[-1])
+        b2 = norm(df_slice["supertrend_bias"].iloc[-2])
+        if side == "CALL" and b1 == "DOWN" and b2 == "DOWN":
+            logging.info(f"{YELLOW}[EXIT][ST_FLIP] CALL bearish x2{RESET}")
+            return True, "ST_FLIP"
+        if side == "PUT"  and b1 == "UP"   and b2 == "UP":
+            logging.info(f"{YELLOW}[EXIT][ST_FLIP] PUT bullish x2{RESET}")
+            return True, "ST_FLIP"
+
+    # 7. Consecutive reversal candles (direction-aware — FIX)
+    last_c = df_slice.iloc[-1]
+    is_reversal = (
+        (side == "CALL" and last_c["close"] < last_c["open"]) or
+        (side == "PUT"  and last_c["close"] > last_c["open"])
+    )
+    state["consec_count"] = (state.get("consec_count", 0) + 1) if is_reversal else 0
+    if state["consec_count"] >= 3:
+        logging.info(f"{YELLOW}[EXIT][REVERSAL] {side} {state['consec_count']} reversal candles{RESET}")
+        return True, "REVERSAL_EXIT"
+
+    # 8. EMA plateau + momentum drop
+    ema9  = df_slice["close"].ewm(span=9,  adjust=False).mean().iloc[-1]
     ema13 = df_slice["close"].ewm(span=13, adjust=False).mean().iloc[-1]
     ema_gap = abs(ema9 - ema13)
 
-    ok, momentum = momentum_ok(df_slice, side)
-    if not ok or momentum is None:
-        momentum = 0
+    _, momentum = momentum_ok(df_slice, side)
+    momentum = momentum or 0
 
-    # --- ATR-based dynamic levels ---
-    stop = state.get("stop")
-    tg   = state.get("tg")
-    trail_step = state.get("trail_step")
+    prev_gap      = state.get("prev_gap", ema_gap)
+    peak_momentum = state.get("peak_momentum", abs(momentum))
 
-    # --- ATR exits (same for CALL and PUT since both are long) ---
-    if stop and current_price <= stop:
-        logging.info(f"{YELLOW}[EXIT] ATR Stop Loss hit side={side} stop={stop} current={current_price}{RESET}")
-        return True, "SL_HIT"
-
-    if tg and current_price >= tg:
-        logging.info(f"{YELLOW}[EXIT] ATR Full Target hit side={side} target={tg} current={current_price}{RESET}")
-        return True, "TARGET_HIT"
-
-    # --- Buffered trailing stop update ---
-    buffer_points = 12  # minimum favorable move before trailing engages
-    if current_price >= entry_price + buffer_points:
-        new_stop = current_price - trail_step
-        if new_stop > state["stop"]:
-            state["stop"] = new_stop
-            state["trail_updates"] += 1
-            logging.info(f"[TRAIL] {side} stop updated → {state['stop']:.2f} at Candle {i}")
-
-    # --- Consecutive candle reversal guard ---
-    if "consec_count" not in state:
-        state["consec_count"] = 0
-
-    last_candle = df_slice.iloc[-1]
-    if last_candle["close"] > last_candle["open"]:
-        state["consec_count"] += 1
-    else:
-        state["consec_count"] = 0
-
-    if state["consec_count"] >= 4:
-        logging.info(f"{YELLOW}[EXIT] Consecutive candles → reversal risk side={side}{RESET}")
-        return True, "REVERSAL_EXIT"
-
-    # --- Momentum exits ---
-    if ema_gap > state["prev_gap"]:
-        state["prev_gap"] = ema_gap
-        if abs(momentum) > state["peak_momentum"]:
-            state["peak_momentum"] = abs(momentum)
-            state["peak_candle"] = i
+    if ema_gap > prev_gap:
+        state["prev_gap"]      = ema_gap
+        state["peak_momentum"] = max(peak_momentum, abs(momentum))
         state["plateau_count"] = 0
         return False, None
 
-    if ema_gap <= state["prev_gap"]:
-        state["plateau_count"] += 1
-    else:
-        state["plateau_count"] = 0
+    state["plateau_count"] = state.get("plateau_count", 0) + 1
+    state["prev_gap"]      = ema_gap
 
-    if state["plateau_count"] >= 2 and abs(momentum) < state["peak_momentum"] * 0.4:
-        cci_series = calculate_cci(df_slice)
-        cci_val = cci_series.iloc[-1] if not cci_series.empty else None
-        wr_val = williams_r(df_slice)
+    if state["plateau_count"] >= 2 and abs(momentum) < peak_momentum * 0.4 and len(osc_hits) >= 1:
+        logging.info(f"{YELLOW}[EXIT][MOMENTUM] {side} plateau+drop+osc{RESET}")
+        return True, "MOMENTUM_EXIT"
 
-        if (cci_val is not None and cci_val > 120) or (wr_val is not None and wr_val < -85):
-            logging.info(f"{YELLOW}[EXIT] EMA plateau + momentum drop + oscillator confirm side={side}{RESET}")
-            return True, "MOMENTUM_EXIT"
-
-    # --- Time guard ---
-    if i - state["entry_candle"] >= 5 and state["trail_updates"] == 0:
-        logging.info(f"{YELLOW}[EXIT] Max hold time (5 candles) exceeded side={side}{RESET}")
+    # 9. Time guard: 8 candles with no trail
+    if i - entry_candle >= 8 and state.get("trail_updates", 0) == 0:
+        logging.info(f"{YELLOW}[EXIT][TIME] {side} {i-entry_candle} candles no trail{RESET}")
         return True, "TIME_EXIT"
 
     return False, None
@@ -326,91 +377,58 @@ def check_exit_condition(df_slice, state):
 def build_dynamic_levels(entry_price, atr, side, entry_candle,
                          rr_ratio=2.0, profit_loss_point=5, candles_df=None):
     """
-    Build stop-loss, partial/full targets, and trailing parameters.
-    Adjustments for live market:
-    - SL anchored to entry candle extremes
-    - Wider reward points (2 × ATR in normal regime)
-    - Buffered trailing stop
-    - Unified PT/TG logic for long CALL and long PUT
+    Build SL/PT/TG/trail for OPTIONS BUYING (long call or long put).
 
-    Parameters:
-    - entry_price: float, trade entry price
-    - atr: float, average true range
-    - side: str, "CALL" or "PUT"
-    - entry_candle: either a DataFrame row (Series) or an integer index
-    - rr_ratio: reward-to-risk multiplier
-    - profit_loss_point: minimum risk points
-    - candles_df: optional DataFrame of candles (required if entry_candle is int)
+    FIX: Uses % of option premium (entry_price), not underlying index ATR.
+    ATR on Nifty index = 30-100 pts. Option premium = 50-300 pts.
+    Setting SL = entry - 1.5*ATR = entry - 75 pts for a 100-pt option premium
+    means SL is below zero — meaningless.
+
+    % approach: SL at 18% below premium, PT at 25%, TG at 45%.
+    Example: entry=150 → SL=123, PT=187.5, TG=217.5
     """
-
-    # ---- Resolve entry_candle row ----
-    if isinstance(entry_candle, int):
-        if candles_df is None:
-            logging.error("[LEVELS] entry_candle is int but candles_df not provided")
-            return None, None, None, None, None
-        candle_row = candles_df.iloc[entry_candle]
-    elif isinstance(entry_candle, pd.Series):
-        candle_row = entry_candle
-    else:
-        logging.error("[LEVELS] Invalid entry_candle type")
+    if entry_price is None or entry_price <= 0:
+        logging.warning(f"[LEVELS] Invalid entry_price={entry_price}")
         return None, None, None, None, None
 
-    # ---- Decision: Normal / Volatile / Extreme ----
+    if atr is None or pd.isna(atr):
+        logging.warning("[LEVELS] ATR unavailable")
+        return None, None, None, None, None
+
+    # Regime from underlying ATR
     if atr <= 80:
         mode = "normal"
     elif atr <= 200:
         mode = "volatile"
     else:
-        mode = "extreme"
-
-    if mode == "normal":
-        risk_points   = max(profit_loss_point, atr * 0.25)
-        reward_points = atr * rr_ratio
-
-        if side == "CALL":
-            stop = candle_row["low"]
-        elif side == "PUT":
-            stop = candle_row["high"]
-        else:
-            stop = entry_price - risk_points
-
-        partial_target = entry_price + reward_points / 2
-        full_target    = entry_price + reward_points
-        trail_start    = reward_points / 2
-        trail_step     = max(atr * 0.2, 1.0)
-
-        logging.info(
-            f"{CYAN}[LEVELS][NORMAL] ATR={atr:.2f} Risk={risk_points:.2f} "
-            f"Reward={reward_points:.2f} SL={stop:.2f}{RESET}"
-        )
-
-    elif mode == "volatile":
-        risk_points   = atr * 0.5
-        reward_points = atr * 2.0
-
-        if side == "CALL":
-            stop = candle_row["low"]
-        elif side == "PUT":
-            stop = candle_row["high"]
-        else:
-            stop = entry_price - risk_points
-
-        partial_target = entry_price + reward_points * 0.5
-        full_target    = entry_price + reward_points
-        trail_start    = reward_points * 0.25
-        trail_step     = max(atr * 0.3, 1.5)
-
-        logging.info(
-            f"{CYAN}[LEVELS][VOLATILE] ATR={atr:.2f} Risk={risk_points:.2f} "
-            f"Reward={reward_points:.2f} SL={stop:.2f}{RESET}"
-        )
-
-    else:
-        logging.warning(
-            f"{CYAN}[LEVELS][EXTREME] ATR={atr:.2f} → Trade skipped due to excessive volatility{RESET}"
-        )
+        logging.warning(f"[LEVELS][EXTREME] ATR={atr:.0f} — skipping trade")
         return None, None, None, None, None
 
+    # % of option premium — entirely independent of underlying ATR
+    if mode == "normal":
+        sl_pct   = 0.18   # 18% below entry
+        pt_pct   = 0.25   # partial target
+        tg_pct   = 0.45   # full target
+        step_pct = 0.06   # trail step
+    else:  # volatile
+        sl_pct   = 0.22
+        pt_pct   = 0.30
+        tg_pct   = 0.55
+        step_pct = 0.09
+
+    stop           = round(entry_price * (1 - sl_pct),  2)
+    partial_target = round(entry_price * (1 + pt_pct),  2)
+    full_target    = round(entry_price * (1 + tg_pct),  2)
+    trail_start    = round(entry_price * pt_pct * 0.5,  2)
+    trail_step     = round(max(entry_price * step_pct, 2.0), 2)
+
+    logging.info(
+        f"{CYAN}[LEVELS][{mode.upper()}] {side} entry={entry_price:.2f} "
+        f"SL={stop:.2f}(-{sl_pct*100:.0f}%) "
+        f"PT={partial_target:.2f}(+{pt_pct*100:.0f}%) "
+        f"TG={full_target:.2f}(+{tg_pct*100:.0f}%) "
+        f"Step={trail_step:.2f} indexATR={atr:.1f}{RESET}"
+    )
     return stop, partial_target, full_target, trail_start, trail_step
 
 def update_trailing_stop(current_price, entry_price, current_stop,
@@ -783,14 +801,12 @@ def check_order_status(order_id, fyers):
 # =================== Dynamic Order Processing / ATR based SL/PT/TG ==========================
 
 # ===== process_order =====
-def process_order(state, df_slice, info, spot_price, account_type="paper"):
+def process_order(state, df_slice, info, spot_price,
+                  account_type="paper", mode="LIVE"):
     """
     Manage exits for an active trade using SL/Target + hybrid exit logic.
-    Adjustments for live market:
-    - Explicit SL/Target checks with latency buffer
-    - Hybrid exit logic (ATR, momentum, reversal, time)
-    - Market exits for guaranteed fills
-    - Audit logging with trail updates
+    - mode="LIVE": full DB persistence + live orders
+    - mode="REPLAY": skip DB writes, only simulate exits
     """
 
     side   = state["side"]
@@ -800,11 +816,10 @@ def process_order(state, df_slice, info, spot_price, account_type="paper"):
 
     current_candle = df_slice.iloc[-1]
 
-    # --- Latency buffer (2–3 points) ---
     buffer = 2.0
+    exit_reason = None
 
     # --- Explicit SL/Target checks ---
-    exit_reason = None
     if side == "CALL":
         if current_candle["low"] <= state["stop"] + buffer:
             exit_reason = "SL_HIT"
@@ -816,13 +831,12 @@ def process_order(state, df_slice, info, spot_price, account_type="paper"):
         elif spot_price <= state["pt"] + buffer:
             exit_reason = "TARGET_HIT"
 
-    # --- Hybrid exit logic (ATR, momentum, reversal, time) ---
+    # --- Hybrid exit logic ---
     if not exit_reason:
         triggered, reason = check_exit_condition(df_slice, state)
         if triggered and reason:
             exit_reason = reason
 
-    # --- If no exit condition met, keep trade alive ---
     if not exit_reason:
         return False, None
 
@@ -830,8 +844,11 @@ def process_order(state, df_slice, info, spot_price, account_type="paper"):
     if account_type.lower() == "paper":
         success, order_id = send_paper_exit_order(symbol, qty, exit_reason)
     else:
-        # Live trading: always use market order for exit
-        success, order_id = send_live_exit_order(symbol, qty, exit_reason, order_type="MARKET")
+        if mode == "LIVE":
+            success, order_id = send_live_exit_order(symbol, qty, exit_reason, order_type="MARKET")
+        else:
+            # REPLAY mode → simulate success, no DB
+            success, order_id = True, "REPLAY_ORDER"
 
     if success:
         exit_price = current_candle["close"]
@@ -845,18 +862,13 @@ def process_order(state, df_slice, info, spot_price, account_type="paper"):
         trade["quantity"] = 0
 
         trade["filled_df"].loc[dt.now(time_zone)] = [
-            symbol,
-            entry,
-            exit_price,
-            side,
-            state.get("reason", "UNKNOWN"),   # entry reason
-            exit_reason,                      # exit reason
-            state.get("entry_candle", -1),    # entry candle number
-            len(df_slice) - 1,                # exit candle number
-            pnl_points,
-            pnl_value,
-            spot_price,
-            qty
+            symbol, entry, exit_price, side,
+            state.get("reason", "UNKNOWN"),
+            exit_reason,
+            state.get("entry_candle", -1),
+            len(df_slice) - 1,
+            pnl_points, pnl_value,
+            spot_price, qty
         ]
 
         logging.info(
@@ -868,7 +880,11 @@ def process_order(state, df_slice, info, spot_price, account_type="paper"):
             f"TrailUpdates={state.get('trail_updates',0)}{RESET}"
         )
 
-        update_order_status(order_id, "PENDING", qty, exit_price, symbol)
+        if mode == "LIVE":
+            update_order_status(order_id, "PENDING", qty, exit_price, symbol)
+        else:
+            logging.info("[REPLAY] Skipping DB update")
+
         return True, exit_reason
 
     return False, None
@@ -934,104 +950,128 @@ def update_risk(trade_info, risk_info):
             f"[RISK HALT] Max drawdown breached: {total_pnl:.2f} vs peak {risk_info['peak_equity']:.2f}"
         )
 
-# ===== paper_order =====
-def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
+def paper_order(candles_3m, hist_yesterday_15m=None, exit=False, mode="REPLAY"):
     global quantity, paper_info, df, spot_price, last_signal_candle_time, risk_info
 
-    COOLDOWN_SECONDS = 180  # 3 minutes
+    COOLDOWN_SECONDS = 120
     ct = dt.now(time_zone)
 
     # 1. Safety reset
     for leg in ["call_buy", "put_buy"]:
         if paper_info[leg].get("trade_flag", 0) == 2:
-            logging.warning(f"{CYAN}[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0{RESET}")
+            logging.warning(f"[RESET] lingering trade_flag=2 for {leg}")
             paper_info[leg]["trade_flag"] = 0
 
-    # 2. Refresh spot price (simulated)
-    try:
-        quote = fyers.quotes(data={"symbols": ticker})
-        spot_price = quote["d"][0]["v"]["lp"]
+    # 2. Spot price
+    if not candles_3m.empty:
+        spot_price = candles_3m.iloc[-1]["close"]
         logging.info(f"[PAPER] Spot={spot_price}")
-    except Exception as e:
-        logging.warning(f"[PAPER] Spot fetch failed: {e}")
 
     # 3. End-of-day force exit
     if ct > end_time:
-        logging.info("[PAPER] End time reached, closing open positions")
+        logging.info("[PAPER] EOD — closing open positions")
         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
             if paper_info[leg]["trade_flag"] == 1:
                 name = paper_info[leg]["option_name"]
                 qty  = paper_info[leg]["quantity"]
-                success, order_id = send_paper_exit_order(name, qty, "EOD")
-                if success:
-                    exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
-                    cleanup_trade_exit(paper_info, leg, side, name, qty, exit_price, "PAPER", "EOD")
-                    update_order_status(order_id, "PENDING", qty, exit_price, name)
+                ep   = df.loc[name, "ltp"] if name in df.index else spot_price
+                send_paper_exit_order(name, qty, "EOD")
+                cleanup_trade_exit(paper_info, leg, side, name, qty, ep, "PAPER", "EOD")
+        store(paper_info, account_type)
         return
 
-    # 4. Exit management (explicit exit flag)
-    if exit:
-        for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
-            if paper_info[leg]["trade_flag"] == 1:
-                state = paper_info[leg]
-                triggered = process_order(state, candles_3m, paper_info, spot_price, account_type="paper")
-                if triggered:
-                    paper_info["last_exit_time"] = ct
-                    logging.info(f"{YELLOW}[EXIT][PAPER] {side} {state['option_name']} at {paper_info['last_exit_time']}{RESET}")
-        return
-    
-    # 5. Signal evaluation (entry detection on 3m candles only)
-    signal = None
-    if not candles_3m.empty:
-        last_candle_time = candles_3m.iloc[-1]["time"]
-        if last_signal_candle_time != last_candle_time:
-            last_signal_candle_time = last_candle_time
-
-            # ATR from 3m candles
-            atr, atr_source = resolve_atr(candles_3m)
-            logging.info(
-                f"{YELLOW}[SIGNAL EVAL][PAPER] candle={last_candle_time} "
-                f"candles={len(candles_3m)} atr={atr:.2f} source={atr_source}{RESET}"
+    # 4. EXIT MANAGEMENT — runs every call when position is open
+    # FIX: was gated by  if exit:  which was never True. Now unconditional.
+    # FIX: runs BEFORE de-dup so exit is checked every second, not once per candle.
+    for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
+        if paper_info[leg].get("trade_flag", 0) == 1:
+            state = paper_info[leg]
+            triggered, reason = process_order(
+                state, candles_3m, paper_info, spot_price,
+                account_type="paper", mode=mode
             )
+            if triggered:
+                paper_info["last_exit_time"] = ct
+                logging.info(f"[EXIT DONE][PAPER] {side} reason={reason}")
 
-            # Pivot calculations from the most recent 3m candle
-            prev_candle = candles_3m.iloc[-1]
-            cpr  = calculate_cpr(prev_candle["high"], prev_candle["low"], prev_candle["close"])
-            trad = calculate_traditional_pivots(prev_candle["high"], prev_candle["low"], prev_candle["close"])
-            cam  = calculate_camarilla_pivots(prev_candle["high"], prev_candle["low"], prev_candle["close"])
+    if candles_3m is None or candles_3m.empty:
+        return
 
-            # Detect signal using 3m pivots + ATR
-            signal = detect_signal(cpr, trad, cam, candles_3m, atr=atr)
+    # 5. De-duplication — only gates ENTRY signals (not exit, which ran above)
+    last_candle_time = str(candles_3m.iloc[-1].get("time", len(candles_3m)))
+    if last_signal_candle_time == last_candle_time:
+        return   # already processed entry signal for this candle
+    last_signal_candle_time = last_candle_time
 
-    # 6. Paper entry logic
-    if signal:
-        side, reason = signal["side"], signal["reason"]
-        logging.info(f"{YELLOW}[SIGNAL][PAPER] {side} ({reason}) spot={spot_price}{RESET}")
+    # Risk gate
+    if risk_info.get("halt_trading", False):
+        logging.info("[ENTRY BLOCKED][RISK] Halt active")
+        return
 
-        # --- Optional 15m bias filter ---
-        if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
-            last_15m = hist_yesterday_15m.iloc[-1]
-            bias15 = last_15m.get("supertrend_bias", "NEUTRAL")
-            slope15 = last_15m.get("supertrend_slope", "FLAT")
-            logging.info(f"[BIAS][15m] bias={bias15} slope={slope15}")
-            # Example filter: block entries if 15m bias is NEUTRAL
-            if bias15 == "NEUTRAL":
-                logging.info(f"{MAGENTA}[ENTRY BLOCKED][15m Bias] Skipping trade due to neutral 15m bias{RESET}")
-                return
-
-        # --- Filters ---
-        if risk_info.get("halt_trading", False):
-            logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
+    # Cooldown
+    if paper_info.get("last_exit_time"):
+        elapsed = (ct - paper_info["last_exit_time"]).total_seconds()
+        if elapsed < COOLDOWN_SECONDS:
+            logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s < {COOLDOWN_SECONDS}s")
             return
-        if paper_info.get("last_exit_time"):
-            elapsed = (ct - paper_info["last_exit_time"]).total_seconds()
-            if elapsed < COOLDOWN_SECONDS:
-                logging.info(f"{MAGENTA}[ENTRY BLOCKED][COOLDOWN] {side} skipped ({elapsed:.0f}s < {COOLDOWN_SECONDS}s){RESET}")
-                return
 
-        leg = "call_buy" if side == "CALL" else "put_buy"
-        try:
-            if paper_info[leg]["trade_flag"] == 0:
+    # 6. Signal evaluation
+    atr, _ = resolve_atr(candles_3m)
+
+    # TPMA (stored as "vwap" column by build_indicator_dataframe)
+    tpma = float(candles_3m["vwap"].iloc[-1]) if "vwap" in candles_3m.columns and not pd.isna(candles_3m["vwap"].iloc[-1]) else None
+
+    # Opening range (first 5 bars of session)
+    orb_h, orb_l = get_opening_range(candles_3m)
+
+    # FIX: pivots from previous completed candle (iloc[-2]), not current (iloc[-1])
+    pivot_src = candles_3m.iloc[-2] if len(candles_3m) >= 2 else candles_3m.iloc[-1]
+    cpr  = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+
+    signal = detect_signal(
+        candles_3m=candles_3m,
+        candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
+        cpr_levels=cpr,
+        camarilla_levels=cam,
+        traditional_levels=trad,
+        atr=atr,
+        include_partial=False,
+        current_time=ct,
+        vwap=tpma,
+        orb_high=orb_h,
+        orb_low=orb_l,
+    )
+
+    # 7. Entry
+    if not signal:
+        _save_trades_paper()
+        store(paper_info, account_type)
+        return
+
+    side   = signal["side"]
+    reason = signal["reason"]
+    source = signal.get("source", "UNKNOWN")
+    logging.info(
+        f"[SIGNAL][PAPER] {side} score={signal.get('score','?')} "
+        f"source={source} tpma={tpma:.1f if tpma else 'N/A'} | {reason}"
+    )
+
+    # Log 15m bias (FIX: no longer hard-blocks on NEUTRAL — scoring handles it)
+    if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
+        bias15 = hist_yesterday_15m.iloc[-1].get("supertrend_bias", "NEUTRAL")
+        logging.info(f"[BIAS][15m] {bias15}")
+
+    if risk_info.get("halt_trading", False):
+        return
+
+    leg = "call_buy" if side == "CALL" else "put_buy"
+    try:
+        if paper_info[leg]["trade_flag"] == 0:
+            if paper_info.get("trade_count", 0) >= paper_info.get("max_trades", MAX_TRADES_PER_DAY):
+                logging.info("[ENTRY SKIP] Max trades reached")
+            else:
                 opt_type = "CE" if side == "CALL" else "PE"
                 opt_name, strike = get_option_by_moneyness(
                     spot_price, opt_type,
@@ -1039,98 +1079,98 @@ def paper_order(candles_3m, hist_yesterday_15m=None, exit=False):
                 )
 
                 if opt_name and opt_name in df.index:
-                    entry_price = df.loc[opt_name, "ltp"] or spot_price
-
-                    # --- ATR dynamic levels ---
-                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
-                        entry_price,
-                        atr,
-                        side,
-                        len(candles_3m) - 1
-                    )
-                    if stop is None:
-                        logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} ATR regime extreme → skipping trade{RESET}")
+                    ltp_val = df.loc[opt_name, "ltp"]
+                    entry_price = float(ltp_val) if (ltp_val and not pd.isna(ltp_val)) else spot_price
+                    if not entry_price or entry_price <= 0:
+                        logging.warning(f"[ENTRY SKIP] invalid entry_price={entry_price}")
                         return
 
-                    # --- Update trade state ---
+                    # FIX: pass candles_df so build_dynamic_levels can resolve entry candle
+                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
+                        entry_price, atr, side,
+                        entry_candle=len(candles_3m) - 1,
+                        candles_df=candles_3m
+                    )
+                    if stop is None:
+                        logging.warning(f"[ENTRY SKIP] {side} levels failed (ATR extreme?)")
+                        return
+
+                    # FIX: all required exit-state keys initialised
                     paper_info[leg].update({
-                        "option_name": opt_name,
-                        "quantity": quantity,
-                        "buy_price": entry_price,
-                        "order_type": ORDER_TYPE,
-                        "trade_flag": 1,
-                        "pnl": 0,
-                        "reason": reason,
-                        "order_id": f"paper_{opt_name}_{ct}",
-                        "entry_time": ct,
-                        "entry_candle": len(candles_3m) - 1,
-                        "side": side,
-                        # ATR dynamic levels
-                        "stop": stop,
-                        "pt": pt,
-                        "tg": tg,
-                        "trail_start": trail_start,
-                        "trail_step": trail_step,
-                        # Momentum state
-                        "prev_gap": 0,
-                        "peak_momentum": 0,
-                        "peak_candle": len(candles_3m) - 1,
-                        "plateau_count": 0,
+                        "option_name":    opt_name,
+                        "quantity":       quantity,
+                        "buy_price":      entry_price,
+                        "order_type":     ORDER_TYPE,
+                        "trade_flag":     1,
+                        "pnl":            0,
+                        "reason":         reason,
+                        "source":         source,
+                        "order_id":       f"paper_{opt_name}_{ct}",
+                        "entry_time":     ct,
+                        "entry_candle":   len(candles_3m) - 1,
+                        "side":           side,
+                        "stop":           stop,
+                        "pt":             pt,
+                        "tg":             tg,
+                        "trail_start":    trail_start,
+                        "trail_step":     trail_step,
+                        "trail_updates":  0,
+                        "consec_count":   0,
+                        "prev_gap":       0,
+                        "peak_momentum":  0,
+                        "peak_candle":    len(candles_3m) - 1,
+                        "plateau_count":  0,
+                        "partial_booked": False,
                     })
 
-                    # --- Record entry in filled_df ---
                     paper_info[leg]["filled_df"].loc[ct] = [
-                        opt_name,
-                        entry_price,
-                        float("nan"),          # exit_price placeholder
-                        side,
-                        reason,                # entry_reason
-                        None,                  # exit_reason placeholder
-                        len(candles_3m) - 1,   # entry_candle
-                        None,                  # exit_candle placeholder
-                        None,                  # pnl_points placeholder
-                        None,                  # pnl_value placeholder
-                        spot_price,
-                        quantity,
+                        opt_name, entry_price, float("nan"), side,
+                        reason, None, len(candles_3m) - 1,
+                        None, None, None, spot_price, quantity, source
                     ]
-
                     paper_info["trade_count"] = paper_info.get("trade_count", 0) + 1
 
                     logging.info(
-                        f"{GREEN}[ENTRY][PAPER] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"Reason={reason} ATR={atr:.2f} SL={stop:.2f} PT={pt:.2f} TG={tg:.2f} "
-                        f"TrailStart={trail_start:.2f} TrailStep={trail_step:.2f}{RESET}"
+                        f"{GREEN}[ENTRY][PAPER] {side} {opt_name} @ {entry_price:.2f} "
+                        f"SL={stop:.2f} PT={pt:.2f} TG={tg:.2f} "
+                        f"ATR={atr:.1f} step={trail_step:.2f} "
+                        f"score={signal.get('score','?')} source={source}{RESET}"
                     )
                 else:
-                    logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}{CYAN}")
-        except Exception as e:
-            logging.error(f"[ENTRY ERROR][PAPER] {e}", exc_info=True)
+                    logging.warning(f"[ENTRY SKIP] no option for {side} strike={strike}")
+    except Exception as e:
+        logging.error(f"[ENTRY ERROR][PAPER] {e}", exc_info=True)
 
-    # 7. Save trades
+    _save_trades_paper()
+    store(paper_info, account_type)
+
+
+def _save_trades_paper():
     frames = [paper_info["call_buy"]["filled_df"], paper_info["put_buy"]["filled_df"]]
     frames = [f for f in frames if not f.empty]
     if frames:
-        combined = pd.concat(frames)
-        combined.to_csv(f"trades_{strategy_name}_{dt.now(time_zone).date()}.csv")
-    store(paper_info, account_type)
+        pd.concat(frames).to_csv(
+            f"trades_{strategy_name}_{dt.now(time_zone).date()}_PAPER.csv", index=True
+        )
+
 # =============================== Live Trading =======================================
 
 # ===== real_order =====
 def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
     global quantity, live_info, df, spot_price, last_signal_candle_time, risk_info
 
-    COOLDOWN_SECONDS = 180  # 3 minutes
+    COOLDOWN_SECONDS = 120
     ct = dt.now(time_zone)
 
     # 1. Safety reset
     for leg in ["call_buy", "put_buy"]:
         if live_info[leg].get("trade_flag", 0) == 2:
-            logging.warning(f"{CYAN}[RESET] Found lingering trade_flag=2 for {leg}, resetting to 0{RESET}")
+            logging.warning(f"[RESET] lingering trade_flag=2 for {leg}")
             live_info[leg]["trade_flag"] = 0
 
-    # 2. Refresh spot price (live)
+    # 2. Refresh spot price
     try:
-        quote = fyers.quotes(data={"symbols": ticker})
+        quote      = fyers.quotes(data={"symbols": ticker})
         spot_price = quote["d"][0]["v"]["lp"]
         logging.info(f"[LIVE] Spot={spot_price}")
     except Exception as e:
@@ -1138,254 +1178,1119 @@ def live_order(candles_3m, hist_yesterday_15m=None, exit=False):
 
     # 3. End-of-day force exit
     if ct > end_time:
-        logging.info("[LIVE] End time reached, closing open positions")
+        logging.info("[LIVE] EOD — closing positions")
         for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
             if live_info[leg]["trade_flag"] == 1:
                 name = live_info[leg]["option_name"]
                 qty  = live_info[leg]["quantity"]
                 success, order_id = send_live_exit_order(name, qty, "EOD")
                 if success:
-                    exit_price = df.loc[name, "ltp"] if name in df.index else spot_price
-                    cleanup_trade_exit(live_info, leg, side, name, qty, exit_price, "LIVE", "EOD")
-                    update_order_status(order_id, "PENDING", qty, exit_price, name)
+                    ep = df.loc[name, "ltp"] if name in df.index else spot_price
+                    cleanup_trade_exit(live_info, leg, side, name, qty, ep, "LIVE", "EOD")
+                    update_order_status(order_id, "PENDING", qty, ep, name)
         return
 
-    # 4. Exit management (explicit exit flag)
-    if exit:
-        for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
-            if live_info[leg]["trade_flag"] == 1:
-                state = live_info[leg]
-                triggered = process_order(state, candles_3m, live_info, spot_price, account_type="live")
-                if triggered:
-                    live_info["last_exit_time"] = ct
-                    logging.info(f"{YELLOW}[EXIT][LIVE] {side} {state['option_name']} at {live_info['last_exit_time']}{RESET}")
+    # 4. EXIT MANAGEMENT — unconditional, before de-dup
+    # FIX: was gated by  if exit:  which was never True.
+    for leg, side in [("call_buy", "CALL"), ("put_buy", "PUT")]:
+        if live_info[leg].get("trade_flag", 0) == 1:
+            state = live_info[leg]
+            triggered, reason = process_order(
+                state, candles_3m, live_info, spot_price,
+                account_type="live", mode="LIVE"
+            )
+            if triggered:
+                live_info["last_exit_time"] = ct
+                logging.info(f"[EXIT DONE][LIVE] {side} reason={reason}")
+
+    if candles_3m is None or candles_3m.empty:
         return
 
-    # 5. Signal evaluation (entry detection on 3m candles only)
-    signal = None
-    if not candles_3m.empty:
-        last_candle_time = candles_3m.iloc[-1]["time"]
-        if last_signal_candle_time != last_candle_time:
-            last_signal_candle_time = last_candle_time
+    # 5. De-duplication — only gates entry signals
+    last_candle_time = str(candles_3m.iloc[-1].get("time", len(candles_3m)))
+    if last_signal_candle_time == last_candle_time:
+        return
+    last_signal_candle_time = last_candle_time
 
-            # ATR from 3m candles
-            atr, atr_source = resolve_atr(candles_3m)
-            logging.info(
-                f"{YELLOW}[SIGNAL EVAL][LIVE] candle={last_candle_time} "
-                f"candles={len(candles_3m)} atr={atr:.2f} source={atr_source}{RESET}"
+    if risk_info.get("halt_trading", False):
+        return
+
+    if live_info.get("last_exit_time"):
+        elapsed = (ct - live_info["last_exit_time"]).total_seconds()
+        if elapsed < COOLDOWN_SECONDS:
+            logging.info(f"[ENTRY BLOCKED][COOLDOWN] {elapsed:.0f}s")
+            return
+
+    # 6. Signal evaluation
+    atr, _ = resolve_atr(candles_3m)
+
+    # TPMA (stored as "vwap" column by build_indicator_dataframe)
+    tpma = float(candles_3m["vwap"].iloc[-1]) if "vwap" in candles_3m.columns and not pd.isna(candles_3m["vwap"].iloc[-1]) else None
+
+    # Opening range (first 5 bars of session)
+    orb_h, orb_l = get_opening_range(candles_3m)
+
+    # FIX: pivots from previous completed candle
+    pivot_src = candles_3m.iloc[-2] if len(candles_3m) >= 2 else candles_3m.iloc[-1]
+    cpr  = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+    cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+
+    signal = detect_signal(
+        candles_3m=candles_3m,
+        candles_15m=hist_yesterday_15m if hist_yesterday_15m is not None else pd.DataFrame(),
+        cpr_levels=cpr,
+        camarilla_levels=cam,
+        traditional_levels=trad,
+        atr=atr,
+        include_partial=False,
+        current_time=ct,
+        vwap=tpma,
+        orb_high=orb_h,
+        orb_low=orb_l,
+    )
+
+    # 7. Entry
+    if not signal:
+        _save_trades_live()
+        store(live_info, account_type)
+        return
+
+    side   = signal["side"]
+    reason = signal["reason"]
+    source = signal.get("source", "UNKNOWN")
+    logging.info(
+        f"[SIGNAL][LIVE] {side} score={signal.get('score','?')} "
+        f"source={source} tpma={tpma:.1f if tpma else 'N/A'} | {reason}"
+    )
+
+    if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
+        bias15 = hist_yesterday_15m.iloc[-1].get("supertrend_bias", "NEUTRAL")
+        logging.info(f"[BIAS][15m] {bias15}")
+
+    if risk_info.get("halt_trading", False):
+        return
+
+    leg = "call_buy" if side == "CALL" else "put_buy"
+    try:
+        if live_info[leg]["trade_flag"] == 0:
+            if live_info.get("trade_count", 0) >= live_info.get("max_trades", MAX_TRADES_PER_DAY):
+                logging.info("[ENTRY SKIP] Max trades reached")
+                return
+
+            opt_type = "CE" if side == "CALL" else "PE"
+            opt_name, strike = get_option_by_moneyness(
+                spot_price, opt_type,
+                moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
             )
 
-            # Pivot calculations from the most recent 3m candle
-            prev_candle = candles_3m.iloc[-1]
-            cpr  = calculate_cpr(prev_candle["high"], prev_candle["low"], prev_candle["close"])
-            trad = calculate_traditional_pivots(prev_candle["high"], prev_candle["low"], prev_candle["close"])
-            cam  = calculate_camarilla_pivots(prev_candle["high"], prev_candle["low"], prev_candle["close"])
+            if opt_name and opt_name in df.index:
+                ltp_val = df.loc[opt_name, "ltp"]
+                entry_price = float(ltp_val) if (ltp_val and not pd.isna(ltp_val)) else spot_price
+                if not entry_price or entry_price <= 0:
+                    return
 
-            # Detect signal using 3m pivots + ATR
-            signal = detect_signal(cpr, trad, cam, candles_3m, atr=atr)
-
-    # 6. Live entry logic
-    if signal:
-        side, reason = signal["side"], signal["reason"]
-        logging.info(f"[SIGNAL][LIVE] {side} ({reason}) spot={spot_price}")
-
-        # --- Optional 15m bias filter ---
-        if hist_yesterday_15m is not None and not hist_yesterday_15m.empty:
-            last_15m = hist_yesterday_15m.iloc[-1]
-            bias15 = last_15m.get("supertrend_bias", "NEUTRAL")
-            slope15 = last_15m.get("supertrend_slope", "FLAT")
-            logging.info(f"[BIAS][15m] bias={bias15} slope={slope15}")
-            if bias15 == "NEUTRAL":
-                logging.info(f"{MAGENTA}[ENTRY BLOCKED][15m Bias] Skipping trade due to neutral 15m bias{RESET}")
-                return
-
-        # --- Filters ---
-        if risk_info.get("halt_trading", False):
-            logging.info(f"{MAGENTA}[ENTRY BLOCKED][RISK] Trading halted due to risk limits{RESET}")
-            return
-        if live_info.get("last_exit_time"):
-            elapsed = (ct - live_info["last_exit_time"]).total_seconds()
-            if elapsed < COOLDOWN_SECONDS:
-                logging.info(f"{MAGENTA}[ENTRY BLOCKED][LIVE] Cool-down active ({elapsed:.0f}s < {COOLDOWN_SECONDS}s){RESET}")
-                return
-
-        leg = "call_buy" if side == "CALL" else "put_buy"
-        try:
-            if live_info[leg]["trade_flag"] == 0:
-                opt_type = "CE" if side == "CALL" else "PE"
-                opt_name, strike = get_option_by_moneyness(
-                    spot_price, opt_type,
-                    moneyness=CALL_MONEYNESS if side == "CALL" else PUT_MONEYNESS
+                # FIX: pass candles_df
+                stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
+                    entry_price, atr, side,
+                    entry_candle=len(candles_3m) - 1,
+                    candles_df=candles_3m
                 )
+                if stop is None:
+                    logging.warning(f"[ENTRY SKIP] {side} levels failed")
+                    return
 
-                if opt_name and opt_name in df.index:
-                    entry_price = df.loc[opt_name, "ltp"] or spot_price
+                success, order_id = send_live_entry_order(opt_name, quantity, 1)
+                if not success:
+                    logging.warning(f"[ENTRY FAILED][LIVE] {side} {opt_name}")
+                    return
 
-                    # --- ATR dynamic levels ---
-                    stop, pt, tg, trail_start, trail_step = build_dynamic_levels(
-                        entry_price,
-                        atr,
-                        side,
-                        len(candles_3m) - 1
-                    )
-                    if stop is None:
-                        logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} ATR regime extreme → skipping trade{RESET}")
-                        return
+                # FIX: all required exit-state keys
+                live_info[leg].update({
+                    "option_name":    opt_name,
+                    "quantity":       quantity,
+                    "buy_price":      entry_price,
+                    "order_type":     ORDER_TYPE,
+                    "trade_flag":     1,
+                    "pnl":            0,
+                    "reason":         reason,
+                    "source":         source,
+                    "order_id":       order_id,
+                    "entry_time":     ct,
+                    "entry_candle":   len(candles_3m) - 1,
+                    "side":           side,
+                    "stop":           stop,
+                    "pt":             pt,
+                    "tg":             tg,
+                    "trail_start":    trail_start,
+                    "trail_step":     trail_step,
+                    "trail_updates":  0,
+                    "consec_count":   0,
+                    "prev_gap":       0,
+                    "peak_momentum":  0,
+                    "peak_candle":    len(candles_3m) - 1,
+                    "plateau_count":  0,
+                    "partial_booked": False,
+                })
 
-                    # Place live order
-                    success, order_id = send_live_entry_order(opt_name, quantity, 1)  # BUY side=1
-                    if not success:
-                        logging.warning(f"{MAGENTA}[ENTRY FAILED][LIVE] {side} {opt_name}{RESET}")
-                        return
+                live_info[leg]["filled_df"].loc[ct] = [
+                    opt_name, entry_price, float("nan"), side,
+                    reason, None, len(candles_3m) - 1,
+                    None, None, None, spot_price, quantity, source
+                ]
+                live_info["trade_count"] = live_info.get("trade_count", 0) + 1
 
-                    # --- Update trade state ---
-                    live_info[leg].update({
-                        "option_name": opt_name,
-                        "quantity": quantity,
-                        "buy_price": entry_price,
-                        "order_type": ORDER_TYPE,
-                        "trade_flag": 1,
-                        "pnl": 0,
-                        "reason": reason,
-                        "order_id": order_id,
-                        "entry_time": ct,
-                        "entry_candle": len(candles_3m) - 1,
-                        "side": side,
-                        # ATR dynamic levels
-                        "stop": stop,
-                        "pt": pt,
-                        "tg": tg,
-                        "trail_start": trail_start,
-                        "trail_step": trail_step,
-                        # Momentum state
-                        "prev_gap": 0,
-                        "peak_momentum": 0,
-                        "peak_candle": len(candles_3m) - 1,
-                        "plateau_count": 0,
-                    })
+                logging.info(
+                    f"{GREEN}[ENTRY][LIVE] {side} {opt_name} @ {entry_price:.2f} "
+                    f"SL={stop:.2f} PT={pt:.2f} TG={tg:.2f} "
+                    f"ATR={atr:.1f} score={signal.get('score','?')} source={source}{RESET}"
+                )
+            else:
+                logging.warning(f"[ENTRY SKIP] {side} no option. opt_name={opt_name}")
+    except Exception as e:
+        logging.error(f"[ENTRY ERROR][LIVE] {e}", exc_info=True)
 
-                    # --- Record entry in filled_df ---
-                    live_info[leg]["filled_df"].loc[ct] = [
-                        opt_name,
-                        entry_price,
-                        float("nan"),          # exit_price placeholder
-                        side,
-                        reason,                # entry_reason
-                        None,                  # exit_reason placeholder
-                        len(candles_3m) - 1,   # entry_candle
-                        None,                  # exit_candle placeholder
-                        None,                  # pnl_points placeholder
-                        None,                  # pnl_value placeholder
-                        spot_price,
-                        quantity,
-                    ]
+    _save_trades_live()
+    store(live_info, account_type)
 
-                    live_info["trade_count"] = live_info.get("trade_count", 0) + 1
 
-                    logging.info(
-                        f"{GREEN}[ENTRY][LIVE] LONG {side} {opt_name} BUY @ {entry_price:.2f} "
-                        f"Reason={reason} ATR={atr:.2f} SL={stop:.2f} PT={pt:.2f} TG={tg:.2f} "
-                        f"TrailStart={trail_start:.2f} TrailStep={trail_step:.2f}{RESET}"
-                    )
-                else:
-                    logging.warning(f"{CYAN}[ENTRY SKIPPED] {side} no valid option found in df for strike={strike}{RESET}")
-        except Exception as e:
-            logging.error(f"{RED}[ENTRY ERROR][LIVE] {e}{RESET}", exc_info=True)
-
-    # 7. Save trades
-    # 7. Save trades
+def _save_trades_live():
     frames = [live_info["call_buy"]["filled_df"], live_info["put_buy"]["filled_df"]]
     frames = [f for f in frames if not f.empty]
     if frames:
-        combined = pd.concat(frames)
-        combined.to_csv(
-            f"trades_{strategy_name}_{dt.now(time_zone).date()}_LIVE.csv",
-            index=True
+        pd.concat(frames).to_csv(
+            f"trades_{strategy_name}_{dt.now(time_zone).date()}_LIVE.csv", index=True
         )
-    store(live_info, account_type)
 # ============================================== RUN Strategy ==============================================
 
 
 # --- Helper: sleep until next boundary ---
 def sleep_until_next_boundary(interval=180, tz="Asia/Kolkata"):
-    now = dt.now(tz)
-    seconds = now.minute * 60 + now.second
+    """Sleep until next candle boundary. Only used in LIVE fallback mode."""
+    now           = dt.now(tz)
+    seconds       = now.minute * 60 + now.second
     next_boundary = ((seconds // interval) + 1) * interval
-    sleep_time = next_boundary - seconds
-    time.sleep(sleep_time)
+    sleep_secs    = next_boundary - seconds
+    logging.debug(f"[SLEEP] {sleep_secs}s until next {interval}s boundary")
+    time.sleep(sleep_secs)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OFFLINE REPLAY ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
 
-def run_strategy(symbols, tz=time_zone, end_time=None):
+def _print_replay_summary():
+    """Print trade summary after a replay run."""
+    frames = [paper_info["call_buy"]["filled_df"], paper_info["put_buy"]["filled_df"]]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        logging.info("[REPLAY SUMMARY] No trades taken.")
+        return
+
+    combined = pd.concat(frames)
+    total    = len(combined)
+    winners  = (combined["pnl_points"] > 0).sum() if "pnl_points" in combined.columns else 0
+    losers   = (combined["pnl_points"] < 0).sum() if "pnl_points" in combined.columns else 0
+    total_pnl = combined["pnl_value"].sum() if "pnl_value" in combined.columns else 0
+    win_rate  = winners / total * 100 if total > 0 else 0
+
+    logging.info(
+        f"\n{'='*60}\n"
+        f"  REPLAY SUMMARY\n"
+        f"{'='*60}\n"
+        f"  Total trades : {total}\n"
+        f"  Winners      : {winners}  ({win_rate:.1f}%)\n"
+        f"  Losers       : {losers}\n"
+        f"  Total PnL    : {total_pnl:.2f}\n"
+        f"{'='*60}"
+    )
+
+    if "exit_reason" in combined.columns:
+        logging.info("[REPLAY] Exit reasons:")
+        for reason, count in combined["exit_reason"].value_counts().items():
+            logging.info(f"  {reason:20s}: {count}")
+
+    if "source" in combined.columns:
+        logging.info("[REPLAY] Signal sources:")
+        for src, count in combined["source"].value_counts().items():
+            logging.info(f"  {src:20s}: {count}")
+
+    if "side" in combined.columns:
+        logging.info("[REPLAY] By side:")
+        for side, count in combined["side"].value_counts().items():
+            logging.info(f"  {side:20s}: {count}")
+
+
+def run_offline_replay(tick_db, symbols_list=None, date_str=None,
+                       min_warmup_candles=35, signal_only=False,
+                       output_dir=".", db_path=None):
     """
-    Orchestration loop:
-    - Refresh spot price
-    - Delegate candle building + signal detection (with previous day continuity, 3m + 15m)
-    - Route to paper/live order (entry + exit handled inside those functions)
+    Candle-by-candle offline replay using tick_db data. No live connection needed.
+
+    Simulates exactly how the live bot sees data: at each 3m bar boundary
+    only candles[0..i] are visible — no lookahead. Indicators are rebuilt
+    incrementally on each slice.
+
+    Args:
+        tick_db             TickDatabase instance
+        symbols_list        list of symbols; defaults to config symbols
+        date_str            'YYYY-MM-DD' to filter replay to a specific date.
+                            Warmup bars from the previous day are always prepended
+                            for indicator accuracy regardless of this filter.
+                            None = use all data in DB.
+        min_warmup_candles  3m bars needed before evaluation starts.
+                            Supertrend/ADX need 14+; 30 is a safe default.
+        signal_only         True  → log signals, skip trade simulation.
+                            False → simulate entries, SL/PT/TG exits, log PnL.
+        output_dir          Directory for CSV trade log. Default = current dir.
+
+    Two CSVs are saved when signal_only=False:
+        signals_<sym>_<date>.csv   — every signal that fired (bar, time, side, score, reason)
+        trades_<sym>_<date>.csv    — every completed trade (entry, exit, PnL)
+
+    Typical usage:
+        # Terminal:
+        python execution.py                  # trade simulation
+        python execution.py --signal-only    # signals only
+
+        # From Python / notebook:
+        from tickdb import tick_db
+        from execution import run_strategy
+        run_strategy(["NSE:NIFTY50-INDEX"], mode="OFFLINE", tick_db=tick_db,
+                     date_str="2026-02-20", signal_only=True)
     """
-    while dt.now(tz) < end_time:
-        for sym in symbols:
-            logging.info(f"{GRAY}[STRATEGY] Running for {sym}{RESET}")
+    import os
+    from collections import Counter
+    from orchestration import build_indicator_dataframe
+    from signals import detect_signal
 
-            # --- Refresh spot price ---
-            try:
-                quote = fyers.quotes(data={"symbols": sym})
-                spot_price = quote["d"][0]["v"]["lp"]
-                logging.info(f"{GRAY}[SPOT REFRESH] {sym} Spot={spot_price}{RESET}")
-            except Exception as e:
-                logging.warning(f"{GRAY}[SPOT REFRESH FAILED] {sym}: {e}{RESET}")
-                continue
+    if symbols_list is None:
+        symbols_list = symbols if isinstance(symbols, list) else [symbols]
 
-            # --- Delegate candles + signal detection (3m + 15m continuity) ---
-            signal, candles_3m, candles_15m = update_candles_and_signals(
-                symbol=sym,
-                spot_price=spot_price,
-                # lookback_days=2   # ✅ ensure previous day continuity
-            )
+    os.makedirs(output_dir, exist_ok=True)
 
-            # --- Guard against empty DataFrames ---
-            if (candles_3m is None or candles_3m.empty) and (candles_15m is None or candles_15m.empty):
-                logging.warning(f"[STRATEGY] No candles for {sym}, skipping order evaluation")
-                continue
+    logging.info(
+        f"\n{'='*64}\n"
+        f"  OFFLINE REPLAY\n"
+        f"  date        = {date_str or 'all available'}\n"
+        f"  signal_only = {signal_only}\n"
+        f"  warmup      = {min_warmup_candles} bars\n"
+        f"{'='*64}\n"
+    )
 
-            # --- Summary log ---
+    # ── Helper: find the sort/align column (prefer tz-aware "date") ───────────
+    def _time_col(df):
+        for c in ("date", "time", "timestamp", "candle_time"):
+            if c in df.columns:
+                return c
+        return df.columns[0]
+
+    # ── Helper: find string column for date-prefix filtering (YYYY-MM-DD...) ──
+    # Direct SQL output has both "date" (datetime) and "time" (string).
+    # Use "time" for startswith-style date filtering.
+    def _str_col(df):
+        return "time" if "time" in df.columns else _time_col(df)
+
+    # ── Helper: merge and dedup two DataFrames on their time column ───────────
+    def _merge_candles(hist, today):
+        dfs = [d for d in [hist, today] if d is not None and not d.empty]
+        if not dfs:
+            return pd.DataFrame()
+        out  = pd.concat(dfs, ignore_index=True)
+        tcol = _time_col(out)
+        return (out.drop_duplicates(subset=[tcol])
+                   .sort_values(tcol)
+                   .reset_index(drop=True))
+
+    # ── Helper: option premium proxy from underlying move ─────────────────────
+    # tick_db has no option prices. We simulate a 1.5× leveraged option premium.
+    # Entry premium = ATM option rough value (underlying * 0.006).
+    # Subsequent moves: delta ≈ 0.5, gamma amplification ≈ 1.5×.
+    # This is intentionally approximate — the signal quality is what matters.
+    def _option_premium(underlying_close, entry_underlying, entry_premium, side):
+        move = underlying_close - entry_underlying
+        if side == "PUT":
+            move = -move                         # PUT profits when market falls
+        delta_pnl = move * 0.5 * 1.5            # delta 0.5, 1.5× leverage
+        return max(entry_premium + delta_pnl, 1.0)
+
+    # ── Resolve DB path: explicit arg → tick_db attributes → give up ──────────
+    _db_path = db_path
+    if _db_path is None:
+        for _attr in ("db_path", "path", "database", "db_file", "_db_path"):
+            _val = getattr(tick_db, _attr, None)
+            if isinstance(_val, str) and _val:
+                _db_path = _val
+                break
+    if _db_path:
+        logging.info(f"[REPLAY] DB path: {_db_path}")
+    else:
+        logging.warning(
+            "[REPLAY] Could not determine DB path from tick_db. "
+            "Pass it explicitly: run_strategy(..., db_path=r'C:\\SQLite\\ticks\\ticks_2026-02-20.db')"
+        )
+
+    # ── Helper: query SQLite directly using confirmed schema ─────────────────
+    # Schema (from DB inspection):
+    #   candles_3m_ist / candles_15m_ist
+    #   Columns: trade_date TEXT, ist_slot TEXT, symbol TEXT,
+    #            open REAL, high REAL, low REAL, close REAL, volume REAL
+    #
+    # Output column "date": tz-aware IST datetime — required by
+    # build_indicator_dataframe and detect_signal.
+    # "time": "YYYY-MM-DD HH:MM:SS" string — used for de-dup and date filtering.
+    def _load_direct(interval, sym):
+        if not _db_path:
+            return pd.DataFrame()
+        table = "candles_3m_ist" if "3m" in interval else "candles_15m_ist"
+        try:
+            import sqlite3
+            conn  = sqlite3.connect(_db_path)
+            query = f"""
+                SELECT
+                    trade_date || 'T' || ist_slot  AS _dt,
+                    trade_date || ' ' || ist_slot  AS time,
+                    trade_date, ist_slot,
+                    open, high, low, close,
+                    COALESCE(volume, 0) AS volume
+                FROM {table}
+                WHERE symbol = ?
+                ORDER BY trade_date, ist_slot
+            """
+            df   = pd.read_sql_query(query, conn, params=(sym,))
+            conn.close()
+
+            if df.empty:
+                logging.warning(f"  [{table}] 0 rows for symbol={sym}")
+                return pd.DataFrame()
+
+            # Build tz-aware "date" column (IST) — this is what downstream expects
+            ist       = "Asia/Kolkata"
+            df["date"] = (pd.to_datetime(df["_dt"])
+                            .dt.tz_localize(ist))
+            df = df.drop(columns=["_dt"])
+
+            for col in ("open", "high", "low", "close", "volume"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
             logging.info(
-                f"[SUMMARY] {sym}: "
-                f"3m candles={len(candles_3m) if candles_3m is not None and not candles_3m.empty else 0} | "
-                f"15m candles={len(candles_15m) if candles_15m is not None and not candles_15m.empty else 0}"
+                f"  [{table}] {len(df)} rows  "
+                f"({df['time'].iloc[0]} → {df['time'].iloc[-1]})"
             )
+            return df.reset_index(drop=True)
 
-            # --- Route to order functions ---
+        except Exception as e:
+            logging.error(f"  Direct SQL failed ({table}): {e}")
+            return pd.DataFrame()
+
+    def _load_best(interval, sym):
+        # Direct SQL first — always correct, bypasses use_yesterday date filtering
+        df = _load_direct(interval, sym)
+        if not df.empty:
+            return df
+        # Fallback to fetch_candles (works during live session)
+        for flag in (False, True):
+            try:
+                df = tick_db.fetch_candles(interval, use_yesterday=flag, symbol=sym)
+                if df is not None and not df.empty:
+                    logging.debug(f"  fetch_candles(use_yesterday={flag}) → {len(df)} rows")
+                    return df
+            except Exception as e:
+                logging.debug(f"  fetch_candles(use_yesterday={flag}): {e}")
+        return pd.DataFrame()
+
+    for sym in symbols_list:
+        logging.info(f"[REPLAY] Loading candles for {sym} ...")
+
+        # Load using best-of-both strategy (handles post-market and live sessions)
+        try:
+            df_3m_all  = _load_best("3m",  sym)
+            df_15m_all = _load_best("15m", sym)
+        except Exception as e:
+            logging.error(f"[REPLAY] DB load failed for {sym}: {e}")
+            continue
+
+        # ── Load previous trading day(s) of 15m data for indicator warmup ───────
+        # ADX14 needs 28 bars, CCI20 needs 20 bars → need >28 15m rows before today.
+        # Scan up to 5 prev trading days from the replay DB date and prepend them.
+        if _db_path and date_str:
+            import sqlite3 as _sql2, os as _os2
+            _db_dir   = str(pathlib.Path(_db_path).parent)
+            _ref_date = pd.Timestamp(date_str)
+            _prev_frames_15m = []
+            _prev_frames_3m  = []
+            _days_back        = 0
+            _days_found       = 0
+            while _days_back < 14 and _days_found < 5:
+                _days_back += 1
+                _cand = (_ref_date - pd.Timedelta(days=_days_back))
+                if _cand.weekday() >= 5:          # skip Sat/Sun
+                    continue
+                _cand_str  = _cand.strftime("%Y-%m-%d")
+                _cand_path = _os2.path.join(_db_dir, f"ticks_{_cand_str}.db")
+                if not _os2.path.exists(_cand_path):
+                    continue
+                try:
+                    for _tbl, _lst in [("candles_15m_ist", _prev_frames_15m),
+                                        ("candles_3m_ist",  _prev_frames_3m)]:
+                        _q = f"""
+                            SELECT
+                                trade_date || 'T' || ist_slot  AS _dt,
+                                trade_date || ' ' || ist_slot  AS time,
+                                trade_date, ist_slot,
+                                open, high, low, close,
+                                COALESCE(volume, 0) AS volume
+                            FROM {_tbl}
+                            WHERE symbol = ?
+                            ORDER BY trade_date, ist_slot
+                        """
+                        with _sql2.connect(_cand_path) as _c2:
+                            _tmp = pd.read_sql_query(_q, _c2, params=(sym,))
+                        if not _tmp.empty:
+                            _ist = "Asia/Kolkata"
+                            _tmp["date"] = pd.to_datetime(_tmp["_dt"]).dt.tz_localize(_ist)
+                            _tmp = _tmp.drop(columns=["_dt"])
+                            for _col in ("open","high","low","close","volume"):
+                                _tmp[_col] = pd.to_numeric(_tmp[_col], errors="coerce")
+                            _lst.append(_tmp)
+                except Exception as _ex:
+                    logging.debug(f"[REPLAY WARMUP] {_cand_str}: {_ex}")
+                    continue
+                _days_found += 1
+
+            if _prev_frames_15m:
+                _prev_15m = pd.concat(_prev_frames_15m, ignore_index=True)
+                df_15m_all = pd.concat([_prev_15m, df_15m_all], ignore_index=True)
+                df_15m_all = (df_15m_all.drop_duplicates(subset=["time"])
+                                         .sort_values("time")
+                                         .reset_index(drop=True))
+                logging.info(f"[REPLAY] 15m warmup: prepended {len(_prev_15m)} rows "
+                             f"from {_days_found} prev day(s) → total {len(df_15m_all)} 15m rows")
+
+            if _prev_frames_3m:
+                _prev_3m = pd.concat(_prev_frames_3m, ignore_index=True)
+                df_3m_all = pd.concat([_prev_3m, df_3m_all], ignore_index=True)
+                df_3m_all = (df_3m_all.drop_duplicates(subset=["time"])
+                                       .sort_values("time")
+                                       .reset_index(drop=True))
+
+        if df_3m_all.empty:
+            logging.warning(
+                f"[REPLAY] No 3m candles found for {sym}. "
+                f"Check that the DB file has session data."
+            )
+            continue
+
+        tc3  = _time_col(df_3m_all)          # datetime col for sorting/alignment
+        sc3  = _str_col(df_3m_all)           # string col for date-prefix filtering
+        tc15 = _time_col(df_15m_all) if not df_15m_all.empty else tc3
+        sc15 = _str_col(df_15m_all)  if not df_15m_all.empty else sc3
+        total_bars = len(df_3m_all)
+
+        # Show available range
+        logging.info(
+            f"[REPLAY] {sym}: {total_bars} total 3m bars  "
+            f"({df_3m_all.iloc[0][sc3]} → {df_3m_all.iloc[-1][sc3]})"
+        )
+
+        # Auto-reduce warmup if DB has fewer bars than requested
+        effective_warmup = min_warmup_candles
+        if total_bars <= min_warmup_candles:
+            effective_warmup = max(14, total_bars // 3)
+            logging.warning(
+                f"[REPLAY] Only {total_bars} bars but warmup={min_warmup_candles}. "
+                f"Auto-reduced to {effective_warmup}."
+            )
+            if total_bars <= effective_warmup + 1:
+                logging.warning(
+                    f"[REPLAY] Still not enough bars ({total_bars}). "
+                    f"The DB may only contain post-market data."
+                )
+                continue
+
+        # ── Optional date filter ───────────────────────────────────────────────
+        replay_start_idx = effective_warmup
+        if date_str:
+            try:
+                mask    = df_3m_all[sc3].astype(str).str.startswith(date_str)
+                matches = mask[mask].index
+                if len(matches) == 0:
+                    available = sorted(df_3m_all[sc3].astype(str).str[:10].unique())
+                    logging.warning(
+                        f"[REPLAY] No bars for date={date_str}. "
+                        f"Dates in DB: {available}"
+                    )
+                    continue
+                first_match      = int(matches[0])
+                replay_start_idx = max(first_match, effective_warmup)
+                logging.info(
+                    f"[REPLAY] Date {date_str}: bars {first_match}–{total_bars-1} "
+                    f"(replay from bar {replay_start_idx})"
+                )
+            except Exception as e:
+                logging.warning(f"[REPLAY] Date filter error: {e}")
+
+        replay_bars = total_bars - replay_start_idx
+        logging.info(
+            f"[REPLAY] Warmup={replay_start_idx} | Evaluating={replay_bars} bars\n"
+        )
+
+        # ── Per-run state ─────────────────────────────────────────────────────
+        signals_fired  = []
+        trade_log      = []
+        blocker_counts = Counter()
+
+        global last_signal_candle_time
+        last_signal_candle_time = None  # reset dedup so replay is clean
+
+        # ── PositionManager — single source of truth for open position ─────────
+        # Prevents repeated orders: once a trade is open, detect_signal is
+        # bypassed entirely. Each bar instead runs pm.update() to monitor the
+        # position and decide HOLD vs EXIT using:
+        #   HARD_STOP   — premium drops to 50% of entry
+        #   TRAIL_STOP  — ratcheting stop after 40% gain
+        #   PARTIAL     — book half at 60% gain, move stop to breakeven
+        #   MOMENTUM_PEAK — RSI extreme + (CCI extreme OR slope reversal)
+        #   ST_FLIP     — SuperTrend flips against position
+        #   MAX_HOLD    — safety valve at MAX_HOLD_BARS bars
+        #   EOD_EXIT    — force close at 15:15 IST
+
+        class _PM:
+            """Inline PositionManager — no external import needed.
+
+            Works in BOTH signal_only=True AND signal_only=False modes.
+            Once a position is opened, is_open() returns True and the main
+            loop skips detect_signal entirely — no repeated orders possible.
+            """
+            # ── Tunable thresholds ────────────────────────────────────
+            RSI_OB          = 70     # overbought → exit CALL (was 72, tighter)
+            RSI_OS          = 30     # oversold   → exit PUT  (was 28, tighter)
+            CCI_EXTREME     = 120    # CCI extreme exit (was 150, fires earlier at peak)
+            MIN_HOLD        = 3      # min bars before any momentum/ST exit (was 2)
+            MAX_HOLD        = 20     # hard max hold 20×3m = 60 min (was 12 — too short)
+            TRAIL_ACTIVATE  = 0.25   # trail kicks in after 25% premium gain (was 0.40)
+            TRAIL_STEP      = 0.15   # give back at most 15% of peak gain (was 0.20)
+            HARD_STOP_FRAC  = 0.45   # max loss = 45% of entry premium (was 0.50)
+            PARTIAL_FRAC    = 0.50   # partial profit at 50% gain, stop → breakeven
+            EOD_MIN         = 15 * 60 + 10  # force close at 15:10 IST (was 15:15)
+
+            def __init__(self):
+                self._t = None
+
+            def is_open(self): return self._t is not None
+
+            def open_pos(self, bar_idx, bar_time, underlying, entry_premium, signal):
+                self._t = dict(
+                    entry_bar=bar_idx, entry_time=bar_time,
+                    entry_ul=underlying, entry_px=entry_premium,
+                    side=signal["side"], score=signal.get("score", 0),
+                    source=signal.get("source", "?"),
+                    pivot=signal.get("pivot", ""),
+                    peak_px=entry_premium, bars_held=0,
+                    partial_done=False,
+                    hard_stop=entry_premium * self.HARD_STOP_FRAC,
+                    trail_active=False, trail_stop=None,
+                    entry_st=str(signal.get("st_bias", "?")),
+                )
+                logging.info(
+                    f"{GREEN}[TRADE OPEN] {signal['side']} bar={bar_idx} {bar_time} "
+                    f"underlying={underlying:.2f} premium≈{entry_premium:.1f} "
+                    f"score={signal.get('score','?')} "
+                    f"src={signal.get('source','?')} pivot={signal.get('pivot','')}{RESET}"
+                )
+
+            def update(self, bar_idx, bar_time, underlying, row):
+                """Returns ("HOLD",None) or ("EXIT", reason_str)."""
+                t   = self._t
+                ep  = t["entry_px"]
+                side= t["side"]
+
+                # Simulate current option premium (0.5-delta ATM approx)
+                move = underlying - t["entry_ul"]
+                if side == "PUT": move = -move
+                cur = max(0.1, ep + 0.5 * move)
+
+                t["bars_held"] += 1
+                if cur > t["peak_px"]:
+                    t["peak_px"] = cur
+
+                # Safe indicator reads
+                def _f(k, d=float("nan")):
+                    try:
+                        v = float(row.get(k, d))
+                        import math
+                        return v if math.isfinite(v) else d
+                    except Exception: return d
+
+                rsi = _f("rsi14", 50.0)
+                cci = _f("cci20",  0.0)
+                st  = str(row.get("supertrend_bias","?")).upper()
+                slp = str(row.get("slope","?")).upper()
+
+                # Bar time in minutes
+                try:
+                    ts_str = str(bar_time).split(" ")[-1]
+                    bar_min = int(ts_str[:2])*60 + int(ts_str[3:5])
+                except Exception: bar_min = 0
+
+                gain     = t["peak_px"] - ep
+                cur_gain = cur - ep
+
+                # 1. HARD STOP
+                if cur <= t["hard_stop"]:
+                    return "EXIT", "HARD_STOP", cur
+
+                # 2. TRAIL STOP (activates after TRAIL_ACTIVATE gain)
+                if not t["trail_active"] and gain >= ep * self.TRAIL_ACTIVATE:
+                    t["trail_active"] = True
+                    t["trail_stop"]   = ep + gain * (1 - self.TRAIL_STEP)
+                    logging.info(
+                        f"  {CYAN}[TRAIL ON] bar={bar_idx} peak_gain={gain:.1f} "
+                        f"trail_stop={t['trail_stop']:.1f}{RESET}"
+                    )
+                if t["trail_active"]:
+                    new_trail = ep + gain * (1 - self.TRAIL_STEP)
+                    if new_trail > t["trail_stop"]:
+                        t["trail_stop"] = new_trail
+                    if cur <= t["trail_stop"]:
+                        return "EXIT", "TRAIL_STOP", cur
+
+                # 3. PARTIAL PROFIT — move hard stop to breakeven
+                if not t["partial_done"] and cur_gain >= ep * self.PARTIAL_FRAC:
+                    t["partial_done"] = True
+                    t["hard_stop"]    = ep
+                    logging.info(
+                        f"  {CYAN}[PARTIAL] bar={bar_idx} {bar_time} {side} "
+                        f"cur={cur:.1f} gain={cur_gain:.1f} "
+                        f"→ stop moved to breakeven {ep:.1f}{RESET}"
+                    )
+
+                if t["bars_held"] >= self.MIN_HOLD:
+                    # 4. MOMENTUM PEAK EXIT
+                    rsi_extreme = (side=="CALL" and rsi >= self.RSI_OB) or \
+                                  (side=="PUT"  and rsi <= self.RSI_OS)
+                    cci_extreme = (side=="CALL" and cci >= self.CCI_EXTREME) or \
+                                  (side=="PUT"  and cci <= -self.CCI_EXTREME)
+                    slope_rev   = (side=="CALL" and slp=="DOWN") or \
+                                  (side=="PUT"  and slp=="UP")
+
+                    if rsi_extreme and (cci_extreme or slope_rev):
+                        return "EXIT", "MOMENTUM_PEAK", cur
+
+                    # 5. SUPERTREND FLIP
+                    st_flip = (side=="CALL" and st=="DOWN") or \
+                              (side=="PUT"  and st=="UP")
+                    if st_flip:
+                        return "EXIT", "ST_FLIP", cur
+
+                # 6. MAX HOLD
+                if t["bars_held"] >= self.MAX_HOLD:
+                    return "EXIT", "MAX_HOLD", cur
+
+                # 7. EOD
+                if bar_min >= self.EOD_MIN:
+                    return "EXIT", "EOD_EXIT", cur
+
+                return "HOLD", None, cur
+
+            def close_pos(self, bar_idx, bar_time, underlying, exit_px, reason, qty):
+                t   = self._t
+                ep  = t["entry_px"]
+                pnl_pts = exit_px - ep
+                pnl_val = pnl_pts * qty
+                color   = GREEN if pnl_pts >= 0 else RED
+                outcome = "WIN " if pnl_pts >= 0 else "LOSS"
+                logging.info(
+                    f"{color}[TRADE EXIT][{reason}] {outcome} "
+                    f"{t['side']} bar={bar_idx} {bar_time} "
+                    f"premium {ep:.1f}→{exit_px:.1f} "
+                    f"P&L={pnl_pts:+.1f}pts ({pnl_val:+.0f}₹) "
+                    f"peak={t['peak_px']:.1f} held={t['bars_held']}bars{RESET}"
+                )
+                record = {
+                    "date":          bar_time,
+                    "bar":           bar_idx,
+                    "side":          t["side"],
+                    "entry_bar":     t["entry_bar"],
+                    "entry_time":    t["entry_time"],
+                    "entry_ul":      t["entry_ul"],
+                    "entry_premium": ep,
+                    "exit_ul":       underlying,
+                    "exit_premium":  exit_px,
+                    "peak_premium":  t["peak_px"],
+                    "exit_reason":   reason,
+                    "bars_held":     t["bars_held"],
+                    "pnl_points":    round(pnl_pts, 2),
+                    "pnl_value":     round(pnl_val, 2),
+                    "source":        t.get("source", "?"),
+                    "score":         t.get("score", "?"),
+                    "pivot":         t.get("pivot", ""),
+                }
+                self._t = None
+                return record
+
+        pm = _PM()
+        cooldown_until = 0   # bar index after which new entries are allowed again
+
+        # Pre-build a simple _FakeTime factory (avoids class-inside-loop issues)
+        class _FakeTime:
+            __slots__ = ("hour", "minute")
+            def __init__(self, h, m):
+                self.hour, self.minute = h, m
+
+        # ── Main loop ─────────────────────────────────────────────────────────
+        for i in range(replay_start_idx, total_bars):
+            slice_3m = df_3m_all.iloc[:i + 1].copy()
+            cur_time = slice_3m.iloc[-1][tc3]    # tz-aware datetime for 15m alignment
+
+            # Align 15m: bars whose datetime <= current 3m datetime
+            if not df_15m_all.empty:
+                slice_15m = df_15m_all[df_15m_all[tc15] <= cur_time].copy()
+            else:
+                slice_15m = pd.DataFrame()
+
+            # Build indicators
+            try:
+                slice_3m = build_indicator_dataframe(sym, slice_3m, interval="3m")
+                if not slice_15m.empty:
+                    slice_15m = build_indicator_dataframe(sym, slice_15m, interval="15m")
+            except Exception as e:
+                logging.debug(f"[REPLAY bar={i}] indicator error: {e}")
+                continue
+
+            last_row  = slice_3m.iloc[-1]
+            bar_time  = last_row.get(sc3, str(cur_time))
+            bar_close = float(last_row["close"])
+
+            # ── Bar time gate ─────────────────────────────────────────────────
+            ts    = pd.Timestamp(bar_time)
+            bar_t = ts.hour * 60 + ts.minute
+
+            # ── POSITION MONITOR — runs every bar when a trade is open ─────────
+            # Works in both signal_only=True AND False modes.
+            # While pm.is_open(): detect_signal is bypassed — no repeated orders.
+            if pm.is_open():
+                action, reason, cur_px = pm.update(i, bar_time, bar_close, last_row)
+                if action == "EXIT":
+                    record = pm.close_pos(i, bar_time, bar_close, cur_px, reason, quantity)
+                    trade_log.append(record)
+                    cooldown_until = i + 2   # 2-bar cooldown before next entry
+                    # After exit: don't evaluate entry on the same bar
+                continue
+
+            # ── COOLDOWN — bars immediately after an exit ─────────────────────
+            if i < cooldown_until:
+                blocker_counts["COOLDOWN"] = blocker_counts.get("COOLDOWN", 0) + 1
+                continue
+
+            # ── POST-MARKET GATE — no entries after close ─────────────────────
+            if bar_t >= 15 * 60 + 30:
+                blocker_counts["POST_MARKET"] = blocker_counts.get("POST_MARKET", 0) + 1
+                continue
+
+            # ── ENTRY EVALUATION — only runs when no position is open ──────────
+            atr, _ = resolve_atr(slice_3m)
+
+            # TPMA (stored as "vwap" by build_indicator_dataframe)
+            tpma = (float(slice_3m["vwap"].iloc[-1])
+                    if "vwap" in slice_3m.columns
+                    and not pd.isna(slice_3m["vwap"].iloc[-1]) else None)
+
+            orb_h, orb_l = get_opening_range(slice_3m)
+
+            pivot_src = slice_3m.iloc[-2] if len(slice_3m) >= 2 else slice_3m.iloc[-1]
+            cpr  = calculate_cpr(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+            trad = calculate_traditional_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+            cam  = calculate_camarilla_pivots(pivot_src["high"], pivot_src["low"], pivot_src["close"])
+
+            fake_time = _FakeTime(ts.hour, ts.minute)
+
+            try:
+                signal = detect_signal(
+                    candles_3m=slice_3m,
+                    candles_15m=slice_15m,
+                    cpr_levels=cpr,
+                    camarilla_levels=cam,
+                    traditional_levels=trad,
+                    atr=atr,
+                    include_partial=False,
+                    current_time=fake_time,
+                    vwap=tpma,
+                    orb_high=orb_h,
+                    orb_low=orb_l,
+                )
+            except Exception as e:
+                logging.debug(f"[REPLAY bar={i}] detect_signal error: {e}")
+                continue
+
+            if not signal:
+                blocked_by = signal.get("reason", "SCORE_LOW") if signal else "NO_SIGNAL"
+                blocker_counts[blocked_by] += 1
+                continue
+
+            side   = signal["side"]
+            score  = signal.get("score", "?")
+            reason = signal["reason"]
+            source = signal.get("source", "?")
+
+            # Enrich signal with current ST for PM entry tracking
+            signal["st_bias"] = str(last_row.get("supertrend_bias", "?"))
+            signal["pivot"]   = signal.get("pivot", "")
+
+            # Option premium approximation: ATM ≈ 0.6% of underlying
+            entry_premium = round(bar_close * 0.006, 1)
+
+            # ── Log the entry signal ───────────────────────────────────────────
+            logging.info(
+                f"  {GREEN}[SIGNAL→ENTRY] bar={i} {bar_time} | "
+                f"{side} score={score} src={source} pivot={signal.get('pivot','')}{RESET}"
+            )
+            logging.info(
+                f"    underlying={bar_close:.2f}  "
+                f"premium≈{entry_premium:.1f}  "
+                f"ST={last_row.get('supertrend_bias','?')}  "
+                f"EMA9={last_row.get('ema9', float('nan')):.1f}  "
+                f"CCI={last_row.get('cci20', float('nan')):.1f}  "
+                f"RSI={last_row.get('rsi14', float('nan')):.1f}"
+            )
+            logging.info(f"    reason: {reason}")
+
+            # Track in signals_fired (first entry only per trade)
+            signals_fired.append({
+                "bar":         i,
+                "time":        bar_time,
+                "side":        side,
+                "score":       score,
+                "reason":      reason,
+                "source":      source,
+                "pivot":       signal.get("pivot", ""),
+                "underlying":  bar_close,
+                "est_premium": entry_premium,
+            })
+
+            # ── Open position via PositionManager ─────────────────────────────
+            # This locks out all subsequent bars from calling detect_signal
+            # until this trade is exited.
+            pm.open_pos(i, bar_time, bar_close, entry_premium, signal)
+
+        # ── Force close if still open at end of data ──────────────────────────
+        if pm.is_open():
+            last_ul = float(df_3m_all.iloc[-1]["close"])
+            t       = pm._t
+            ep      = t["entry_px"]
+            move    = last_ul - t["entry_ul"]
+            if t["side"] == "PUT": move = -move
+            final_px = max(0.1, ep + 0.5 * move)
+            record   = pm.close_pos(
+                total_bars - 1, df_3m_all.iloc[-1][sc3],
+                last_ul, final_px, "EOD_CLOSE", quantity
+            )
+            trade_log.append(record)
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        safe_sym  = sym.replace(":", "_")
+        date_tag  = date_str or "all"
+        sep       = "─" * 64
+
+        logging.info(f"\n{sep}")
+        logging.info(f"  RESULTS: {sym}  ({date_tag})")
+        logging.info(sep)
+        logging.info(f"  Trades taken  : {len(signals_fired)}  "
+                     f"(one entry per trade — PM locks out re-entry while open)")
+
+        if signals_fired:
+            call_ct = sum(1 for s in signals_fired if s["side"] == "CALL")
+            put_ct  = sum(1 for s in signals_fired if s["side"] == "PUT")
+            scores  = [s["score"] for s in signals_fired if isinstance(s["score"], (int, float))]
+            avg_sc  = sum(scores) / len(scores) if scores else 0
+            logging.info(f"    CALL={call_ct}  PUT={put_ct}  avg_score={avg_sc:.1f}")
+            sig_csv = os.path.join(output_dir, f"signals_{safe_sym}_{date_tag}.csv")
+            pd.DataFrame(signals_fired).to_csv(sig_csv, index=False)
+            logging.info(f"    → {sig_csv}")
+
+        # Trade log shown in all modes (PM tracks exits even in signal_only)
+        if trade_log:
+            wins     = sum(1 for t in trade_log if t["pnl_points"] > 0)
+            losses   = len(trade_log) - wins
+            tot_pnl  = sum(t["pnl_value"] for t in trade_log)
+            win_rate = wins / len(trade_log) * 100
+            logging.info(f"\n  Trades closed : {len(trade_log)}")
+            logging.info(f"  Win / Loss    : {wins} / {losses}  ({win_rate:.1f}%)")
+            logging.info(f"  Total PnL (₹) : {tot_pnl:+.2f}")
+            logging.info(f"\n  Exit breakdown:")
+            for reason, cnt in Counter(t["exit_reason"] for t in trade_log).most_common():
+                logging.info(f"    {reason:22s}: {cnt}")
+            logging.info(f"\n  Trade details:")
+            for t in trade_log:
+                color = GREEN if t["pnl_points"] >= 0 else RED
+                logging.info(
+                    f"    {color}{t['side']:4s} entry={t['entry_time']} "
+                    f"exit={t['date']} held={t['bars_held']}bars "
+                    f"pnl={t['pnl_points']:+.1f}pts ({t['pnl_value']:+.0f}₹) "
+                    f"[{t['exit_reason']}]{RESET}"
+                )
+            trd_csv = os.path.join(output_dir, f"trades_{safe_sym}_{date_tag}.csv")
+            pd.DataFrame(trade_log).to_csv(trd_csv, index=False)
+            logging.info(f"\n  → {trd_csv}")
+        else:
+            logging.info("  Trades closed : 0")
+
+        if blocker_counts:
+            logging.info(f"\n  Signal blockers:")
+            for reason, cnt in blocker_counts.most_common(10):
+                logging.info(f"    {reason:30s}: {cnt} bars")
+
+        logging.info(f"{sep}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN STRATEGY — LIVE fallback + entry point for run_offline_replay
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_strategy(symbols, tz=time_zone, end_time=None,
+                 replay_data=None, mode="LIVE",
+                 tick_db=None, date_str=None,
+                 signal_only=False, min_warmup_candles=35,
+                 output_dir=".", db_path=None):
+    """
+    Unified strategy entry point.
+
+    mode="LIVE"
+        Single-pass fallback. Primary live execution runs via main.py.
+
+    mode="REPLAY"
+        Snapshot replay — pass replay_data={sym: (df_3m, df_15m)}.
+        Calls paper_order() once with the full snapshot.
+
+    mode="OFFLINE"
+        Candle-by-candle walk-through using tick_db. No live connection needed.
+
+        Required:
+            tick_db             TickDatabase instance
+
+        Optional:
+            date_str            'YYYY-MM-DD' to replay a specific date
+            signal_only         True = signals only, no trade simulation
+            min_warmup_candles  bars before evaluation starts (default 30)
+            output_dir          directory for CSV output (default '.')
+
+        Usage:
+            from tickdb import tick_db
+            from execution import run_strategy
+
+            # Signal evaluation only — fastest way to check what fires
+            run_strategy(["NSE:NIFTY50-INDEX"], mode="OFFLINE",
+                         tick_db=tick_db, date_str="2026-02-20",
+                         signal_only=True)
+
+            # Full trade simulation with PnL
+            run_strategy(["NSE:NIFTY50-INDEX"], mode="OFFLINE",
+                         tick_db=tick_db, date_str="2026-02-20",
+                         signal_only=False, output_dir="./replay_results")
+    """
+
+    # ── OFFLINE ──────────────────────────────────────────────────────────────
+    if mode == "OFFLINE":
+        if tick_db is None:
+            logging.error("[run_strategy] mode=OFFLINE requires tick_db argument")
+            return
+        run_offline_replay(
+            tick_db=tick_db,
+            symbols_list=symbols if isinstance(symbols, list) else [symbols],
+            date_str=date_str,
+            min_warmup_candles=min_warmup_candles,
+            signal_only=signal_only,
+            output_dir=output_dir,
+            db_path=db_path,
+        )
+        return
+
+    # ── LIVE (single-pass fallback) ───────────────────────────────────────────
+    if mode == "LIVE":
+        for sym in symbols:
+            logging.info(f"{GRAY}[STRATEGY][LIVE] {sym}{RESET}")
+            spot_local = None
+            try:
+                q = fyers.quotes(data={"symbols": sym})
+                spot_local = q["d"][0]["v"]["lp"]
+            except Exception as e:
+                logging.debug(f"[STRATEGY] Quote API: {e}")
+
+            candles_3m, candles_15m = update_candles_and_signals(
+                symbol=sym, spot_price=spot_local, tick_db=tick_db
+            )
+            if candles_3m is None or candles_3m.empty:
+                logging.warning(f"[STRATEGY] No candles for {sym}")
+                continue
+
             if account_type.upper() == "PAPER":
-                paper_order(candles_3m, hist_yesterday_15m=candles_15m)
+                paper_order(candles_3m, hist_yesterday_15m=candles_15m, mode=mode)
             else:
                 live_order(candles_3m, hist_yesterday_15m=candles_15m)
+        return
 
-        # --- Sleep until next 3m boundary to avoid hammering ---
-        sleep_until_next_boundary(interval=180, tz=tz)
+    # ── REPLAY (snapshot) ─────────────────────────────────────────────────────
+    for sym in symbols:
+        if not replay_data or sym not in replay_data:
+            continue
+        candles_3m, candles_15m = replay_data[sym]
+        if candles_3m is None or candles_3m.empty:
+            continue
+        logging.info(
+            f"[REPLAY] {sym}: "
+            f"3m={len(candles_3m)} "
+            f"15m={len(candles_15m) if not candles_15m.empty else 0}"
+        )
+        if account_type.upper() == "PAPER":
+            paper_order(candles_3m, hist_yesterday_15m=candles_15m, mode="REPLAY")
+        else:
+            live_order(candles_3m, hist_yesterday_15m=candles_15m)
 
+    _print_replay_summary()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STANDALONE ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # --- Restrict to indices explicitly ---
-    symbols = ["NSE:NIFTY50-INDEX"]  # adjust as needed
+    """
+    Run offline replay from the terminal — no live connection needed.
 
-    today = dt.now(time_zone).date()
-    end_time = dt.datetime(today.year, today.month, today.day, 15, 30, tzinfo=time_zone)
+    Usage:
+        python execution.py                           # trade simulation, today's DB data
+        python execution.py --signal-only             # signals only
+        python execution.py --date 2026-02-20         # specific date
+        python execution.py --date 2026-02-20 --signal-only
+        python execution.py --out ./results           # custom output directory
+        python execution.py --warmup 50               # more warmup bars
+    """
+    import sys, os, argparse
 
-    logging.info(f"[SESSION] Trading until {end_time}")
+    parser = argparse.ArgumentParser(description="Offline replay using tick_db data")
+    parser.add_argument("--date",        default=None,  help="Date to replay YYYY-MM-DD")
+    parser.add_argument("--signal-only", action="store_true", help="Log signals only, no trade sim")
+    parser.add_argument("--out",         default=".",   help="Output directory for CSVs")
+    parser.add_argument("--warmup",      default=30,    type=int, help="Warmup bars (default 30)")
+    parser.add_argument("--sym",         default="NSE:NIFTY50-INDEX", help="Symbol to replay")
+    parser.add_argument("--db",          default=None,
+                        help=r"Direct SQLite DB path, e.g. C:\SQLite\ticks\ticks_2026-02-20.db "
+                             "(use when fetch_candles returns too few rows post-market)")
+    args = parser.parse_args()
 
-    # --- Bootstrap yesterday’s 15m candles ---
-    hist_yesterday_15m = {
-        sym: tick_db.fetch_candles("15m", use_yesterday=True, symbol=sym)
-        for sym in symbols
-    }
+    try:
+        from tickdb import tick_db as _tick_db
+    except ImportError:
+        logging.error("tickdb module not found — cannot run offline replay")
+        sys.exit(1)
 
-    # ✅ Visibility: log how many 15m candles were bootstrapped per symbol
-    for sym, df in hist_yesterday_15m.items():
-        if df is not None and not df.empty:
-            logging.info(f"{CYAN}[BOOTSTRAP] {sym} yesterday 15m candles={len(df)}{RESET}")
-        else:
-            logging.warning(f"{CYAN}[BOOTSTRAP] {sym} no 15m candles found for yesterday{RESET}")
-
-    # --- Run strategy orchestration ---
-    run_strategy(symbols, tz=time_zone, end_time=end_time)
+    run_strategy(
+        symbols=[args.sym],
+        mode="OFFLINE",
+        tick_db=_tick_db,
+        date_str=args.date,
+        signal_only=args.signal_only,
+        min_warmup_candles=args.warmup,
+        output_dir=args.out,
+        db_path=args.db,
+    )

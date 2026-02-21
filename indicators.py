@@ -149,32 +149,6 @@ def calculate_ema(df, period=20, column="close"):
     series = df[column].dropna()
     return series.ewm(span=period, adjust=False).mean()
 
-def calculate_adx(df, period=14):
-    """Calculate ADX (Average Directional Index) from a DataFrame."""
-    if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):
-        logging.warning("[ADX] No data")
-        return pd.Series(dtype=float, index=df.index if df is not None else None)
-
-    high, low, close = df["high"], df["low"], df["close"]
-
-    plus_dm = high.diff()
-    minus_dm = low.diff().abs()
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
-
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-
-    atr = tr.rolling(period).mean()
-    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
-    adx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)).rolling(period).mean()
-
-    return adx
-
 def calculate_cci(df, period=20):
     """Commodity Channel Index (CCI) as a Series."""
     if df is None or df.empty or not {"high","low","close"}.issubset(df.columns):

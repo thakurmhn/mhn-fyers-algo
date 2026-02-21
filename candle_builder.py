@@ -61,9 +61,10 @@ def build_3min_candle(df_ticks, symbol):
         # ✅ Add unified 'time' column for downstream strategy
         ohlcv["time"] = ohlcv.index.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Indicators
-        ohlcv["ema20"] = calculate_ema(ohlcv, column="close", period=20)
-        ohlcv["ema50"] = calculate_ema(ohlcv, column="close", period=50)
+        # --- Indicators (updated to EMA9/EMA13, no bias logic) ---
+        ohlcv["ema9"] = calculate_ema(ohlcv, column="close", period=9)
+        ohlcv["ema13"] = calculate_ema(ohlcv, column="close", period=13)
+
         ohlcv["adx14"] = calculate_adx(ohlcv)
         ohlcv["cci20"] = calculate_cci(ohlcv)
 
@@ -80,7 +81,6 @@ def build_3min_candle(df_ticks, symbol):
         return pd.DataFrame(columns=[
             "trade_date","ist_slot","time","open","high","low","close","volume","symbol"
         ])
-
 
 # ===== Candle Builder (15m) =====
 def prepare_intraday(df_intraday, target_date=None):
@@ -195,9 +195,9 @@ def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
         # ✅ Add unified 'time' column for downstream strategy
         df_15m["time"] = df_15m.index.strftime("%Y-%m-%d %H:%M:%S")
 
-        # ✅ Enrich with indicators including Supertrend bias/slope
-        df_15m["ema20"] = calculate_ema(df_15m, column="close", period=20)
-        df_15m["ema50"] = calculate_ema(df_15m, column="close", period=50)
+        # ✅ Enrich with indicators (updated to EMA9/EMA13, no bias logic)
+        df_15m["ema9"] = calculate_ema(df_15m, column="close", period=9)
+        df_15m["ema13"] = calculate_ema(df_15m, column="close", period=13)
         df_15m["adx14"] = calculate_adx(df_15m)
         df_15m["cci20"] = calculate_cci(df_15m)
 
@@ -213,6 +213,7 @@ def build_15m_candles(df_intraday, tick_db, symbol, target_date=None):
         return pd.DataFrame(columns=[
             "trade_date","ist_slot","time","open","high","low","close","volume","symbol"
         ])
+    
 
 def get_today_15m_candles(hist_data):
     """Return today's 15m candles enriched with indicators and supertrend bias/slope."""
@@ -235,9 +236,9 @@ def get_today_15m_candles(hist_data):
         # ✅ Add unified 'time' column for downstream strategy
         df_15m["time"] = df_15m.index.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Enrich with indicators
-        df_15m["ema20"] = calculate_ema(df_15m, column="close", period=20)
-        df_15m["ema50"] = calculate_ema(df_15m, column="close", period=50)
+        # ✅ Enrich with indicators (updated to EMA9/EMA13, no bias logic)
+        df_15m["ema9"] = calculate_ema(df_15m, column="close", period=9)
+        df_15m["ema13"] = calculate_ema(df_15m, column="close", period=13)
         df_15m["adx14"] = calculate_adx(df_15m)
         df_15m["cci20"] = calculate_cci(df_15m)
 

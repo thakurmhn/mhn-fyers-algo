@@ -2,7 +2,6 @@ import pandas as pd
 import sqlite3
 import logging
 import os
-from datetime import datetime
 
 from indicators import (
     resolve_atr,
@@ -11,7 +10,7 @@ from indicators import (
     calculate_camarilla_pivots
 )
 from signals import detect_signal
-from execution import build_dynamic_levels, process_order
+from execution_bak import build_dynamic_levels, process_order
 from orchestration import build_indicator_dataframe
 
 RESET   = "\033[0m"
@@ -118,14 +117,23 @@ def replay_run_strategy(symbol, prev_date, curr_date, cooldown=20):
             if last_exit_candle and i - last_exit_candle < cooldown:
                 continue
 
+            # signal = detect_signal(
+            #     cpr_levels=cpr_levels,
+            #     traditional_levels=trad_levels,
+            #     camarilla_levels=cam_levels,
+            #     candles_3m=df_slice_3m,
+            #     atr=atr_val,
+            #     bias="PREV_DAY",
+            #     higher_tf=df_slice_15m if not df_slice_15m.empty else None,
+            #     include_partial=False
+            # )
             signal = detect_signal(
-                cpr_levels=cpr_levels,
-                traditional_levels=trad_levels,
-                camarilla_levels=cam_levels,
                 candles_3m=df_slice_3m,
+                candles_15m=df_slice_15m,
+                cpr_levels=cpr_levels,
+                camarilla_levels=cam_levels,
+                traditional_levels=trad_levels,
                 atr=atr_val,
-                bias="PREV_DAY",
-                higher_tf=df_slice_15m if not df_slice_15m.empty else None,
                 include_partial=False
             )
             if signal:

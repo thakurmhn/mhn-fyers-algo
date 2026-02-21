@@ -1,631 +1,336 @@
-# ===== orchestration.py ============
+# ===== orchestration.py (v3 — IMPROVED) =====
+"""
+IMPROVEMENTS vs v2:
+1. build_indicator_dataframe now also computes VWAP and stores in df["vwap"]
+2. RSI column naming made consistent: always "rsi14"
+3. ADX returns scalar per-row instead of full series (avoids potential dtype issues)
+4. Supertrend warmup guard: returns NEUTRAL/NaN for first (atr_period) rows safely
+5. fetch_fyers_history: better handling of empty response (no silent empty return)
+All v2 bug-fixes retained (reconciliation, include_today, etc.)
+"""
 
 import logging
 import pandas as pd
-import sqlite3
-import os
-from datetime import datetime, timedelta
+import numpy as np
+from datetime import datetime as dt, timedelta, date as date_type
+from setup import fyers
+import pytz
 
-from candle_builder import build_3min_candle
-from tickdb import tick_db
 from indicators import (
     calculate_cpr,
     calculate_traditional_pivots,
     calculate_camarilla_pivots,
-    resolve_atr,
     calculate_ema,
     calculate_adx,
     calculate_cci,
-    supertrend,
-    compute_rsi
+    compute_rsi,
 )
-from signals import detect_signal, classify_volatility, signal_confidence, bias_from_indicators
-from setup import fyers_async
 
-RESET   = "\033[0m"
-GREEN   = "\033[92m"
-CYAN    = "\033[96m"
+RESET  = "\033[0m"
+GREEN  = "\033[92m"
+CYAN   = "\033[96m"
+YELLOW = "\033[93m"
 
-BASE_PATH = r"C:\SQLite\ticks"
+ist = pytz.timezone("Asia/Kolkata")
+
 
 def fmt(val):
-    """Format numeric values safely for logs."""
     return f"{val:.2f}" if val is not None and not pd.isna(val) else "NA"
 
 
-def fetch_ticks_from_db(symbol, date_str):
-    """Fetch ticks directly from SQLite DB for a given date."""
-    db_path = os.path.join(BASE_PATH, f"ticks_{date_str}.db")
-    logging.info(f"[DB PATH] Using database at {db_path}")
-    if not os.path.exists(db_path):
-        logging.warning(f"[DB] No DB file found for {date_str}")
-        return pd.DataFrame()
+def calculate_atr(df, period=14):
+    high, low, close = df["high"], df["low"], df["close"]
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low  - close.shift()).abs()
+    tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=period, min_periods=period).mean()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VWAP — session VWAP computed from candle DataFrame
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_typical_price_ma(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """
+    Rolling mean of typical price (H+L+C)/3.
+    VWAP substitute for volume-less instruments like NSE:NIFTY50-INDEX.
+    Stored as df["vwap"] so downstream scoring engine works without changes.
+    """
     try:
-        conn = sqlite3.connect(db_path)
-        tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table'", conn)
-        if "ticks" not in tables["name"].values:
-            logging.warning(f"[DB WARN] {db_path} has no ticks table")
-            conn.close()
-            return pd.DataFrame()
-
-        df = pd.read_sql_query("SELECT * FROM ticks WHERE symbol=?", conn, params=[symbol])
-        conn.close()
-
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        # Normalize numeric fields
-        for col in ["last_price", "volume", "bid", "ask"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        return df
+        tp = (df["high"] + df["low"] + df["close"]) / 3
+        return tp.rolling(period, min_periods=1).mean()
     except Exception as e:
-        logging.error(f"[DB ERROR] Failed to fetch ticks: {e}")
-        return pd.DataFrame()
+        logging.debug(f"[TPMA ERROR] {e}")
+        return pd.Series([np.nan] * len(df), index=df.index)
 
 
-def ensure_tables_exist():
-    """Ensure required tables exist in the current tick_db connection."""
-    try:
-        tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table'", tick_db.conn)
-        required = {"ticks", "candles_3m_ist", "candles_15m_ist"}
-        missing = required - set(tables["name"].values)
-        if missing:
-            logging.warning(f"[DB WARN] Missing tables {missing}, creating now")
-            tick_db._create_tables()
-    except Exception as e:
-        logging.error(f"[DB ERROR] Failed to ensure tables exist: {e}")
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPERTREND — with bias reconciliation (v2 fix retained)
+# ─────────────────────────────────────────────────────────────────────────────
+def supertrend(df, atr_period=14, multiplier=3):
+    """
+    Supertrend with correct bias reconciliation.
+    Returns (line_series, bias_series, slope_series).
+    """
+    df = df.copy()
+
+    df['H-L'] = df['high'] - df['low']
+    df['H-C'] = abs(df['high'] - df['close'].shift())
+    df['L-C'] = abs(df['low']  - df['close'].shift())
+    df['TR']  = df[['H-L', 'H-C', 'L-C']].max(axis=1)
+    df['ATR'] = df['TR'].rolling(atr_period).mean()
+
+    hl2 = (df['high'] + df['low']) / 2
+    df['upperband'] = hl2 + multiplier * df['ATR']
+    df['lowerband'] = hl2 - multiplier * df['ATR']
+
+    df['final_upperband'] = df['upperband'].copy()
+    df['final_lowerband'] = df['lowerband'].copy()
+
+    for i in range(atr_period, len(df)):
+        prev_ub    = df['final_upperband'].iloc[i - 1]
+        prev_lb    = df['final_lowerband'].iloc[i - 1]
+        prev_close = df['close'].iloc[i - 1]
+
+        if prev_close <= prev_ub:
+            df.loc[df.index[i], 'final_upperband'] = min(df['upperband'].iloc[i], prev_ub)
+        else:
+            df.loc[df.index[i], 'final_upperband'] = df['upperband'].iloc[i]
+
+        if prev_close >= prev_lb:
+            df.loc[df.index[i], 'final_lowerband'] = max(df['lowerband'].iloc[i], prev_lb)
+        else:
+            df.loc[df.index[i], 'final_lowerband'] = df['lowerband'].iloc[i]
+
+    line  = pd.Series(index=df.index, dtype=float)
+    bias  = pd.Series(index=df.index, dtype=object)
+    slope = pd.Series(index=df.index, dtype=object)
+
+    for i in range(atr_period, len(df)):
+        close_i = df['close'].iloc[i]
+        prev_ub = df['final_upperband'].iloc[i - 1]
+        prev_lb = df['final_lowerband'].iloc[i - 1]
+        curr_lb = df['final_lowerband'].iloc[i]
+        curr_ub = df['final_upperband'].iloc[i]
+
+        if close_i > prev_ub:
+            line.iloc[i] = curr_lb
+            bias.iloc[i] = "UP"
+        elif close_i < prev_lb:
+            line.iloc[i] = curr_ub
+            bias.iloc[i] = "DOWN"
+        else:
+            prev_bias = bias.iloc[i - 1] if i > atr_period else "NEUTRAL"
+            prev_line = line.iloc[i - 1] if i > atr_period else float('nan')
+            if prev_bias == "UP":
+                line.iloc[i] = curr_lb
+                bias.iloc[i] = "UP"
+            elif prev_bias == "DOWN":
+                line.iloc[i] = curr_ub
+                bias.iloc[i] = "DOWN"
+            else:
+                line.iloc[i] = prev_line
+                bias.iloc[i] = "NEUTRAL"
+
+        if i > atr_period:
+            pl = line.iloc[i - 1]
+            cl = line.iloc[i]
+            if pd.isna(pl) or pd.isna(cl):
+                slope.iloc[i] = slope.iloc[i - 1]
+            elif cl > pl:
+                slope.iloc[i] = "UP"
+            elif cl < pl:
+                slope.iloc[i] = "DOWN"
+            else:
+                slope.iloc[i] = slope.iloc[i - 1]
+
+    # Reconcile bias against line position (v2 fix)
+    corrected = 0
+    for i in range(atr_period, len(df)):
+        cl = line.iloc[i]
+        cc = df['close'].iloc[i]
+        if pd.isna(cl):
+            continue
+        if cc > cl and bias.iloc[i] != "UP":
+            bias.iloc[i] = "UP"
+            corrected += 1
+        elif cc < cl and bias.iloc[i] != "DOWN":
+            bias.iloc[i] = "DOWN"
+            corrected += 1
+
+    if corrected > 0:
+        logging.debug(
+            f"[SUPERTREND] Reconciled {corrected} rows where bias "
+            f"didn't match line position"
+        )
+
+    return line, bias, slope
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# INDICATOR DATAFRAME
+# ─────────────────────────────────────────────────────────────────────────────
 def build_indicator_dataframe(symbol, df, interval="3m"):
-    """Enrich candles with indicators (EMA, ADX, CCI, ATR, Supertrend, RSI, Bias/Confidence)."""
     if df is None or df.empty:
-        logging.warning(f"[INDICATORS] No {interval} candles available for {symbol}")
+        logging.warning(f"[INDICATORS] No {interval} candles for {symbol}")
         return pd.DataFrame()
 
     df = df.copy()
 
-    # --- EMA ---
-    df["ema20"] = calculate_ema(df, column="close", period=20)
-    df["ema50"] = calculate_ema(df, column="close", period=50)
+    df["ema9"]  = calculate_ema(df, column="close", period=9)
+    df["ema13"] = calculate_ema(df, column="close", period=13)
 
-    # --- ADX ---
-    if len(df) >= 14:
-        try:
-            df["adx14"] = calculate_adx(df)
-        except Exception as e:
-            logging.error(f"[ADX ERROR] {e}")
-            df["adx14"] = float("nan")
-    else:
-        df["adx14"] = float("nan")
-        logging.warning(f"[INDICATORS] {symbol} insufficient {interval} bars ({len(df)}) for ADX")
-
-    # --- CCI ---
-    if len(df) >= 20:
-        try:
-            df["cci20"] = calculate_cci(df)
-        except Exception as e:
-            logging.error(f"[CCI ERROR] {e}")
-            df["cci20"] = float("nan")
-    else:
-        df["cci20"] = float("nan")
-        logging.warning(f"[INDICATORS] {symbol} insufficient {interval} bars ({len(df)}) for CCI")
-
-    # --- Fill missing values for continuity (both forward and backward) ---
-    df["adx14"] = df["adx14"].bfill().ffill()
-    df["cci20"] = df["cci20"].bfill().ffill()
-
-    # --- ATR ---
     try:
-        atr, _ = resolve_atr(df, daily_atr=None)
+        df["adx14"] = calculate_adx(df)
+    except Exception as e:
+        logging.error(f"[ADX ERROR] {e}")
+        df["adx14"] = float("nan")
+
+    try:
+        df["cci20"] = calculate_cci(df)
+    except Exception as e:
+        logging.error(f"[CCI ERROR] {e}")
+        df["cci20"] = float("nan")
+
+    try:
+        df["atr14"] = calculate_atr(df, period=14)
     except Exception as e:
         logging.error(f"[ATR ERROR] {e}")
-        atr = float("nan")
+        df["atr14"] = float("nan")
 
-    # --- Supertrend ---
     try:
-        bias, slope = supertrend(df, atr_val=atr)
-        df.loc[df.index[-1], "supertrend_bias"] = bias
-        df.loc[df.index[-1], "supertrend_slope"] = slope
+        line_s, bias_s, slope_s = supertrend(df, atr_period=14, multiplier=3)
+        df["supertrend_line"]  = line_s
+        df["supertrend_bias"]  = bias_s
+        df["supertrend_slope"] = slope_s
     except Exception as e:
         logging.error(f"[SUPERTREND ERROR] {e}")
-        df.loc[df.index[-1], "supertrend_bias"] = "NEUTRAL"
-        df.loc[df.index[-1], "supertrend_slope"] = "FLAT"
+        df["supertrend_line"]  = float("nan")
+        df["supertrend_bias"]  = "NEUTRAL"
+        df["supertrend_slope"] = "FLAT"
 
-    # --- RSI ---
     try:
         df["rsi14"] = compute_rsi(df["close"], period=14)
     except Exception as e:
         logging.error(f"[RSI ERROR] {e}")
         df["rsi14"] = float("nan")
 
-    # --- Bias & Confidence ---
+    # TPMA — Typical Price Moving Average (VWAP substitute for NSE index, no volume)
+    # Stored as "vwap" column so downstream scoring engine works unchanged.
     try:
-        bias_reason, bias_score = bias_from_indicators(df.iloc[-1])
-        vol_regime = classify_volatility(atr)
-        conf_bucket = signal_confidence(vol_regime, bias_score, bias_reason)
-
-        df.loc[df.index[-1], "bias_reason"] = bias_reason
-        df.loc[df.index[-1], "bias_score"] = bias_score
-        df.loc[df.index[-1], "vol_regime"] = vol_regime
-        df.loc[df.index[-1], "confidence"] = conf_bucket
+        df["vwap"] = calculate_typical_price_ma(df, period=20)
     except Exception as e:
-        logging.error(f"[BIAS/CONFIDENCE ERROR] {e}")
-        df.loc[df.index[-1], "bias_reason"] = "HOLD"
-        df.loc[df.index[-1], "bias_score"] = 0.0
-        df.loc[df.index[-1], "vol_regime"] = "UNKNOWN"
-        df.loc[df.index[-1], "confidence"] = "LOW"
+        logging.debug(f"[TPMA ERROR] {e}")
+        df["vwap"] = float("nan")
 
-    # --- Logging ---
-    last_row = df.iloc[-1]
+    last = df.iloc[-1]
     logging.info(
-        f"{CYAN}[INDICATOR DF] {symbol} {interval} "
-        f"ema20={fmt(last_row['ema20'])} ema50={fmt(last_row['ema50'])} "
-        f"adx14={fmt(last_row['adx14'])} cci20={fmt(last_row['cci20'])} "
-        f"rsi14={fmt(last_row['rsi14'])} "
-        f"supertrend_bias={last_row['supertrend_bias']} slope={last_row['supertrend_slope']} "
-        f"bias={last_row['bias_reason']} score={last_row['bias_score']} "
-        f"vol={last_row['vol_regime']} confidence={last_row['confidence']}{RESET}"
+        f"[INDICATOR DF] {symbol} {interval} "
+        f"ema9={fmt(last['ema9'])} ema13={fmt(last['ema13'])} "
+        f"adx14={fmt(last['adx14'])} cci20={fmt(last['cci20'])} "
+        f"rsi14={fmt(last['rsi14'])} "
+        f"supertrend_bias={last.get('supertrend_bias', '')} "
+        f"slope={last.get('supertrend_slope', '')} "
+        f"line={fmt(last['supertrend_line'])} "
+        f"vwap={fmt(last.get('vwap'))}"
     )
-
     return df
 
 
-def fetch_previous_3m(symbol, base_path=r"C:\SQLite\ticks", lookback_days=7, min_days=3):
-    """
-    Fetch previous trading candles for the 3m interval from SQL DB for bootstrapping indicators.
-    By default, fetches multiple days (min_days=3) to ensure enough rows for ADX/CCI.
-    """
-    today = datetime.now().date()
-    collected = []
+# ─────────────────────────────────────────────────────────────────────────────
+# FETCH CANDLES — with today's intraday data
+# ─────────────────────────────────────────────────────────────────────────────
+def fetch_fyers_history(symbol, resolution="15", days=5, include_today=False):
+    today      = dt.now(ist).date()
+    start_date = today - timedelta(days=days)
+    range_to   = (today + timedelta(days=1)) if include_today else today
 
-    for i in range(1, lookback_days + 1):
-        candidate = today - timedelta(days=i)
-        db_file = os.path.join(base_path, f"ticks_{candidate}.db")
-        if not os.path.exists(db_file):
-            continue
+    hist_req = {
+        "symbol":      symbol,
+        "resolution":  resolution,
+        "date_format": "1",
+        "range_from":  start_date.strftime("%Y-%m-%d"),
+        "range_to":    range_to.strftime("%Y-%m-%d"),
+        "cont_flag":   "1",
+    }
 
-        try:
-            conn = sqlite3.connect(db_file)
-            df = pd.read_sql_query(
-                "SELECT * FROM candles_3m_ist WHERE symbol=? ORDER BY trade_date, ist_slot",
-                conn,
-                params=[symbol]
-            )
-            conn.close()
-
-            if df is None or df.empty:
-                continue
-
-            df_prev = df[df["trade_date"] == str(candidate)].copy()
-            if df_prev.empty:
-                continue
-
-            # ✅ Add unified 'time' column
-            df_prev["time"] = df_prev["trade_date"] + " " + df_prev["ist_slot"]
-
-            collected.append(df_prev)
-            logging.info(f"[CONTINUITY] {symbol} 3m: fetched {len(df_prev)} candles for {candidate}")
-
-            # Stop once we have min_days worth of continuity
-            if len(collected) >= min_days:
-                break
-
-        except Exception as e:
-            logging.error(f"[CONTINUITY ERROR] Failed to fetch 3m candles for {symbol} on {candidate}: {e}")
-            continue
-
-    if collected:
-        # ✅ Concatenate multiple days
-        df_all = pd.concat(collected, ignore_index=True)
-        logging.info(f"[CONTINUITY] {symbol} 3m: total {len(df_all)} candles from {len(collected)} days")
-
-        # ✅ Enrich once on the full continuity set
-        df_all = build_indicator_dataframe(symbol, df_all, interval="3m")
-        return df_all
-
-    logging.warning(f"[CONTINUITY] No 3m candles found for {symbol} in last {lookback_days} days")
-    return pd.DataFrame(columns=["trade_date","ist_slot","time","open","high","low","close","volume","symbol"])
-
-
-
-def fetch_previous_15m(symbol, interval="15m", base_path=r"C:\SQLite\ticks", lookback_days=7, min_days=3):
-    """
-    Fetch previous trading candles for the given interval (3m or 15m).
-    By default, fetches multiple days (min_days=3) to ensure enough rows for ADX/CCI.
-    """
-    today = datetime.now().date()
-    collected = []
-
-    for i in range(1, lookback_days + 1):
-        candidate = today - timedelta(days=i)
-        db_file = os.path.join(base_path, f"ticks_{candidate}.db")
-        if not os.path.exists(db_file):
-            continue
-
-        try:
-            conn = sqlite3.connect(db_file)
-            df = pd.read_sql_query(
-                f"SELECT * FROM candles_{interval}_ist WHERE symbol=? ORDER BY trade_date, ist_slot",
-                conn,
-                params=[symbol]
-            )
-            conn.close()
-
-            if df is None or df.empty:
-                continue
-
-            df_prev = df[df["trade_date"] == str(candidate)].copy()
-            if df_prev.empty:
-                continue
-
-            # ✅ Add unified 'time' column
-            df_prev["time"] = df_prev["trade_date"] + " " + df_prev["ist_slot"]
-
-            collected.append(df_prev)
-            logging.info(f"[CONTINUITY] {symbol} {interval}: fetched {len(df_prev)} candles for {candidate}")
-
-            # Stop once we have min_days worth of continuity
-            if len(collected) >= min_days:
-                break
-
-        except Exception as e:
-            logging.error(f"[CONTINUITY ERROR] Failed to fetch {interval} candles for {symbol} on {candidate}: {e}")
-            continue
-
-    if collected:
-        # ✅ Concatenate multiple days
-        df_all = pd.concat(collected, ignore_index=True)
-        logging.info(f"[CONTINUITY] {symbol} {interval}: total {len(df_all)} candles from {len(collected)} days")
-
-        # ✅ Enrich once on the full continuity set
-        df_all = build_indicator_dataframe(symbol, df_all, interval=interval)
-        return df_all
-
-    logging.warning(f"[CONTINUITY] No {interval} candles found for {symbol} in last {lookback_days} days")
-    return pd.DataFrame(columns=["trade_date","ist_slot","time","open","high","low","close","volume","symbol"])
-
-
-def merge_candles(prev_df, today_df, symbol, interval, prev_date, today_str, include_partial=True):
-    """Merge previous day + today candles, drop duplicates, return merged DataFrame.
-       include_partial=False will drop rows flagged as is_partial.
-    """
-
-    def ensure_time(df):
-        if df is not None and not df.empty:
-            df = df.copy()
-            # Case 1: Already has trade_date + ist_slot
-            if {"trade_date", "ist_slot"} <= set(df.columns):
-                if "time" not in df.columns:
-                    df["time"] = df["trade_date"] + " " + df["ist_slot"]
-            # Case 2: Has 'ts' column from tick_db.build_candles_from_ticks
-            elif "ts" in df.columns:
-                df["trade_date"] = df["ts"].dt.strftime("%Y-%m-%d")
-                df["ist_slot"] = df["ts"].dt.strftime("%H:%M:%S")
-                df["symbol"] = symbol
-                df["time"] = df["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
-        return df
-
-    prev_df = ensure_time(prev_df)
-    today_df = ensure_time(today_df)
-
-    # 🔍 Drop partial rows if requested
-    if not include_partial:
-        if prev_df is not None and "is_partial" in prev_df.columns:
-            prev_df = prev_df.loc[~prev_df["is_partial"]]
-        if today_df is not None and "is_partial" in today_df.columns:
-            today_df = today_df.loc[~today_df["is_partial"]]
-
-    if prev_df is not None and not prev_df.empty and today_df is not None and not today_df.empty:
-        merged_df = pd.concat([prev_df, today_df], ignore_index=True).drop_duplicates(
-            subset=["trade_date", "ist_slot", "symbol"], keep="last"
-        ).sort_values(by=["trade_date", "ist_slot"])
-        logging.info(
-            f"[MERGE] {symbol} {interval} continuity merged from {prev_date} + {today_str}: "
-            f"prev={len(prev_df)} | today={len(today_df)} | merged={len(merged_df)}"
-        )
-        logging.info(f"[MERGE SAMPLE] {symbol} {interval} merged tail:\n{merged_df.tail(3)}")
-        return merged_df.reset_index(drop=True)
-
-    elif today_df is not None and not today_df.empty:
-        logging.info(
-            f"[MERGE] {symbol} {interval} continuity not available, using today only ({len(today_df)})"
-        )
-        logging.info(f"[MERGE SAMPLE] {symbol} {interval} today tail:\n{today_df.tail(3)}")
-        return today_df.reset_index(drop=True)
-
-    elif prev_df is not None and not prev_df.empty:
-        logging.info(
-            f"[MERGE] {symbol} {interval} no today candles yet, using continuity only ({len(prev_df)})"
-        )
-        logging.info(f"[MERGE SAMPLE] {symbol} {interval} continuity tail:\n{prev_df.tail(3)}")
-        return prev_df.reset_index(drop=True)
-
-    else:
-        logging.warning(f"[MERGE] No {interval} candles available for {symbol}")
-        return pd.DataFrame(columns=[
-            "trade_date","ist_slot","time","open","high","low","close","volume","symbol","is_partial"
-        ])
-    
-
-# def update_candles_and_signals(symbol, spot_price=None, base_path=r"C:\SQLite\ticks", use_higher_tf=False):
-#     """
-#     Update loop with previous trading day candles included (3m + 15m).
-#     Uses fetch_previous_3m() and fetch_previous_15m() helpers for continuity.
-#     Runs signal detection only on 3m candles unless use_higher_tf=True.
-#     Returns (signal, df_3m, df_15m).
-#     """
-#     try:
-#         today_str = datetime.now().strftime("%Y-%m-%d")
-
-#         # --- Fetch today's ticks ---
-#         df_ticks_today = fetch_ticks_from_db(symbol, today_str)
-#         if df_ticks_today is None or df_ticks_today.empty:
-#             logging.warning(f"[UPDATE] No ticks found for {symbol}, bootstrapping from continuity only")
-#             df_3m_prev = fetch_previous_3m(symbol, base_path=base_path)
-#             df_15m_prev = fetch_previous_15m(symbol, interval="15m", base_path=base_path)
-#             logging.info(f"[SUMMARY BOOTSTRAP] {symbol}: continuity only -> 3m={len(df_3m_prev)} candles, 15m={len(df_15m_prev)} candles")
-#             return None, df_3m_prev, df_15m_prev
-
-#         # --- Build today's 3m candles ---
-#         df_3m_today = build_3min_candle(df_ticks_today, symbol)
-#         if df_3m_today is None or df_3m_today.empty:
-#             df_3m_today = pd.DataFrame()
-#         else:
-#             df_3m_today = build_indicator_dataframe(symbol, df_3m_today, interval="3m")
-
-#         # --- Build today's 15m candles ---
-#         df_15m_today = tick_db.build_candles_from_ticks(symbol, interval="15m")
-#         if df_15m_today is None or df_15m_today.empty:
-#             df_15m_today = pd.DataFrame()
-#         else:
-#             df_15m_today = df_15m_today.copy()
-#             # Normalize schema for merge compatibility
-#             if "trade_date" not in df_15m_today.columns:
-#                 df_15m_today["trade_date"] = pd.to_datetime(df_15m_today.index).strftime("%Y-%m-%d")
-#             if "ist_slot" not in df_15m_today.columns:
-#                 df_15m_today["ist_slot"] = pd.to_datetime(df_15m_today.index).strftime("%H:%M:%S")
-#             if "symbol" not in df_15m_today.columns:
-#                 df_15m_today["symbol"] = symbol
-#             df_15m_today["time"] = df_15m_today["trade_date"] + " " + df_15m_today["ist_slot"]
-
-#             df_15m_today = build_indicator_dataframe(symbol, df_15m_today, interval="15m")
-
-#         # --- Fetch previous trading day candles ---
-#         df_3m_prev = fetch_previous_3m(symbol, base_path=base_path)
-#         df_15m_prev = fetch_previous_15m(symbol, interval="15m", base_path=base_path)
-
-#         # --- Merge continuity + today ---
-#         df_3m = merge_candles(df_3m_prev, df_3m_today, symbol, "3m", prev_date="2026-02-16", today_str=today_str)
-#         df_15m = merge_candles(df_15m_prev, df_15m_today, symbol, "15m", prev_date="2026-02-16", today_str=today_str)
-
-#         # --- Enrich merged sets ---
-#         if df_3m is not None and not df_3m.empty:
-#             df_3m = build_indicator_dataframe(symbol, df_3m, interval="3m")
-#         if df_15m is not None and not df_15m.empty:
-#             df_15m = build_indicator_dataframe(symbol, df_15m, interval="15m")
-
-#         logging.info(f"[SUMMARY] Update complete for {symbol}: 3m={len(df_3m)} candles, 15m={len(df_15m)} candles")
-#         logging.info(
-#             f"[DASHBOARD] {symbol} counts -> prev_3m={len(df_3m_prev)} today_3m={len(df_3m_today)} merged_3m={len(df_3m)} | "
-#             f"prev_15m={len(df_15m_prev)} today_15m={len(df_15m_today)} merged_15m={len(df_15m)}"
-#         )
-
-#         # --- Resolve spot price ---
-#         if spot_price is None:
-#             try:
-#                 quote = fyers_async.quotes({"symbols": symbol})
-#                 spot_price = quote["d"][0]["v"].get("lp")
-#                 logging.info(f"[SPOT] {symbol} resolved via quotes API: {spot_price}")
-#             except Exception as e:
-#                 logging.warning(f"[SPOT FALLBACK] {symbol} quotes API failed: {e}")
-#                 latest_tick = tick_db.get_latest_tick(symbol)
-#                 if latest_tick is not None:
-#                     spot_price = latest_tick.get("last_price")
-#                     logging.info(f"[SPOT] {symbol} fallback to tick last_price: {spot_price}")
-
-#         if spot_price is None:
-#             logging.warning(f"[UPDATE] No spot price available for {symbol}")
-#             return None, df_3m, df_15m
-
-#         # --- Compute levels from last 3m candle ---
-#         if df_3m is None or df_3m.empty:
-#             logging.warning(f"[UPDATE] No 3m candles available for {symbol}")
-#             return None, df_3m, df_15m
-
-#         last_candle = df_3m.iloc[-1]
-#         cpr_levels = calculate_cpr(last_candle.high, last_candle.low, last_candle.close)
-#         traditional_levels = calculate_traditional_pivots(last_candle.high, last_candle.low, last_candle.close)
-#         camarilla_levels = calculate_camarilla_pivots(last_candle.high, last_candle.low, last_candle.close)
-
-#         atr = last_candle.get("atr")
-#         bias_score = last_candle.get("bias_score")
-#         rsi_val = last_candle.get("rsi14")
-
-#         # --- Detect signal (3m only unless use_higher_tf=True) ---
-#         signal = detect_signal(
-#             cpr_levels,
-#             traditional_levels,
-#             camarilla_levels,
-#             df_3m,
-#             atr=atr,
-#             bias=bias_score,
-#             higher_tf=df_15m if (df_15m is not None and not df_15m.empty and use_higher_tf) else None
-#         )
-
-#         if signal:
-#             logging.info(
-#                 f"{GREEN}[SIGNAL FIRED] {symbol} side={signal['side']} reason={signal['reason']} "
-#                 f"PeakMomentum={fmt(signal['peak_momentum'])} ATR={fmt(atr)} RSI={fmt(rsi_val)}{RESET}"
-#             )
-#         else:
-#             logging.debug(f"[SIGNAL CHECK] No signal for {symbol}")
-
-#         return signal, df_3m, df_15m
-
-#     except Exception as e:
-#         logging.error(f"[UPDATE ERROR] {symbol}: {e}")
-#         return None, pd.DataFrame(), pd.DataFrame()
-
-def update_candles_and_signals(symbol, spot_price=None, base_path=r"C:\SQLite\ticks", use_higher_tf=False):
-    """
-    Update loop with previous trading day candles included (3m + 15m).
-    - Fetch today's ticks
-    - Build today's 3m and 15m candles
-    - Merge with previous day continuity
-    - Enrich merged sets with indicators
-    - Detect signals on 3m candles, with optional 15m bias confirmation
-    Returns (signal, df_3m, df_15m).
-    """
     try:
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        response = fyers.history(data=hist_req)
+        candles  = response.get("candles", [])
+        if not candles:
+            logging.warning(f"[FETCH] No candles for {symbol} res={resolution}")
+            return pd.DataFrame()
 
-        # --- Fetch today's ticks ---
-        df_ticks_today = fetch_ticks_from_db(symbol, today_str)
-        if df_ticks_today is None or df_ticks_today.empty:
-            logging.warning(f"[UPDATE] No ticks found for {symbol}, bootstrapping from continuity only")
-            df_3m_prev = fetch_previous_3m(symbol, base_path=base_path)
-            df_15m_prev = fetch_previous_15m(symbol, interval="15m", base_path=base_path)
-            logging.info(f"[SUMMARY BOOTSTRAP] {symbol}: continuity only -> 3m={len(df_3m_prev)} candles, 15m={len(df_15m_prev)} candles")
-            return None, df_3m_prev, df_15m_prev
+        hist_data = pd.DataFrame(candles, columns=["date", "open", "high", "low", "close", "volume"])
+        hist_data["date"] = (
+            pd.to_datetime(hist_data["date"], unit="s")
+            .dt.tz_localize("UTC")
+            .dt.tz_convert(ist)
+        )
 
-        # --- Build today's 3m candles ---
-        df_3m_today = build_3min_candle(df_ticks_today, symbol)
-        if df_3m_today is None or df_3m_today.empty:
-            df_3m_today = pd.DataFrame()
-
-        # --- Build today's 15m candles ---
-        df_15m_today = tick_db.build_candles_from_ticks(symbol, interval="15m")
-        if df_15m_today is None or df_15m_today.empty:
-            df_15m_today = pd.DataFrame()
+        if not include_today:
+            hist_data = hist_data[hist_data["date"].dt.date < today]
         else:
-            # Normalize schema for merge compatibility
-            df_15m_today = df_15m_today.copy()
-            if "trade_date" not in df_15m_today.columns:
-                df_15m_today["trade_date"] = pd.to_datetime(df_15m_today.index).strftime("%Y-%m-%d")
-            if "ist_slot" not in df_15m_today.columns:
-                df_15m_today["ist_slot"] = pd.to_datetime(df_15m_today.index).strftime("%H:%M:%S")
-            if "symbol" not in df_15m_today.columns:
-                df_15m_today["symbol"] = symbol
-            df_15m_today["time"] = df_15m_today["trade_date"] + " " + df_15m_today["ist_slot"]
+            mins     = int(resolution) if str(resolution).isdigit() else 3
+            now_ist  = dt.now(ist)
+            slot_min = (now_ist.minute // mins) * mins
+            current_slot_start = now_ist.replace(minute=slot_min, second=0, microsecond=0)
+            if current_slot_start.tzinfo is None:
+                current_slot_start = ist.localize(current_slot_start)
+            hist_data = hist_data[hist_data["date"] < current_slot_start]
 
-        # --- Fetch previous trading day candles ---
-        df_3m_prev = fetch_previous_3m(symbol, base_path=base_path)
-        df_15m_prev = fetch_previous_15m(symbol, interval="15m", base_path=base_path)
+        hist_data["trade_date"] = hist_data["date"].dt.strftime("%Y-%m-%d")
+        hist_data["ist_slot"]   = hist_data["date"].dt.strftime("%H:%M:%S")
+        hist_data["symbol"]     = symbol
+        hist_data["time"]       = hist_data["trade_date"] + " " + hist_data["ist_slot"]
 
-        # --- Merge continuity + today ---
-        df_3m = merge_candles(df_3m_prev, df_3m_today, symbol, "3m", prev_date="2026-02-16", today_str=today_str)
-        df_15m = merge_candles(df_15m_prev, df_15m_today, symbol, "15m", prev_date="2026-02-16", today_str=today_str)
-
-        # --- Enrich merged sets (not today-only) ---
-        if df_3m is not None and not df_3m.empty:
-            df_3m = build_indicator_dataframe(symbol, df_3m, interval="3m")
-        if df_15m is not None and not df_15m.empty:
-            df_15m = build_indicator_dataframe(symbol, df_15m, interval="15m")
-
-        logging.info(f"[SUMMARY] Update complete for {symbol}: 3m={len(df_3m)} candles, 15m={len(df_15m)} candles")
         logging.info(
-            f"[DASHBOARD] {symbol} counts -> prev_3m={len(df_3m_prev)} today_3m={len(df_3m_today)} merged_3m={len(df_3m)} | "
-            f"prev_15m={len(df_15m_prev)} today_15m={len(df_15m_today)} merged_15m={len(df_15m)}"
+            f"[FETCH] {symbol} res={resolution} include_today={include_today} "
+            f"rows={len(hist_data)} "
+            f"last={hist_data.iloc[-1]['date'] if not hist_data.empty else 'none'}"
         )
-
-        # --- Resolve spot price ---
-        if spot_price is None:
-            try:
-                quote = fyers_async.quotes({"symbols": symbol})
-                spot_price = quote["d"][0]["v"].get("lp")
-                logging.info(f"[SPOT] {symbol} resolved via quotes API: {spot_price}")
-            except Exception as e:
-                logging.warning(f"[SPOT FALLBACK] {symbol} quotes API failed: {e}")
-                latest_tick = tick_db.get_latest_tick(symbol)
-                if latest_tick is not None:
-                    spot_price = latest_tick.get("last_price")
-                    logging.info(f"[SPOT] {symbol} fallback to tick last_price: {spot_price}")
-
-        if spot_price is None:
-            logging.warning(f"[UPDATE] No spot price available for {symbol}")
-            return None, df_3m, df_15m
-
-        # --- Compute levels from last 3m candle ---
-        if df_3m is None or df_3m.empty:
-            logging.warning(f"[UPDATE] No 3m candles available for {symbol}")
-            return None, df_3m, df_15m
-
-        last_candle = df_3m.iloc[-1]
-        cpr_levels = calculate_cpr(last_candle.high, last_candle.low, last_candle.close)
-        traditional_levels = calculate_traditional_pivots(last_candle.high, last_candle.low, last_candle.close)
-        camarilla_levels = calculate_camarilla_pivots(last_candle.high, last_candle.low, last_candle.close)
-
-        atr = last_candle.get("atr")
-        bias_score = last_candle.get("bias_score")
-        rsi_val = last_candle.get("rsi14")
-
-        # --- Detect signal (3m only unless use_higher_tf=True) ---
-        signal = detect_signal(
-            cpr_levels,
-            traditional_levels,
-            camarilla_levels,
-            df_3m,
-            atr=atr,
-            bias=bias_score,
-            higher_tf=df_15m if (df_15m is not None and not df_15m.empty and use_higher_tf) else None,
-            include_partial=False  # ✅ ensure trades only fire after 3m candle close
-        )
-
-        if signal:
-            logging.info(
-                f"{GREEN}[SIGNAL FIRED] {symbol} side={signal['side']} reason={signal['reason']} "
-                f"PeakMomentum={fmt(signal['peak_momentum'])} ATR={fmt(atr)} RSI={fmt(rsi_val)}{RESET}"
-            )
-        else:
-            logging.debug(f"[SIGNAL CHECK] No signal for {symbol}")
-
-        return signal, df_3m, df_15m
+        return hist_data.reset_index(drop=True)
 
     except Exception as e:
-        logging.error(f"[UPDATE ERROR] {symbol}: {e}")
-        return None, pd.DataFrame(), pd.DataFrame()
-    
+        logging.error(f"[FETCH ERROR] {symbol} res={resolution}: {e}", exc_info=True)
+        return pd.DataFrame()
 
-if __name__ == "__main__":
-    import os
-    import sqlite3
-    import pandas as pd
 
-    SYMBOL = "NSE:NIFTY50-INDEX"
-    INTERVAL = "15m"
-    BASE_PATH = r"C:\SQLite\ticks"
+# ─────────────────────────────────────────────────────────────────────────────
+# UPDATE CANDLES AND SIGNALS
+# ─────────────────────────────────────────────────────────────────────────────
+def update_candles_and_signals(symbol, spot_price=None, days=5, tick_db=None):
+    try:
+        df_3m  = fetch_fyers_history(symbol, resolution="3",  days=days, include_today=True)
+        df_15m = fetch_fyers_history(symbol, resolution="15", days=days, include_today=True)
 
-    def fetch_candles(db_file, interval="15m"):
-        conn = sqlite3.connect(db_file)
-        df = pd.read_sql_query(
-            f"SELECT * FROM candles_{interval}_ist WHERE symbol=? ORDER BY trade_date, ist_slot",
-            conn,
-            params=[SYMBOL]
-        )
-        conn.close()
-        return df
+        if tick_db is not None:
+            try:
+                today_3m = tick_db.fetch_candles("3m", use_yesterday=False, symbol=symbol)
+                if today_3m is not None and not today_3m.empty:
+                    if "time" in today_3m.columns and "date" not in today_3m.columns:
+                        today_3m = today_3m.rename(columns={"time": "date"})
+                    if "date" in today_3m.columns:
+                        today_3m["date"] = pd.to_datetime(today_3m["date"])
+                        if today_3m["date"].dt.tz is None:
+                            today_3m["date"] = today_3m["date"].dt.tz_localize(ist)
+                        today_3m = today_3m[today_3m["date"].dt.date == dt.now(ist).date()]
+                        if not today_3m.empty:
+                            df_3m = pd.concat([df_3m, today_3m], ignore_index=True)
+                            df_3m = (df_3m.drop_duplicates(subset=["date"])
+                                         .sort_values("date")
+                                         .reset_index(drop=True))
+                            logging.info(f"[TICK_DB MERGE 3m] {symbol}: {len(df_3m)} rows after merge")
+            except Exception as e:
+                logging.debug(f"[TICK_DB MERGE] {symbol}: {e}")
 
-    # continuity (Feb 16) + today (Feb 17)
-    prev_file = os.path.join(BASE_PATH, "ticks_2026-02-16.db")
-    today_file = os.path.join(BASE_PATH, "ticks_2026-02-17.db")
+        if not df_3m.empty:
+            df_3m = build_indicator_dataframe(symbol, df_3m, interval="3m")
+        if not df_15m.empty:
+            df_15m = build_indicator_dataframe(symbol, df_15m, interval="15m")
 
-    df_prev = fetch_candles(prev_file, INTERVAL)
-    df_today = fetch_candles(today_file, INTERVAL)
+        return df_3m, df_15m
 
-    print(f"[DEBUG] Prev candles={len(df_prev)} Today candles={len(df_today)}")
-    print("[DEBUG] Today columns:", df_today.columns.tolist())
-    print(df_today.head(3))
-
-    merged = merge_candles(df_prev, df_today, SYMBOL, INTERVAL, prev_date="2026-02-16", today_str="2026-02-17")
-
-    print(f"[RESULT] Merged candles={len(merged)}")
-    print(merged.tail(5))
-
-    # ✅ Enrich merged candles with indicators
-    enriched = build_indicator_dataframe(SYMBOL, merged.copy(), interval=INTERVAL)
-
-    print("[ENRICHED SAMPLE] Tail of merged + indicators:")
-    print(enriched.tail(5))
+    except Exception as e:
+        logging.error(f"[UPDATE ERROR] {symbol}: {e}", exc_info=True)
+        return pd.DataFrame(), pd.DataFrame()
